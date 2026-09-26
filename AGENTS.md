@@ -23,8 +23,10 @@ GLM Coding Plan 用量菜单栏工具（对标 `~/Documents/kimi/workspace/kimi-
   - `/api/monitor/usage/quota/limit` — 5 小时 + 7 天（周）credits（`CREDIT_LIMIT`，unit 3=小时/6=周；官方文档 docs.bigmodel.cn/cn/coding-plan/overview：Lite 2,000/5h + 10,000/周；旧版 TOKENS_LIMIT/TIME_LIMIT 已随 2026-07 积分制改版下线；`nextResetTime` 为 epoch 毫秒）
   - `/api/monitor/usage/model-usage?startTime=&endTime=` — 按小时 token/调用数（本地时区 `yyyy-MM-dd HH:mm:ss`）
   - `/api/monitor/usage/tool-usage` — MCP 工具次数
+  - `/api/biz/subscription/list` — 套餐信息（`status=="VALID"` 首条的 `productName` + `valid` 末尾到期时间），Bearer API key 认证，code==200
+- **充值卡（额度重置卡）**：`GET https://zcode.z.ai/api/v1/coding-plan/reset/status`（注意：ZCode 自家后端，非 open.bigmodel.cn；成功码 code==0）。需双 token 认证：`Authorization: Bearer <zcodejwttoken>` + `X-Bigmodel-Authorization: <oauth:bigmodel:access_token>` + `Bigmodel-Target-Type: PERSONAL`，两 token 均在 credentials.json（`CredStore.loadResetTokens()` 解密）。响应 `available_five_hour_resets`/`available_week_resets` 数组、每张卡 `expire_at` 为 epoch 毫秒。接口路径逆向自 ZCode app.asar（`/use` `/opportunity` `/history/read` 均为写操作，应用只读 status，绝不自动用卡）。token 是 ZCode 登录态、可能过期 → 失败时菜单降级为提示行。
 - **Peak**：峰谷时段本地计算，新版积分制口径（高峰=工作日 14:00–18:00 全价，其余时间+周末全天 5 折；Asia/Shanghai 时区，不依赖系统时区；老版 V1/V2 的 3倍/1倍 口径不适用）。限时活动硬编码日期、过期自动失效：双节 2026-09-25~10-07 全天 5 折；深夜错峰 2026-09-03~10-07 每日 23:00–09:00 ZCode 内 Flash 0 消耗/其他 Agent 额度×2。菜单栏标题 emoji（🔥 高峰 / ⚡ 深夜活动）+ 下拉菜单状态行；`--peak-test` 为边界回归用例，**改活动日期后必跑**。
-- 刷新节奏：额度每 60s，token 统计每 5 分钟（`tokenEveryCycles`）。token 统计全靠服务端，不扫描本地会话日志（与 KimiUsage 的关键差异）。
+- 刷新节奏：额度每 60s，token 统计/充值卡/套餐到期每 5 分钟（`tokenEveryCycles`）。token 统计全靠服务端，不扫描本地会话日志（与 KimiUsage 的关键差异）。
 - 自诊断写 `~/Library/Application Support/GlmUsage/status.json`。
 
 ## 约定

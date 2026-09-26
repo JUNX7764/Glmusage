@@ -39,6 +39,22 @@ enum CredStore {
         return decrypt(enc)
     }
 
+    // 充值卡（额度重置卡）接口所需的两个 ZCode 登录态 token（同一密文格式、同一把密钥）。
+    // 任一缺失/解密失败返回 nil，由调用方优雅降级；同样只存内存、绝不落盘。
+    static func loadResetTokens() -> (jwt: String, maas: String)? {
+        guard let data = FileManager.default.contents(atPath: credPath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            return nil
+        }
+        guard let jwt = decrypt(obj["zcodejwttoken"] ?? "")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !jwt.isEmpty,
+              let maas = decrypt(obj["oauth:bigmodel:access_token"] ?? "")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !maas.isEmpty else {
+            return nil
+        }
+        return (jwt, maas)
+    }
+
     static func decrypt(_ s: String) -> String? {
         let parts = s.dropFirst("enc:v1:".count)
             .split(separator: ".")
@@ -99,6 +115,18 @@ struct ToolUsage {
     var webRead: Double
 }
 
+/// 充值卡（官方名：额度重置卡）：按窗口类型分组的未过期卡到期时间（已过滤 expire_at <= now）
+struct ResetCards {
+    var fiveHour: [Date]
+    var week: [Date]
+}
+
+/// 套餐订阅信息（subscription/list）
+struct SubscriptionInfo {
+    var name: String
+    var expireDate: Date?
+}
+
 struct UsageData {
     var fiveHour: LimitEntry?
     var week: LimitEntry?
@@ -107,6 +135,9 @@ struct UsageData {
     var tokens7d: ModelUsage?
     var tokens30d: ModelUsage?
     var tools30d: ToolUsage?
+    var resetCards: ResetCards?        // 充值卡（额度重置卡）可用列表
+    var resetCardsError: String?
+    var subscription: SubscriptionInfo?
     var quotaError: String?
     var tokensError: String?
     var updatedAt: Date = Date()
@@ -120,6 +151,10 @@ struct UsageData {
 //   GET {base}/api/monitor/usage/tool-usage?startTime=&endTime=  MCP 工具次数
 // 时间参数为本地时区 "yyyy-MM-dd HH:mm:ss"；Authorization: Bearer <订阅 api-key>。
 // token 统计由服务端完成，无需扫描本地会话日志（与 KimiUsage 的差异点）。
+// 另有两个扩展接口：
+//   GET https://zcode.z.ai/api/v1/coding-plan/reset/status  充值卡（额度重置卡），
+//       需 Authorization/X-Bigmodel-Authorization/Bigmodel-Target-Type 三个自定义头，成功码 code==0
+//   GET {base}/api/biz/subscription/list                    套餐订阅（code==200，data 为数组）
 
 enum Fetcher {
     static let base = "https://open.bigmodel.cn"
@@ -139,8 +174,9 @@ enum Fetcher {
                 URLQueryItem(name: "endTime", value: f.string(from: to))]
     }
 
-    static func fetch(apiKey: String, path: String, from: Date? = nil, to: Date? = nil,
-                      completion: @escaping ([String: Any]?, String?) -> Void) {
+    /// 通用 GET（code==200 判成功），回调 data 字段原始 JSON（dict / array 均可）
+    private static func fetchRaw(apiKey: String, path: String, from: Date? = nil, to: Date? = nil,
+                                 completion: @escaping (Any?, String?) -> Void) {
         let req: URLRequest?
         if let from = from, let to = to {
             var comp = URLComponents(string: base + path)
@@ -161,8 +197,16 @@ enum Fetcher {
             if let code = obj["code"] as? Int, code != 200 {
                 completion(nil, "code \(code) \(obj["msg"] as? String ?? "")"); return
             }
-            completion(obj["data"] as? [String: Any], nil)
+            completion(obj["data"], nil)
         }.resume()
+    }
+
+    /// data 为 dict 的接口走这里（额度窗口 / token 统计 / MCP 工具）
+    static func fetch(apiKey: String, path: String, from: Date? = nil, to: Date? = nil,
+                      completion: @escaping ([String: Any]?, String?) -> Void) {
+        fetchRaw(apiKey: apiKey, path: path, from: from, to: to) { data, err in
+            completion(data as? [String: Any], err)
+        }
     }
 
     /// 额度窗口：5 小时 + 7 天（周）
@@ -233,6 +277,80 @@ enum Fetcher {
                 webRead: total["totalWebReadMcpCount"] as? Double ?? 0), nil)
         }
     }
+
+    // 充值卡（额度重置卡）：ZCode 侧接口，成功码为 code==0（与 open.bigmodel.cn 系的 200 不同）
+    static let resetBase = "https://zcode.z.ai"
+
+    /// 查询可用充值卡列表；jwt/maas 为 ZCode 登录态 token，过期/缺失由上层优雅降级
+    static func fetchResetCards(jwt: String, maas: String,
+                                completion: @escaping (ResetCards?, String?) -> Void) {
+        guard let url = URL(string: resetBase + "/api/v1/coding-plan/reset/status") else {
+            completion(nil, "bad url"); return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        // zcodejwttoken 明文可能已自带 "Bearer " 前缀，避免重复拼接
+        let auth = jwt.lowercased().hasPrefix("bearer ") ? jwt : "Bearer \(jwt)"
+        req.setValue(auth, forHTTPHeaderField: "Authorization")
+        req.setValue(maas, forHTTPHeaderField: "X-Bigmodel-Authorization")
+        req.setValue("PERSONAL", forHTTPHeaderField: "Bigmodel-Target-Type")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("GlmUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            guard err == nil, let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                completion(nil, err?.localizedDescription ?? "bad response"); return
+            }
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                completion(nil, "HTTP \(http.statusCode)"); return
+            }
+            let code = obj["code"] as? Int ?? -1
+            guard code == 0 else {
+                completion(nil, "code \(code) \(obj["msg"] as? String ?? "")"); return
+            }
+            guard let d = obj["data"] as? [String: Any] else {
+                completion(nil, "no data"); return
+            }
+            func cards(_ key: String) -> [Date] {
+                (d[key] as? [[String: Any]] ?? [])
+                    .compactMap { ($0["expire_at"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) } }
+                    .filter { $0 > Date() }   // 只保留未过期
+            }
+            completion(ResetCards(fiveHour: cards("available_five_hour_resets"),
+                                  week: cards("available_week_resets")), nil)
+        }.resume()
+    }
+
+    /// 套餐订阅：取 status=="VALID" 的第一条；到期时间解析失败时仅降级显示名称
+    static func fetchSubscription(apiKey: String,
+                                  completion: @escaping (SubscriptionInfo?, String?) -> Void) {
+        fetchRaw(apiKey: apiKey, path: "/api/biz/subscription/list") { data, err in
+            guard err == nil else { completion(nil, err); return }
+            guard let list = data as? [[String: Any]] else {
+                completion(nil, "unexpected payload"); return
+            }
+            guard let sub = list.first(where: { ($0["status"] as? String) == "VALID" }) else {
+                completion(nil, "no valid subscription"); return
+            }
+            completion(SubscriptionInfo(name: sub["productName"] as? String ?? "?",
+                                        expireDate: parseValidEnd(sub["valid"] as? String ?? "")), nil)
+        }
+    }
+
+    // valid 形如 "2026-09-26 18:18:52-2027-09-26 10:00:00"：日期对内部也含 '-'，
+    // 用正则取最后一个完整 "yyyy-MM-dd HH:mm:ss"（即到期时间），空格转 T 后按本地时区解析
+    private static func parseValidEnd(_ valid: String) -> Date? {
+        guard let re = try? NSRegularExpression(pattern: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#) else {
+            return nil
+        }
+        let ns = valid as NSString
+        guard let m = re.matches(in: valid, range: NSRange(location: 0, length: ns.length)).last else {
+            return nil
+        }
+        let s = ns.substring(with: m.range).replacingOccurrences(of: " ", with: "T")
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"   // 无时区字段，按本地时区解释
+        return f.date(from: s)
+    }
 }
 
 // MARK: - 菜单栏堆叠两行文字渲染
@@ -292,6 +410,34 @@ enum Fmt {
         f.dateFormat = "MM-dd HH:mm"
         return f.string(from: d)
     }
+    // 充值卡/套餐到期提示：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期（本地时区）
+    static func expires(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        let cal = Calendar.current
+        if cal.isDateInToday(d) {
+            f.dateFormat = "'今天' HH:mm"
+        } else if cal.isDateInTomorrow(d) {
+            f.dateFormat = "'明天' HH:mm"
+        } else {
+            f.dateFormat = "yyyy-MM-dd HH:mm"
+        }
+        return f.string(from: d)
+    }
+    // 自诊断 / --once 输出用完整日期时间（本地时区）
+    static let fullTime: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+    // 套餐到期输出用秒级完整时间（本地时区）
+    static let fullSec: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
     // token 数量缩写：999 / 12.3K / 1.23M
     static func tokens(_ v: Double) -> String {
         if v >= 1_000_000 { return String(format: "%.2fM", v / 1_000_000) }
@@ -468,6 +614,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 else if err != nil, merged.tokensError == nil { merged.tokensError = err }
                 wg.leave()
             }
+            // 充值卡（额度重置卡）：ZCode 登录态 token 缺失/过期时优雅降级为错误提示
+            if let (jwt, maas) = CredStore.loadResetTokens() {
+                wg.enter()
+                Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r, err in
+                    if let r = r { merged.resetCards = r }
+                    else if err != nil { merged.resetCardsError = err }
+                    wg.leave()
+                }
+            } else {
+                merged.resetCardsError = "未找到 ZCode 登录凭证"
+            }
+            // 套餐到期（与充值卡同周期刷新）
+            wg.enter()
+            Fetcher.fetchSubscription(apiKey: key) { r, _ in
+                if let r = r { merged.subscription = r }
+                wg.leave()
+            }
             group.enter()
             wg.notify(queue: .global()) { group.leave() }
         }
@@ -492,11 +655,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.tokens30d = old.tokens30d
                 merged.tools30d = old.tools30d
                 merged.tokensError = old.tokensError
+                merged.resetCards = old.resetCards
+                merged.resetCardsError = old.resetCardsError
+                merged.subscription = old.subscription
             } else {
                 if merged.tokensToday == nil { merged.tokensToday = old.tokensToday }
                 if merged.tokens7d == nil { merged.tokens7d = old.tokens7d }
                 if merged.tokens30d == nil { merged.tokens30d = old.tokens30d }
                 if merged.tools30d == nil { merged.tools30d = old.tools30d }
+                if merged.resetCards == nil { merged.resetCards = old.resetCards }
+                if merged.subscription == nil { merged.subscription = old.subscription }
             }
             self.usage = merged
             self.renderBar()
@@ -538,6 +706,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func writeStatus(line1: String, line2: String, peakLine: String) {
         let dir = NSHomeDirectory() + "/Library/Application Support/GlmUsage"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // 充值卡/套餐自诊断（只含到期时间与名称，不含任何密钥）
+        var cardsStatus: [String] = []
+        if let c = usage.resetCards {
+            cardsStatus += c.fiveHour.sorted().map { "5h:" + Fmt.fullTime.string(from: $0) }
+            cardsStatus += c.week.sorted().map { "week:" + Fmt.fullTime.string(from: $0) }
+        }
         let info: [String: Any] = [
             "line1": line1,
             "line2": line2,
@@ -552,7 +726,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "weekRemaining": usage.week?.usedRemainingRatio ?? -1,
             "level": usage.level ?? "",
             "quotaError": usage.quotaError ?? "",
-            "tokensError": usage.tokensError ?? ""
+            "tokensError": usage.tokensError ?? "",
+            "resetCards": cardsStatus,
+            "subscription": usage.subscription?.name ?? "",
+            "subscriptionExpire": usage.subscription?.expireDate.map { Fmt.iso8601.string(from: $0) } ?? ""
         ]
         if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted]) {
             try? data.write(to: URL(fileURLWithPath: dir + "/status.json"))
@@ -590,6 +767,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pk = Peak.evaluate()
         menu.addItem(info(pk.line))
         if let ev = pk.eventLine { menu.addItem(info(ev)) }
+
+        // 充值卡（额度重置卡）：按过期时间升序，≤72 小时临期加 ⚠️ 前缀
+        func cardLine(_ label: String, _ d: Date) -> String {
+            let warn = d.timeIntervalSinceNow <= 72 * 3600
+            return (warn ? "⚠️ " : "  ") + "\(label) · \(Fmt.expires(d)) 过期"
+        }
+        if let cards = usage.resetCards {
+            let f5 = cards.fiveHour.sorted(), wk = cards.week.sorted()
+            if f5.isEmpty && wk.isEmpty {
+                menu.addItem(info("充值卡（额度重置）：暂无可用"))
+            } else {
+                var parts: [String] = []
+                if !f5.isEmpty { parts.append("5 小时 ×\(f5.count)") }
+                if !wk.isEmpty { parts.append("周 ×\(wk.count)") }
+                menu.addItem(info("充值卡（额度重置）：" + parts.joined(separator: " · ")))
+                for d in f5 { menu.addItem(info(cardLine("5 小时卡", d))) }
+                for d in wk { menu.addItem(info(cardLine("周卡", d))) }
+            }
+        } else if let e = usage.resetCardsError {
+            let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
+            menu.addItem(info("充值卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试）"))
+        }
+
+        // 套餐到期
+        if let sub = usage.subscription {
+            var l = "套餐：\(sub.name)"
+            if let exp = sub.expireDate { l += " · \(Fmt.expires(exp)) 到期" }
+            menu.addItem(info(l))
+        }
 
         // Token 用量（服务端统计）
         menu.addItem(.separator())
@@ -726,6 +932,24 @@ func onceMode() {
         if let r = r { data.tools30d = r }
         group.leave()
     }
+    // 充值卡（额度重置卡）+ 套餐到期：与 token 统计同批拉取
+    var subErr: String?
+    if let (jwt, maas) = CredStore.loadResetTokens() {
+        group.enter()
+        Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r, err in
+            if let r = r { data.resetCards = r }
+            else { data.resetCardsError = err ?? "?" }
+            group.leave()
+        }
+    } else {
+        data.resetCardsError = "未找到 ZCode 登录凭证"
+    }
+    group.enter()
+    Fetcher.fetchSubscription(apiKey: key) { r, err in
+        if let r = r { data.subscription = r }
+        else { subErr = err ?? "?" }
+        group.leave()
+    }
     _ = group.wait(timeout: .now() + 25)
 
     func line(_ e: LimitEntry?) -> String {
@@ -749,6 +973,22 @@ func onceMode() {
     if let t = data.tools30d {
         print("tools 30d: search=\(Int(t.networkSearch)) webRead=\(Int(t.webRead))")
     }
+    if let c = data.resetCards {
+        var s = "cards: 5h x\(c.fiveHour.count)"
+        let f5 = c.fiveHour.sorted().map { Fmt.fullTime.string(from: $0) }.joined(separator: ", ")
+        if !f5.isEmpty { s += " [\(f5)]" }
+        s += " week x\(c.week.count)"
+        let wk = c.week.sorted().map { Fmt.fullTime.string(from: $0) }.joined(separator: ", ")
+        if !wk.isEmpty { s += " [\(wk)]" }
+        print(s)
+    }
+    if let e = data.resetCardsError { print("cards error: \(e)") }
+    if let sub = data.subscription {
+        var s = "subscription: \(sub.name)"
+        if let exp = sub.expireDate { s += " expire=\(Fmt.fullSec.string(from: exp))" }
+        print(s)
+    }
+    if let e = subErr { print("subscription error: \(e)") }
     if let e = data.quotaError { print("quota error: \(e)") }
     print("lastOK: quota=\(Fmt.lastOK(quotaOK)) tokens=\(Fmt.lastOK(tokensOK))")
     exit(0)
