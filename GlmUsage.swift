@@ -768,7 +768,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(pk.line))
         if let ev = pk.eventLine { menu.addItem(info(ev)) }
 
-        // 充值卡（额度重置卡）：按过期时间升序，≤72 小时临期加 ⚠️ 前缀
+        // 充值卡（额度重置卡）板块：首轮未拉到数据时不画分隔线，避免连续双 separator；≤72 小时临期加 ⚠️
+        if usage.resetCards != nil || usage.resetCardsError != nil {
+            menu.addItem(.separator())
+        }
         func cardLine(_ label: String, _ d: Date) -> String {
             let warn = d.timeIntervalSinceNow <= 72 * 3600
             return (warn ? "⚠️ " : "  ") + "\(label) · \(Fmt.expires(d)) 过期"
@@ -788,13 +791,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let e = usage.resetCardsError {
             let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
             menu.addItem(info("充值卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试）"))
-        }
-
-        // 套餐到期
-        if let sub = usage.subscription {
-            var l = "套餐：\(sub.name)"
-            if let exp = sub.expireDate { l += " · \(Fmt.expires(exp)) 到期" }
-            menu.addItem(info(l))
         }
 
         // Token 用量（服务端统计）
