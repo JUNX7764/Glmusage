@@ -278,6 +278,13 @@ enum Fmt {
         f.dateFormat = "HH:mm"
         return f.string(from: d)
     }
+    // 最后成功时间的占位口径：无记录用 "--"（time() 对 nil 返回空串，不适合过期提示行）
+    static func lastOK(_ d: Date?) -> String {
+        guard let d = d else { return "--" }
+        return time(d)
+    }
+    // 自诊断 JSON 用；仅主线程调用，static 单次构造避免每次刷新重复分配
+    static let iso8601 = ISO8601DateFormatter()
     static func dayTime(_ d: Date?) -> String {
         guard let d = d else { return "" }
         let f = DateFormatter()
@@ -522,8 +529,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
-        statusItem.button?.toolTip = "GLM 余额 · 额度最后成功 \(quotaLastOK.map { Fmt.time($0) } ?? "--")"
-            + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
+        statusItem.button?.toolTip = "GLM 余额 · 额度最后成功 \(Fmt.lastOK(quotaLastOK))"
+            + " · Token 最后成功 \(Fmt.lastOK(tokensLastOK))"
         writeStatus(line1: line1, line2: line2, peakLine: peak.line)
     }
 
@@ -535,10 +542,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "line1": line1,
             "line2": line2,
             "peak": peakLine,
-            "updatedAt": ISO8601DateFormatter().string(from: Date()),
+            "updatedAt": Fmt.iso8601.string(from: Date()),
             // 两组数据的最后成功时间（ISO8601，无则空串）与过期标记
-            "quotaLastOK": quotaLastOK.map { ISO8601DateFormatter().string(from: $0) } ?? "",
-            "tokensLastOK": tokensLastOK.map { ISO8601DateFormatter().string(from: $0) } ?? "",
+            "quotaLastOK": quotaLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
+            "tokensLastOK": tokensLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
             "quotaStale": quotaStale,
             "tokensStale": tokensStale,
             "fiveHourRemaining": usage.fiveHour?.usedRemainingRatio ?? -1,
@@ -614,10 +621,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 数据过期提示：仅对应组过期时显示，紧贴更新时间行
         if quotaStale {
-            menu.addItem(info("⚠️ 额度数据已过期 · 最后成功 \(quotaLastOK.map { Fmt.time($0) } ?? "--")"))
+            menu.addItem(info("⚠️ 额度数据已过期 · 最后成功 \(Fmt.lastOK(quotaLastOK))"))
         }
         if tokensStale {
-            menu.addItem(info("⚠️ Token 数据已过期 · 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"))
+            menu.addItem(info("⚠️ Token 数据已过期 · 最后成功 \(Fmt.lastOK(tokensLastOK))"))
         }
 
         menu.addItem(.separator())
@@ -743,7 +750,7 @@ func onceMode() {
         print("tools 30d: search=\(Int(t.networkSearch)) webRead=\(Int(t.webRead))")
     }
     if let e = data.quotaError { print("quota error: \(e)") }
-    print("lastOK: quota=\(quotaOK.map { Fmt.time($0) } ?? "--") tokens=\(tokensOK.map { Fmt.time($0) } ?? "--")")
+    print("lastOK: quota=\(Fmt.lastOK(quotaOK)) tokens=\(Fmt.lastOK(tokensOK))")
     exit(0)
 }
 
