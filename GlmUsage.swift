@@ -316,14 +316,19 @@ enum Fmt {
 enum Peak {
     static let tz = TimeZone(identifier: "Asia/Shanghai")!
 
-    private static var cal: Calendar {
+    private static let cal: Calendar = {
         var c = Calendar(identifier: .gregorian)
         c.timeZone = tz
         return c
+    }()
+
+    // 两个限时活动同在 2026 年 9 月起、10-07 止，仅 9 月起始日不同
+    private static func eventActive(_ dc: DateComponents, fromSepDay startDay: Int) -> Bool {
+        dc.year == 2026 && ((dc.month == 9 && dc.day! >= startDay) || (dc.month == 10 && dc.day! <= 7))
     }
 
     private static func isFestivalDay(_ dc: DateComponents) -> Bool {
-        dc.year == 2026 && ((dc.month == 9 && dc.day! >= 25) || (dc.month == 10 && dc.day! <= 7))
+        eventActive(dc, fromSepDay: 25)
     }
 
     private static func isNightWindow(_ date: Date) -> Bool {
@@ -331,8 +336,7 @@ enum Peak {
         guard h >= 23 || h < 9 else { return false }
         // 凌晨 0~9 点归属前一晚的窗口，起算日期相应前移一天
         let base = h < 9 ? cal.date(byAdding: .day, value: -1, to: date)! : date
-        let dc = cal.dateComponents([.year, .month, .day], from: base)
-        return dc.year == 2026 && ((dc.month == 9 && dc.day! >= 3) || (dc.month == 10 && dc.day! <= 7))
+        return eventActive(cal.dateComponents([.year, .month, .day], from: base), fromSepDay: 3)
     }
 
     /// 下一个高峰开始时刻（跳过周末与双节活动日）
@@ -352,8 +356,8 @@ enum Peak {
 
     /// emoji：⚡ 深夜活动 ＞ 🔥 高峰 ＞ 无（普通非高峰不占宽度）
     static func evaluate(at date: Date = Date()) -> (emoji: String?, line: String, eventLine: String?) {
-        let c = cal.dateComponents([.month, .day, .hour, .weekday], from: date)
-        let festival = isFestivalDay(cal.dateComponents([.year, .month, .day], from: date))
+        let c = cal.dateComponents([.year, .month, .day, .hour, .weekday], from: date)
+        let festival = isFestivalDay(c)
         let night = isNightWindow(date)
         let peak = !festival && (2...6).contains(c.weekday!) && c.hour! >= 14 && c.hour! < 18
 
