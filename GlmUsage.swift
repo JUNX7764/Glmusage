@@ -438,8 +438,9 @@ enum Fmt {
         f.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return f
     }()
-    // token 数量缩写：999 / 12.3K / 1.23M
+    // token 数量缩写：999 / 12.3K / 1.23M / 1.23B
     static func tokens(_ v: Double) -> String {
+        if v >= 1_000_000_000 { return String(format: "%.2fB", v / 1_000_000_000) }
         if v >= 1_000_000 { return String(format: "%.2fM", v / 1_000_000) }
         if v >= 10_000 { return String(format: "%.1fK", v / 1_000) }
         if v >= 1_000 { return String(format: "%.2fK", v / 1_000) }
