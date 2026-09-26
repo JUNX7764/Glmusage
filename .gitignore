@@ -1,0 +1,8 @@
+# 构建产物
+*.app
+*-bin
+*.zip
+.DS_Store
+# 图标生成中间产物（保留 icns 成品）
+AppIcon.iconset/
+icon_1024x1024.png
