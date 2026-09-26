@@ -392,6 +392,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let launchAgentLabel = "com.local.glm-usage"
     // token 统计每 N 个刷新周期拉一次（额度窗口仍每 60s 刷新）
     private let tokenEveryCycles = 5
+    // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
+    private let quotaStaleAfter: TimeInterval = 600
+    private let tokensStaleAfter: TimeInterval = 1800
+    // 两组数据各自的最后成功拉取时间（5H/7D 同源共用 quotaLastOK；token 三窗口+MCP 共用 tokensLastOK）
+    private var quotaLastOK: Date?
+    private var tokensLastOK: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[GlmUsage] launched, creating status item")
@@ -461,6 +467,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
+            // 必须在旧值回填之前判定：本次新拉到的值非 nil 才算成功、才推进 lastOK，
+            // 由旧值回填得来的数据绝不更新 lastOK（否则断网时过期数据会被误标为新鲜）
+            if merged.fiveHour != nil || merged.week != nil { self.quotaLastOK = Date() }
+            if tokens, merged.tokensToday != nil || merged.tokens7d != nil
+                || merged.tokens30d != nil || merged.tools30d != nil {
+                self.tokensLastOK = Date()
+            }
             // 网络瞬断（如睡眠唤醒）时保留上次成功数据，避免菜单栏闪 "--"
             let old = self.usage
             if merged.fiveHour == nil { merged.fiveHour = old.fiveHour }
@@ -484,14 +497,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；峰谷状态加 emoji 前缀
+    // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
+    // 无数据不算过期——菜单里本就显示"暂无数据"，无需再标注。
+    private func isStale(_ lastOK: Date?, hasData: Bool, after: TimeInterval) -> Bool {
+        guard hasData else { return false }
+        guard let t = lastOK else { return true }
+        return Date().timeIntervalSince(t) > after
+    }
+    private var quotaStale: Bool {
+        isStale(quotaLastOK, hasData: usage.fiveHour != nil || usage.week != nil, after: quotaStaleAfter)
+    }
+    private var tokensStale: Bool {
+        isStale(tokensLastOK, hasData: usage.tokensToday != nil || usage.tokens7d != nil
+            || usage.tokens30d != nil || usage.tools30d != nil, after: tokensStaleAfter)
+    }
+
+    // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；峰谷状态加 emoji 前缀；过期组加 ⚠️ 前缀
+    // （⚠️ 放在峰谷 emoji 之后、"5H"/"7D" 文本之前，不影响 Peak 判定；token 组无菜单栏行，仅在下拉菜单标注）
     private func renderBar() {
         let peak = Peak.evaluate()
-        let line1 = (peak.emoji.map { "\($0) " } ?? "") + "5H \(Fmt.pct(usage.fiveHour?.usedRemainingRatio))"
-        let line2 = "7D \(Fmt.pct(usage.week?.usedRemainingRatio))"
+        let staleQuota = quotaStale
+        let line1 = (peak.emoji.map { "\($0) " } ?? "") + (staleQuota ? "⚠️ " : "") + "5H \(Fmt.pct(usage.fiveHour?.usedRemainingRatio))"
+        let line2 = (staleQuota ? "⚠️ " : "") + "7D \(Fmt.pct(usage.week?.usedRemainingRatio))"
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
-        statusItem.button?.toolTip = "GLM 余额 · 更新于 \(Fmt.time(usage.updatedAt))"
+        // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
+        statusItem.button?.toolTip = "GLM 余额 · 额度最后成功 \(quotaLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
         writeStatus(line1: line1, line2: line2, peakLine: peak.line)
     }
 
@@ -504,6 +536,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "line2": line2,
             "peak": peakLine,
             "updatedAt": ISO8601DateFormatter().string(from: Date()),
+            // 两组数据的最后成功时间（ISO8601，无则空串）与过期标记
+            "quotaLastOK": quotaLastOK.map { ISO8601DateFormatter().string(from: $0) } ?? "",
+            "tokensLastOK": tokensLastOK.map { ISO8601DateFormatter().string(from: $0) } ?? "",
+            "quotaStale": quotaStale,
+            "tokensStale": tokensStale,
             "fiveHourRemaining": usage.fiveHour?.usedRemainingRatio ?? -1,
             "weekRemaining": usage.week?.usedRemainingRatio ?? -1,
             "level": usage.level ?? "",
@@ -575,6 +612,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(info("Token 统计获取失败：\(e)"))
         }
 
+        // 数据过期提示：仅对应组过期时显示，紧贴更新时间行
+        if quotaStale {
+            menu.addItem(info("⚠️ 额度数据已过期 · 最后成功 \(quotaLastOK.map { Fmt.time($0) } ?? "--")"))
+        }
+        if tokensStale {
+            menu.addItem(info("⚠️ Token 数据已过期 · 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"))
+        }
+
         menu.addItem(.separator())
         menu.addItem(info("更新于 \(Fmt.time(usage.updatedAt))"))
         menu.addItem(.separator())
@@ -642,8 +687,12 @@ func onceMode() {
     }
     let group = DispatchGroup()
     var data = UsageData()
+    // 两组数据的最后成功时间（本次拉到新值才算成功，与 App 内 quotaLastOK/tokensLastOK 口径一致）
+    var quotaOK: Date?
+    var tokensOK: Date?
     group.enter()
     Fetcher.fetchQuota(apiKey: key) { r in
+        if r.fiveHour != nil || r.week != nil { quotaOK = Date() }
         data.fiveHour = r.fiveHour; data.week = r.week
         data.level = r.level; data.quotaError = r.quotaError
         group.leave()
@@ -655,6 +704,7 @@ func onceMode() {
         group.enter()
         Fetcher.fetchModelUsage(apiKey: key, from: from, to: now) { r, err in
             if let r = r {
+                tokensOK = Date()
                 switch label {
                 case "today": data.tokensToday = r
                 case "7d": data.tokens7d = r
@@ -693,6 +743,7 @@ func onceMode() {
         print("tools 30d: search=\(Int(t.networkSearch)) webRead=\(Int(t.webRead))")
     }
     if let e = data.quotaError { print("quota error: \(e)") }
+    print("lastOK: quota=\(quotaOK.map { Fmt.time($0) } ?? "--") tokens=\(tokensOK.map { Fmt.time($0) } ?? "--")")
     exit(0)
 }
 
