@@ -76,7 +76,7 @@ enum CredStore {
 
 /// quota/limit 返回的一条窗口限制（credit 额度）
 struct LimitEntry {
-    var label: String          // "5 小时窗口" / "月度额度"
+    var label: String          // "5 小时窗口" / "7 天额度"
     var isFiveHour: Bool
     var limit: Double          // usage 字段 = 窗口总额度（credits）
     var used: Double           // currentValue
@@ -101,7 +101,7 @@ struct ToolUsage {
 
 struct UsageData {
     var fiveHour: LimitEntry?
-    var month: LimitEntry?
+    var week: LimitEntry?
     var level: String?                 // 套餐等级 lite/pro/max...
     var tokensToday: ModelUsage?
     var tokens7d: ModelUsage?
@@ -165,7 +165,7 @@ enum Fetcher {
         }.resume()
     }
 
-    /// 额度窗口：5 小时 + 月度
+    /// 额度窗口：5 小时 + 7 天（周）
     static func fetchQuota(apiKey: String, completion: @escaping (UsageData) -> Void) {
         var result = UsageData()
         fetch(apiKey: apiKey, path: "/api/monitor/usage/quota/limit") { data, err in
@@ -180,12 +180,13 @@ enum Fetcher {
                 let type = e["type"] as? String ?? ""
                 let unit = e["unit"] as? Int ?? 0
                 let number = e["number"] as? Int ?? 0
-                // 现行 API：CREDIT_LIMIT + unit 枚举（3=小时, 6=月）；旧版插件：TOKENS_LIMIT/TIME_LIMIT
+                // 现行 API：CREDIT_LIMIT + unit 枚举（3=小时, 6=周）——官方套餐为"每 5 小时 + 每周"积分，
+                // 旧版插件：TOKENS_LIMIT(5h)/TIME_LIMIT(月度 MCP) 已随 2026-07 积分制改版下线
                 let isFiveHour = type == "TOKENS_LIMIT" || (type == "CREDIT_LIMIT" && unit == 3 && number == 5)
-                let isMonth = type == "TIME_LIMIT" || (type == "CREDIT_LIMIT" && unit == 6 && number == 1)
-                guard isFiveHour || isMonth else { continue }
+                let isWeek = type == "TIME_LIMIT" || (type == "CREDIT_LIMIT" && unit == 6)
+                guard isFiveHour || isWeek else { continue }
                 let entry = LimitEntry(
-                    label: isFiveHour ? "5 小时窗口" : "月度额度",
+                    label: isFiveHour ? "5 小时窗口" : "7 天额度",
                     isFiveHour: isFiveHour,
                     limit: e["usage"] as? Double ?? 0,
                     used: e["currentValue"] as? Double ?? 0,
@@ -193,9 +194,9 @@ enum Fetcher {
                     usedRatio: max(0, min(1, (e["percentage"] as? Double ?? 0) / 100)),
                     reset: (e["nextResetTime"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) })
                 if isFiveHour, result.fiveHour == nil { result.fiveHour = entry }
-                if isMonth, result.month == nil { result.month = entry }
+                if isWeek, result.week == nil { result.week = entry }
             }
-            if result.fiveHour == nil && result.month == nil {
+            if result.fiveHour == nil && result.week == nil {
                 result.quotaError = "unexpected payload"
             }
         }
@@ -302,6 +303,81 @@ enum Fmt {
     }()
 }
 
+// MARK: - 峰谷时段（新版积分制）
+//
+// 官方规则（docs.bigmodel.cn/cn/coding-plan/overview）：
+//   高峰 = 周一~周五 14:00–18:00（北京时间 UTC+8），积分全价抵扣；
+//   其余时间（含周末全天）= 非高峰，积分 5 折抵扣。
+//   （老版 V1/V2 套餐的 3 倍/1 倍口径不适用于积分制账号）
+//   限时活动按官方公告硬编码日期，过期自动失效：
+//     双节 2026-09-25 ~ 10-07：全天按非高峰 5 折
+//     深夜错峰 2026-09-03 ~ 10-07 每日 23:00~次日09:00：ZCode 内 Flash 0 消耗、其他 Agent 额度 ×2
+
+enum Peak {
+    static let tz = TimeZone(identifier: "Asia/Shanghai")!
+
+    private static var cal: Calendar {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = tz
+        return c
+    }
+
+    private static func isFestivalDay(_ dc: DateComponents) -> Bool {
+        dc.year == 2026 && ((dc.month == 9 && dc.day! >= 25) || (dc.month == 10 && dc.day! <= 7))
+    }
+
+    private static func isNightWindow(_ date: Date) -> Bool {
+        let h = cal.component(.hour, from: date)
+        guard h >= 23 || h < 9 else { return false }
+        // 凌晨 0~9 点归属前一晚的窗口，起算日期相应前移一天
+        let base = h < 9 ? cal.date(byAdding: .day, value: -1, to: date)! : date
+        let dc = cal.dateComponents([.year, .month, .day], from: base)
+        return dc.year == 2026 && ((dc.month == 9 && dc.day! >= 3) || (dc.month == 10 && dc.day! <= 7))
+    }
+
+    /// 下一个高峰开始时刻（跳过周末与双节活动日）
+    static func nextPeakStart(_ date: Date) -> Date {
+        let today = cal.startOfDay(for: date)
+        let h = cal.component(.hour, from: date)
+        var day = today
+        for _ in 0..<20 {   // 双节可连续覆盖 10+ 天，搜索窗口须长于活动跨度
+            let dc = cal.dateComponents([.year, .month, .day, .weekday], from: day)
+            if (2...6).contains(dc.weekday!), !isFestivalDay(dc), day > today || h < 14 {
+                return cal.date(bySettingHour: 14, minute: 0, second: 0, of: day)!
+            }
+            day = cal.date(byAdding: .day, value: 1, to: day)!
+        }
+        return date
+    }
+
+    /// emoji：⚡ 深夜活动 ＞ 🔥 高峰 ＞ 无（普通非高峰不占宽度）
+    static func evaluate(at date: Date = Date()) -> (emoji: String?, line: String, eventLine: String?) {
+        let c = cal.dateComponents([.month, .day, .hour, .weekday], from: date)
+        let festival = isFestivalDay(cal.dateComponents([.year, .month, .day], from: date))
+        let night = isNightWindow(date)
+        let peak = !festival && (2...6).contains(c.weekday!) && c.hour! >= 14 && c.hour! < 18
+
+        let np = nextPeakStart(date)
+        let npText: String
+        if cal.isDate(np, inSameDayAs: date) {
+            npText = "今天 14:00"
+        } else if let tomorrow = cal.date(byAdding: .day, value: 1, to: date), cal.isDate(np, inSameDayAs: tomorrow) {
+            npText = "明天 14:00"
+        } else {
+            npText = Fmt.dayTime(np)
+        }
+
+        let emoji = night ? "⚡" : (peak ? "🔥" : nil)
+        let line = peak
+            ? "🔥 高峰期 · 积分全价（18:00 后恢复 5 折）"
+            : "⚡ 非高峰 · 积分 5 折（下个高峰 \(npText)）"
+        var eventLine: String? = nil
+        if festival { eventLine = "🎉 双节活动：全天按非高峰 5 折（至 10-07）" }
+        if night { eventLine = "🌙 深夜错峰：Flash 免费 · 其他 Agent 额度 ×2（至 10-07）" }
+        return (emoji, line, eventLine)
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -339,7 +415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         group.enter()
         Fetcher.fetchQuota(apiKey: key) { r in
             merged.fiveHour = r.fiveHour
-            merged.month = r.month
+            merged.week = r.week
             merged.level = r.level
             merged.quotaError = r.quotaError
             group.leave()
@@ -384,7 +460,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 网络瞬断（如睡眠唤醒）时保留上次成功数据，避免菜单栏闪 "--"
             let old = self.usage
             if merged.fiveHour == nil { merged.fiveHour = old.fiveHour }
-            if merged.month == nil { merged.month = old.month }
+            if merged.week == nil { merged.week = old.week }
             if merged.level == nil { merged.level = old.level }
             if !tokens {
                 merged.tokensToday = old.tokensToday
@@ -404,26 +480,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // 菜单栏显示：5H / MO 两行堆叠（显示余额）
+    // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；峰谷状态加 emoji 前缀
     private func renderBar() {
-        let line1 = "5H \(Fmt.pct(usage.fiveHour?.usedRemainingRatio))"
-        let line2 = "MO \(Fmt.pct(usage.month?.usedRemainingRatio))"
+        let peak = Peak.evaluate()
+        let line1 = (peak.emoji.map { "\($0) " } ?? "") + "5H \(Fmt.pct(usage.fiveHour?.usedRemainingRatio))"
+        let line2 = "7D \(Fmt.pct(usage.week?.usedRemainingRatio))"
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         statusItem.button?.toolTip = "GLM 余额 · 更新于 \(Fmt.time(usage.updatedAt))"
-        writeStatus(line1: line1, line2: line2)
+        writeStatus(line1: line1, line2: line2, peakLine: peak.line)
     }
 
     // 自诊断：把渲染内容写到本地，便于排查
-    private func writeStatus(line1: String, line2: String) {
+    private func writeStatus(line1: String, line2: String, peakLine: String) {
         let dir = NSHomeDirectory() + "/Library/Application Support/GlmUsage"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let info: [String: Any] = [
             "line1": line1,
             "line2": line2,
+            "peak": peakLine,
             "updatedAt": ISO8601DateFormatter().string(from: Date()),
             "fiveHourRemaining": usage.fiveHour?.usedRemainingRatio ?? -1,
-            "monthRemaining": usage.month?.usedRemainingRatio ?? -1,
+            "weekRemaining": usage.week?.usedRemainingRatio ?? -1,
             "level": usage.level ?? "",
             "quotaError": usage.quotaError ?? "",
             "tokensError": usage.tokensError ?? ""
@@ -458,7 +536,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return s
         }
         menu.addItem(info(limitLine(usage.fiveHour)))
-        menu.addItem(info(limitLine(usage.month)))
+        menu.addItem(info(limitLine(usage.week)))
+
+        // 峰谷状态 + 限时活动
+        let pk = Peak.evaluate()
+        menu.addItem(info(pk.line))
+        if let ev = pk.eventLine { menu.addItem(info(ev)) }
 
         // Token 用量（服务端统计）
         menu.addItem(.separator())
@@ -557,7 +640,7 @@ func onceMode() {
     var data = UsageData()
     group.enter()
     Fetcher.fetchQuota(apiKey: key) { r in
-        data.fiveHour = r.fiveHour; data.month = r.month
+        data.fiveHour = r.fiveHour; data.week = r.week
         data.level = r.level; data.quotaError = r.quotaError
         group.leave()
     }
@@ -590,10 +673,12 @@ func onceMode() {
         if e.reset != nil { s += " reset=\(Fmt.dayTime(e.reset))" }
         return s
     }
-    print("menubar: 5H \(Fmt.pct(data.fiveHour?.usedRemainingRatio)) / MO \(Fmt.pct(data.month?.usedRemainingRatio))")
+    let pk = Peak.evaluate()
+    print("menubar: 5H \(Fmt.pct(data.fiveHour?.usedRemainingRatio)) / 7D \(Fmt.pct(data.week?.usedRemainingRatio))")
+    print("peak: \(pk.line)\(pk.eventLine.map { "\n  \($0)" } ?? "")")
     print("level: \(data.level ?? "?")")
     print("5h  \(line(data.fiveHour))")
-    print("mo  \(line(data.month))")
+    print("7d  \(line(data.week))")
     for (label, s) in [("today", data.tokensToday), ("7d", data.tokens7d), ("30d", data.tokens30d)] {
         if let s = s {
             let models = s.byModel.map { "\($0.name)=\(Fmt.tokens($0.tokens))" }.joined(separator: " ")
@@ -604,6 +689,40 @@ func onceMode() {
         print("tools 30d: search=\(Int(t.networkSearch)) webRead=\(Int(t.webRead))")
     }
     if let e = data.quotaError { print("quota error: \(e)") }
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--peak-test") {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd HH:mm"
+    f.timeZone = Peak.tz
+    let cases = [
+        "2026-09-24 15:00",  // 周四 · 双节前的普通工作日高峰
+        "2026-09-25 15:00",  // 周五 · 双节第一天，活动覆盖高峰
+        "2026-09-26 15:00",  // 周六下午 · 周末全天非高峰
+        "2026-09-28 13:59",  // 周一 · 双节覆盖（常规规则此刻应为高峰前 1 分钟）
+        "2026-09-28 14:00",  // 周一 · 双节覆盖（常规规则此刻应进入高峰）
+        "2026-09-28 17:59",  // 周一 · 双节覆盖（常规高峰最后一分钟）
+        "2026-09-28 18:00",  // 周一 · 双节覆盖（常规高峰结束）
+        "2026-09-28 22:00",  // 周一晚 · 下个高峰=双节后首个工作日
+        "2026-09-30 23:30",  // 深夜活动开始 + 双节
+        "2026-10-01 08:59",  // 深夜活动尾段（归属 9-30 夜）
+        "2026-10-01 09:00",  // 深夜结束 · 双节白天
+        "2026-10-07 15:00",  // 双节最后一天（周三），活动覆盖
+        "2026-10-08 01:00",  // 最后一晚深夜活动的凌晨（归属 10-07 夜）
+        "2026-10-08 13:59",  // 双节后首个工作日 · 高峰前 1 分钟，下个高峰=今天
+        "2026-10-08 14:00",  // 双节后首个工作日 · 高峰开始
+        "2026-10-08 17:59",  // 高峰最后一分钟
+        "2026-10-08 18:00",  // 高峰结束
+        "2026-10-08 15:00",  // 高峰中（周四）
+        "2026-10-09 21:00",  // 周五晚 · 下个高峰=下周一
+        "2026-10-09 01:00",  // 活动结束后凌晨 · 无深夜标记
+    ]
+    for c in cases {
+        guard let d = f.date(from: c) else { print("bad case \(c)"); continue }
+        let r = Peak.evaluate(at: d)
+        print("\(c)  [\(r.emoji ?? "-")] \(r.line)\(r.eventLine.map { " | \($0)" } ?? "")")
+    }
     exit(0)
 }
 
