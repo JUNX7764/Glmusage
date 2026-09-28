@@ -558,7 +558,21 @@ enum Fetcher {
 // MARK: - 菜单栏堆叠两行文字渲染
 
 enum StackImage {
-    static func make(line1: String, line2: String) -> NSImage {
+    // 纯几何：badge（峰谷/过期 emoji）挂在文本列左侧向左突出，两行正文从同一 x 起左对齐（5H/7D 对齐）
+    static func geometry(badge1Width: CGFloat, badge2Width: CGFloat,
+                         text1Width: CGFloat, text2Width: CGFloat)
+            -> (textX: CGFloat, badge1X: CGFloat?, badge2X: CGFloat?, width: CGFloat) {
+        let margin: CGFloat = 1
+        let gap: CGFloat = 2
+        let hasBadge = badge1Width > 0 || badge2Width > 0
+        let textX = margin + (hasBadge ? ceil(max(badge1Width, badge2Width)) + gap : 0)
+        let badge1X = badge1Width > 0 ? textX - gap - ceil(badge1Width) : nil
+        let badge2X = badge2Width > 0 ? textX - gap - ceil(badge2Width) : nil
+        let width = textX + ceil(max(text1Width, text2Width)) + margin
+        return (textX, badge1X, badge2X, width)
+    }
+
+    static func make(badge1: String, line1: String, badge2: String, line2: String) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font,
@@ -566,12 +580,17 @@ enum StackImage {
         ]
         let s1 = NSAttributedString(string: line1, attributes: attrs)
         let s2 = NSAttributedString(string: line2, attributes: attrs)
-        let w = max(s1.size().width, s2.size().width) + 2
+        let b1 = badge1.isEmpty ? nil : NSAttributedString(string: badge1, attributes: attrs)
+        let b2 = badge2.isEmpty ? nil : NSAttributedString(string: badge2, attributes: attrs)
+        let g = geometry(badge1Width: b1?.size().width ?? 0, badge2Width: b2?.size().width ?? 0,
+                         text1Width: s1.size().width, text2Width: s2.size().width)
         let h: CGFloat = 21
-        let img = NSImage(size: NSSize(width: ceil(w), height: h))
+        let img = NSImage(size: NSSize(width: ceil(g.width), height: h))
         img.lockFocus()
-        s1.draw(at: NSPoint(x: 1, y: 10.5))
-        s2.draw(at: NSPoint(x: 1, y: 0.5))
+        if let x = g.badge1X { b1?.draw(at: NSPoint(x: x, y: 10.5)) }
+        if let x = g.badge2X { b2?.draw(at: NSPoint(x: x, y: 0.5)) }
+        s1.draw(at: NSPoint(x: g.textX, y: 10.5))
+        s2.draw(at: NSPoint(x: g.textX, y: 0.5))
         img.unlockFocus()
         img.isTemplate = true   // 自动适配深色/浅色菜单栏
         return img
@@ -975,13 +994,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isStale(subscriptionLastOK, hasData: usage.subscription != nil, after: 900)
     }
 
-    // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；峰谷状态加 emoji 前缀；过期组加 ⚠️ 前缀
-    // （⚠️ 放在峰谷 emoji 之后、"5H"/"7D" 文本之前，不影响 Peak 判定；token 组无菜单栏行，仅在下拉菜单标注）
+    // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；峰谷/过期 emoji 作为 badge 向左突出，正文列保持对齐
+    // （⚠️ 放在峰谷 emoji 之后，不影响 Peak 判定；token 组无菜单栏行，仅在下拉菜单标注）
     private func renderBar() {
         let peak = Peak.evaluate()
-        let line1 = (peak.emoji.map { "\($0) " } ?? "") + (fiveHourStale ? "⚠️ " : "") + "5H \(Fmt.pct(usage.fiveHour?.usedRemainingRatio))"
-        let line2 = (weekStale ? "⚠️ " : "") + "7D \(Fmt.pct(usage.week?.usedRemainingRatio))"
-        statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
+        let text1 = "5H \(Fmt.pct(usage.fiveHour?.usedRemainingRatio))"
+        let text2 = "7D \(Fmt.pct(usage.week?.usedRemainingRatio))"
+        let marks1 = [peak.emoji, fiveHourStale ? "⚠️" : nil].compactMap { $0 }
+        let marks2: [String] = weekStale ? ["⚠️"] : []
+        statusItem.button?.image = StackImage.make(
+            badge1: marks1.joined(), line1: text1,
+            badge2: marks2.joined(), line2: text2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = "GLM 余额 · 5H最后成功 \(Fmt.lastOK(fiveHourLastOK))"
@@ -990,7 +1013,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + " · 7天Token最后成功 \(Fmt.lastOK(tokens7dLastOK))"
             + " · 30天Token最后成功 \(Fmt.lastOK(tokens30dLastOK))"
             + " · MCP最后成功 \(Fmt.lastOK(toolsLastOK))"
-        writeStatus(line1: line1, line2: line2, peakLine: peak.line)
+        writeStatus(line1: (marks1.isEmpty ? "" : marks1.joined() + " ") + text1,
+                    line2: (marks2.isEmpty ? "" : marks2.joined() + " ") + text2,
+                    peakLine: peak.line)
     }
 
     // 自诊断：把渲染内容写到本地，便于排查
@@ -1522,7 +1547,26 @@ enum GLMOfflineRegression {
                        && combined.tokensToday != nil && combined.tools30d != nil,
                        "concurrent callback merges lost results")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge)")
+            // 菜单栏对齐：无 badge 时正文贴左缘（旧布局不变）；有 badge 时两行正文仍同一 x，badge 向左突出
+            let plain = StackImage.geometry(badge1Width: 0, badge2Width: 0, text1Width: 30, text2Width: 30)
+            try expect(plain.textX == 1 && plain.badge1X == nil && plain.badge2X == nil,
+                       "badge-free menubar layout drifted from the flush-left baseline")
+            let mark1 = NSAttributedString(string: "⚡⚠️").size().width
+            let mark2 = NSAttributedString(string: "⚠️").size().width
+            let marked = StackImage.geometry(badge1Width: mark1, badge2Width: mark2,
+                                             text1Width: 30, text2Width: 26)
+            try expect(marked.badge1X != nil && marked.badge2X != nil && marked.textX > 1
+                       && abs((marked.badge1X! + ceil(mark1)) - (marked.badge2X! + ceil(mark2))) < 0.5
+                       && marked.badge1X! + ceil(mark1) <= marked.textX
+                       && marked.badge2X! + ceil(mark2) <= marked.textX,
+                       "badge did not hang left of the aligned 5H/7D text column")
+            let line2Only = StackImage.geometry(badge1Width: 0, badge2Width: mark2,
+                                                text1Width: 30, text2Width: 26)
+            try expect(line2Only.badge1X == nil && line2Only.badge2X != nil
+                       && line2Only.badge2X! + ceil(mark2) <= line2Only.textX,
+                       "line-2-only badge shifted the shared text column without hanging left")
+
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)
