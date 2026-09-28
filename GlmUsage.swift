@@ -565,6 +565,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.cycle += 1
             self.refresh(tokens: self.cycle % self.tokenEveryCycles == 0)
         }
+        // 显式容差让系统合并定时器唤醒（Apple 节能指南建议 ≥间隔 10%；60s → 6s）
+        timer?.tolerance = 6
     }
 
     // 拉取数据
