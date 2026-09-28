@@ -1,6 +1,7 @@
 import Cocoa
 import CryptoKit
 import Foundation
+import CoreFoundation
 
 // MARK: - 凭证读取（复用 ZCode 本地加密凭证库）
 //
@@ -117,8 +118,8 @@ struct ToolUsage {
 
 /// 充值卡（官方名：额度重置卡）：按窗口类型分组的未过期卡到期时间（已过滤 expire_at <= now）
 struct ResetCards {
-    var fiveHour: [Date]
-    var week: [Date]
+    var fiveHour: [Date]?
+    var week: [Date]?
 }
 
 /// 套餐订阅信息（subscription/list）
@@ -140,7 +141,108 @@ struct UsageData {
     var subscription: SubscriptionInfo?
     var quotaError: String?
     var tokensError: String?
-    var updatedAt: Date = Date()
+    var fiveHourError: String?
+    var weekError: String?
+    var tokensTodayError: String?
+    var tokens7dError: String?
+    var tokens30dError: String?
+    var toolsError: String?
+    var fiveHourCardsError: String?
+    var weekCardsError: String?
+    var subscriptionError: String?
+}
+
+enum GLMNumber {
+    static func finite(_ value: Any?) -> Double? {
+        if let text = value as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let number = Double(trimmed), number.isFinite else { return nil }
+            return number
+        }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let result = number.doubleValue
+        return result.isFinite ? result : nil
+    }
+
+    static func integer(_ value: Any?) -> Int? {
+        guard let number = finite(value), number.rounded(.towardZero) == number,
+              number >= Double(Int.min), number < Double(Int.max) else { return nil }
+        return Int(number)
+    }
+}
+
+enum GLMFreshness {
+    static func isStale(lastSuccess: Date?, hasData: Bool, now: Date, after: TimeInterval) -> Bool {
+        guard hasData else { return false }
+        guard let lastSuccess = lastSuccess else { return true }
+        return now.timeIntervalSince(lastSuccess) > after
+    }
+
+    static func availableCards(_ cards: [Date], now: Date) -> [Date] {
+        cards.filter { $0 > now }.sorted()
+    }
+
+    static func apply<T>(fresh: T?, failure: String?, value: inout T?,
+                         lastSuccess: inout Date?, error: inout String?, now: Date) {
+        if let fresh = fresh {
+            value = fresh
+            lastSuccess = now
+            error = nil
+        } else if let failure = failure {
+            error = failure
+        }
+    }
+}
+
+enum GLMRefreshSchedule {
+    static func slowItemsDue(cycle: Int, every: Int = 5, manual: Bool) -> Bool {
+        manual || (every > 0 && cycle % every == 0)
+    }
+}
+
+struct ResetCardsResult {
+    var fiveHour: [Date]?
+    var week: [Date]?
+    var fiveHourError: String?
+    var weekError: String?
+}
+
+/// Each network callback serializes its merge through this accumulator before leaving the group.
+final class RefreshAccumulator {
+    private let lock = NSLock()
+    private var value = UsageData()
+
+    func update(_ body: (inout UsageData) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        body(&value)
+    }
+
+    func snapshot() -> UsageData {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
+final class RefreshGate {
+    private let lock = NSLock()
+    private var active = false
+    private var queuedManual = false
+
+    func begin(manual: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !active else { if manual { queuedManual = true }; return false }
+        active = true
+        return true
+    }
+
+    /// Returns true when one queued manual full refresh should start; in that case the gate stays held.
+    func finish() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if queuedManual { queuedManual = false; return true }
+        active = false
+        return false
+    }
 }
 
 // MARK: - 网络请求（智谱开放平台监控接口）
@@ -194,7 +296,8 @@ enum Fetcher {
             if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
                 completion(nil, "HTTP \(http.statusCode)"); return
             }
-            if let code = obj["code"] as? Int, code != 200 {
+            guard let code = GLMNumber.integer(obj["code"]), code == 200 else {
+                let code = GLMNumber.integer(obj["code"]).map(String.init) ?? "missing or invalid"
                 completion(nil, "code \(code) \(obj["msg"] as? String ?? "")"); return
             }
             completion(obj["data"], nil)
@@ -211,39 +314,90 @@ enum Fetcher {
 
     /// 额度窗口：5 小时 + 7 天（周）
     static func fetchQuota(apiKey: String, completion: @escaping (UsageData) -> Void) {
-        var result = UsageData()
         fetch(apiKey: apiKey, path: "/api/monitor/usage/quota/limit") { data, err in
-            defer { completion(result) }
-            if let err = err { result.quotaError = err; return }
-            guard let data = data else { result.quotaError = "no data"; return }
-            result.level = data["level"] as? String
-            guard let limits = data["limits"] as? [[String: Any]] else {
-                result.quotaError = "no limits"; return
+            completion(parseQuota(data, error: err, now: Date()))
+        }
+    }
+
+    /// Each quota window is validated independently; an invalid window never becomes a zero value.
+    static func parseQuota(_ data: [String: Any]?, error: String?, now: Date) -> UsageData {
+        var result = UsageData()
+        if let error = error {
+            result.fiveHourError = error
+            result.weekError = error
+            result.quotaError = error
+            return result
+        }
+        guard let data = data else {
+            result.fiveHourError = "no quota data"
+            result.weekError = "no quota data"
+            result.quotaError = "no quota data"
+            return result
+        }
+        result.level = data["level"] as? String
+        guard let limits = data["limits"] as? [[String: Any]] else {
+            result.fiveHourError = "missing or invalid limits"
+            result.weekError = "missing or invalid limits"
+            result.quotaError = "missing or invalid limits"
+            return result
+        }
+
+        var sawFive = false
+        var sawWeek = false
+        for row in limits {
+            let type = row["type"] as? String ?? ""
+            let unit = GLMNumber.integer(row["unit"])
+            let number = GLMNumber.integer(row["number"])
+            var isFive = false
+            var isWeek = false
+            if type == "TOKENS_LIMIT" { isFive = true }
+            else if type == "TIME_LIMIT" { isWeek = true }
+            else if type == "CREDIT_LIMIT" {
+                if unit == 3 { isFive = true }
+                else if unit == 6 { isWeek = true }
             }
-            for e in limits {
-                let type = e["type"] as? String ?? ""
-                let unit = e["unit"] as? Int ?? 0
-                let number = e["number"] as? Int ?? 0
-                // 现行 API：CREDIT_LIMIT + unit 枚举（3=小时, 6=周）——官方套餐为"每 5 小时 + 每周"积分，
-                // 旧版插件：TOKENS_LIMIT(5h)/TIME_LIMIT(月度 MCP) 已随 2026-07 积分制改版下线
-                let isFiveHour = type == "TOKENS_LIMIT" || (type == "CREDIT_LIMIT" && unit == 3 && number == 5)
-                let isWeek = type == "TIME_LIMIT" || (type == "CREDIT_LIMIT" && unit == 6)
-                guard isFiveHour || isWeek else { continue }
-                let entry = LimitEntry(
-                    label: isFiveHour ? "5 小时窗口" : "7 天额度",
-                    isFiveHour: isFiveHour,
-                    limit: e["usage"] as? Double ?? 0,
-                    used: e["currentValue"] as? Double ?? 0,
-                    remaining: e["remaining"] as? Double ?? 0,
-                    usedRatio: max(0, min(1, (e["percentage"] as? Double ?? 0) / 100)),
-                    reset: (e["nextResetTime"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) })
-                if isFiveHour, result.fiveHour == nil { result.fiveHour = entry }
-                if isWeek, result.week == nil { result.week = entry }
+            guard isFive || isWeek else { continue }
+            if isFive { sawFive = true }
+            if isWeek { sawWeek = true }
+
+            let label = isFive ? "5 小时窗口" : "7 天额度"
+            let invalid = "invalid \(isFive ? "5H" : "7D") quota fields"
+            if type == "CREDIT_LIMIT" && (unit == nil || (isFive && number != 5)) {
+                if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
+                continue
             }
-            if result.fiveHour == nil && result.week == nil {
-                result.quotaError = "unexpected payload"
+            guard let limit = GLMNumber.finite(row["usage"]), limit > 0,
+                  let used = GLMNumber.finite(row["currentValue"]), used >= 0, used <= limit,
+                  let remaining = GLMNumber.finite(row["remaining"]), remaining >= 0, remaining <= limit,
+                  let percentage = GLMNumber.finite(row["percentage"]), (0...100).contains(percentage) else {
+                if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
+                continue
+            }
+            let reset: Date?
+            if let rawReset = row["nextResetTime"] {
+                guard let milliseconds = GLMNumber.finite(rawReset), milliseconds > 0 else {
+                    if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
+                    continue
+                }
+                reset = Date(timeIntervalSince1970: milliseconds / 1000)
+            } else { reset = nil }
+            let entry = LimitEntry(label: label, isFiveHour: isFive, limit: limit, used: used,
+                                   remaining: remaining, usedRatio: percentage / 100, reset: reset)
+            if isFive, result.fiveHour == nil {
+                result.fiveHour = entry
+                result.fiveHourError = nil
+            }
+            if isWeek, result.week == nil {
+                result.week = entry
+                result.weekError = nil
             }
         }
+        if result.fiveHour == nil && !sawFive { result.fiveHourError = "missing 5H quota" }
+        if result.week == nil && !sawWeek { result.weekError = "missing 7D quota" }
+        if result.fiveHour == nil && result.week == nil {
+            result.quotaError = [result.fiveHourError, result.weekError].compactMap { $0 }.joined(separator: "; ")
+        }
+        return result
     }
 
     /// model-usage：一个时间窗的 token/调用统计
@@ -251,19 +405,26 @@ enum Fetcher {
                                 completion: @escaping (ModelUsage?, String?) -> Void) {
         fetch(apiKey: apiKey, path: "/api/monitor/usage/model-usage", from: from, to: to) { data, err in
             guard let data = data, err == nil else { completion(nil, err ?? "no data"); return }
-            let total = data["totalUsage"] as? [String: Any] ?? [:]
-            var byModel: [(String, Double)] = []
-            if let list = data["modelSummaryList"] as? [[String: Any]] {
-                for m in list {
-                    byModel.append((m["modelName"] as? String ?? "?",
-                                    m["totalTokens"] as? Double ?? 0))
-                }
+            guard let usage = parseModelUsage(data) else {
+                completion(nil, "missing or invalid model usage fields"); return
             }
-            completion(ModelUsage(
-                totalTokens: total["totalTokensUsage"] as? Double ?? 0,
-                totalCalls: total["totalModelCallCount"] as? Double ?? 0,
-                byModel: byModel), nil)
+            completion(usage, nil)
         }
+    }
+
+    static func parseModelUsage(_ data: [String: Any]) -> ModelUsage? {
+        guard let total = data["totalUsage"] as? [String: Any],
+              let tokens = GLMNumber.finite(total["totalTokensUsage"]), tokens >= 0,
+              let calls = GLMNumber.finite(total["totalModelCallCount"]), calls >= 0 else { return nil }
+        var byModel: [(String, Double)] = []
+        if let rawList = data["modelSummaryList"] {
+            guard let list = rawList as? [[String: Any]] else { return nil }
+            for model in list {
+                guard let count = GLMNumber.finite(model["totalTokens"]), count >= 0 else { return nil }
+                byModel.append((model["modelName"] as? String ?? "?", count))
+            }
+        }
+        return ModelUsage(totalTokens: tokens, totalCalls: calls, byModel: byModel)
     }
 
     /// tool-usage：MCP 工具次数（网络搜索 / 网页读取）
@@ -271,11 +432,18 @@ enum Fetcher {
                                completion: @escaping (ToolUsage?, String?) -> Void) {
         fetch(apiKey: apiKey, path: "/api/monitor/usage/tool-usage", from: from, to: to) { data, err in
             guard let data = data, err == nil else { completion(nil, err ?? "no data"); return }
-            let total = data["totalUsage"] as? [String: Any] ?? [:]
-            completion(ToolUsage(
-                networkSearch: total["totalNetworkSearchCount"] as? Double ?? 0,
-                webRead: total["totalWebReadMcpCount"] as? Double ?? 0), nil)
+            guard let usage = parseToolUsage(data) else {
+                completion(nil, "missing or invalid tool usage fields"); return
+            }
+            completion(usage, nil)
         }
+    }
+
+    static func parseToolUsage(_ data: [String: Any]) -> ToolUsage? {
+        guard let total = data["totalUsage"] as? [String: Any],
+              let search = GLMNumber.finite(total["totalNetworkSearchCount"]), search >= 0,
+              let webRead = GLMNumber.finite(total["totalWebReadMcpCount"]), webRead >= 0 else { return nil }
+        return ToolUsage(networkSearch: search, webRead: webRead)
     }
 
     // 充值卡（额度重置卡）：ZCode 侧接口，成功码为 code==0（与 open.bigmodel.cn 系的 200 不同）
@@ -283,9 +451,9 @@ enum Fetcher {
 
     /// 查询可用充值卡列表；jwt/maas 为 ZCode 登录态 token，过期/缺失由上层优雅降级
     static func fetchResetCards(jwt: String, maas: String,
-                                completion: @escaping (ResetCards?, String?) -> Void) {
+                                completion: @escaping (ResetCardsResult) -> Void) {
         guard let url = URL(string: resetBase + "/api/v1/coding-plan/reset/status") else {
-            completion(nil, "bad url"); return
+            completion(ResetCardsResult(fiveHourError: "bad url", weekError: "bad url")); return
         }
         var req = URLRequest(url: url, timeoutInterval: 15)
         // zcodejwttoken 明文可能已自带 "Bearer " 前缀，避免重复拼接
@@ -298,42 +466,65 @@ enum Fetcher {
         URLSession.shared.dataTask(with: req) { data, resp, err in
             guard err == nil, let data = data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                completion(nil, err?.localizedDescription ?? "bad response"); return
+                let error = err?.localizedDescription ?? "bad response"
+                completion(ResetCardsResult(fiveHourError: error, weekError: error)); return
             }
             if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-                completion(nil, "HTTP \(http.statusCode)"); return
+                let error = "HTTP \(http.statusCode)"
+                completion(ResetCardsResult(fiveHourError: error, weekError: error)); return
             }
-            let code = obj["code"] as? Int ?? -1
+            let code = GLMNumber.integer(obj["code"]) ?? -1
             guard code == 0 else {
-                completion(nil, "code \(code) \(obj["msg"] as? String ?? "")"); return
+                let error = "code \(code) \(obj["msg"] as? String ?? "")"
+                completion(ResetCardsResult(fiveHourError: error, weekError: error)); return
             }
             guard let d = obj["data"] as? [String: Any] else {
-                completion(nil, "no data"); return
+                completion(ResetCardsResult(fiveHourError: "no data", weekError: "no data")); return
             }
-            func cards(_ key: String) -> [Date] {
-                (d[key] as? [[String: Any]] ?? [])
-                    .compactMap { ($0["expire_at"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) } }
-                    .filter { $0 > Date() }   // 只保留未过期
-            }
-            completion(ResetCards(fiveHour: cards("available_five_hour_resets"),
-                                  week: cards("available_week_resets")), nil)
+            completion(parseResetCards(d, now: Date()))
         }.resume()
+    }
+
+    static func parseResetCards(_ data: [String: Any], now: Date) -> ResetCardsResult {
+        func cards(_ key: String) -> ([Date]?, String?) {
+            guard let raw = data[key] else { return (nil, "missing \(key)") }
+            guard let list = raw as? [[String: Any]] else { return (nil, "invalid \(key)") }
+            var dates: [Date] = []
+            for card in list {
+                guard let millis = GLMNumber.finite(card["expire_at"]), millis > 0 else {
+                    return (nil, "invalid \(key) expiration")
+                }
+                let date = Date(timeIntervalSince1970: millis / 1000)
+                if date > now { dates.append(date) }
+            }
+            return (dates.sorted(), nil)
+        }
+        let five = cards("available_five_hour_resets")
+        let week = cards("available_week_resets")
+        return ResetCardsResult(fiveHour: five.0, week: week.0,
+                                fiveHourError: five.1, weekError: week.1)
     }
 
     /// 套餐订阅：取 status=="VALID" 的第一条；到期时间解析失败时仅降级显示名称
     static func fetchSubscription(apiKey: String,
                                   completion: @escaping (SubscriptionInfo?, String?) -> Void) {
         fetchRaw(apiKey: apiKey, path: "/api/biz/subscription/list") { data, err in
-            guard err == nil else { completion(nil, err); return }
-            guard let list = data as? [[String: Any]] else {
-                completion(nil, "unexpected payload"); return
-            }
-            guard let sub = list.first(where: { ($0["status"] as? String) == "VALID" }) else {
-                completion(nil, "no valid subscription"); return
-            }
-            completion(SubscriptionInfo(name: sub["productName"] as? String ?? "?",
-                                        expireDate: parseValidEnd(sub["valid"] as? String ?? "")), nil)
+            if let err = err { completion(nil, err); return }
+            let result = parseSubscription(data)
+            completion(result.0, result.1)
         }
+    }
+
+    static func parseSubscription(_ data: Any?) -> (SubscriptionInfo?, String?) {
+        guard let list = data as? [[String: Any]] else { return (nil, "unexpected payload") }
+        guard let sub = list.first(where: { ($0["status"] as? String) == "VALID" }) else {
+            return (nil, "no valid subscription")
+        }
+        guard let name = sub["productName"] as? String, !name.isEmpty else {
+            return (nil, "invalid subscription name")
+        }
+        return (SubscriptionInfo(name: name,
+                                 expireDate: parseValidEnd(sub["valid"] as? String ?? "")), nil)
     }
 
     // valid 形如 "2026-09-26 18:18:52-2027-09-26 10:00:00"：日期对内部也含 '-'，
@@ -543,15 +734,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var usage = UsageData()
     private var cycle = 0
+    private let refreshGate = RefreshGate()
     private let launchAgentLabel = "com.local.glm-usage"
     // token 统计每 N 个刷新周期拉一次（额度窗口仍每 60s 刷新）
     private let tokenEveryCycles = 5
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
     private let quotaStaleAfter: TimeInterval = 600
     private let tokensStaleAfter: TimeInterval = 1800
-    // 两组数据各自的最后成功拉取时间（5H/7D 同源共用 quotaLastOK；token 三窗口+MCP 共用 tokensLastOK）
-    private var quotaLastOK: Date?
-    private var tokensLastOK: Date?
+    private var lastAttemptAt = Date()
+    private var fiveHourLastOK: Date?
+    private var weekLastOK: Date?
+    private var tokensTodayLastOK: Date?
+    private var tokens7dLastOK: Date?
+    private var tokens30dLastOK: Date?
+    private var toolsLastOK: Date?
+    private var fiveHourCardsLastOK: Date?
+    private var weekCardsLastOK: Date?
+    private var subscriptionLastOK: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[GlmUsage] launched, creating status item")
@@ -563,27 +762,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.cycle += 1
-            self.refresh(tokens: self.cycle % self.tokenEveryCycles == 0)
+            self.refresh(tokens: GLMRefreshSchedule.slowItemsDue(cycle: self.cycle,
+                every: self.tokenEveryCycles, manual: false))
         }
         // 显式容差让系统合并定时器唤醒（Apple 节能指南建议 ≥间隔 10%；60s → 6s）
         timer?.tolerance = 6
     }
 
     // 拉取数据
-    private func refresh(tokens: Bool) {
+    private func refresh(tokens: Bool, manual: Bool = false) {
+        guard refreshGate.begin(manual: manual) else { return }
+        performRefresh(tokens: tokens || manual)
+    }
+
+    private func performRefresh(tokens: Bool) {
+        lastAttemptAt = Date()
         guard let key = CredStore.loadApiKey() else {
-            usage.quotaError = "未找到 ZCode 凭证（~/.zcode/v2/credentials.json）"
-            renderBar(); rebuildMenu(); return
+            var failed = UsageData()
+            let error = "未找到 ZCode 凭证（~/.zcode/v2/credentials.json）"
+            failed.quotaError = error
+            failed.fiveHourError = error
+            failed.weekError = error
+            if tokens {
+                failed.tokensTodayError = error
+                failed.tokens7dError = error
+                failed.tokens30dError = error
+                failed.toolsError = error
+                failed.fiveHourCardsError = error
+                failed.weekCardsError = error
+                failed.resetCardsError = error
+                failed.subscriptionError = error
+            }
+            finishRefresh(failed, tokens: tokens)
+            return
         }
-        var merged = UsageData()
+        let accumulator = RefreshAccumulator()
         let group = DispatchGroup()
 
         group.enter()
         Fetcher.fetchQuota(apiKey: key) { r in
-            merged.fiveHour = r.fiveHour
-            merged.week = r.week
-            merged.level = r.level
-            merged.quotaError = r.quotaError
+            accumulator.update { current in
+                current.fiveHour = r.fiveHour
+                current.week = r.week
+                current.level = r.level
+                current.quotaError = r.quotaError
+                current.fiveHourError = r.fiveHourError
+                current.weekError = r.weekError
+            }
             group.leave()
         }
 
@@ -599,39 +824,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             for w in windows {
                 wg.enter()
                 Fetcher.fetchModelUsage(apiKey: key, from: w.from, to: w.to) { r, err in
-                    if let r = r {
+                    accumulator.update { current in
                         switch w.label {
-                        case 0: merged.tokensToday = r
-                        case 1: merged.tokens7d = r
-                        default: merged.tokens30d = r
+                        case 0:
+                            current.tokensToday = r
+                            current.tokensTodayError = r == nil ? (err ?? "no data") : nil
+                        case 1:
+                            current.tokens7d = r
+                            current.tokens7dError = r == nil ? (err ?? "no data") : nil
+                        default:
+                            current.tokens30d = r
+                            current.tokens30dError = r == nil ? (err ?? "no data") : nil
                         }
-                    } else if err != nil {
-                        merged.tokensError = err
                     }
                     wg.leave()
                 }
             }
             wg.enter()
             Fetcher.fetchToolUsage(apiKey: key, from: now.addingTimeInterval(-30 * 86400), to: now) { r, err in
-                if let r = r { merged.tools30d = r }
-                else if err != nil, merged.tokensError == nil { merged.tokensError = err }
+                accumulator.update { current in
+                    current.tools30d = r
+                    current.toolsError = r == nil ? (err ?? "no data") : nil
+                }
                 wg.leave()
             }
             // 充值卡（额度重置卡）：ZCode 登录态 token 缺失/过期时优雅降级为错误提示
             if let (jwt, maas) = CredStore.loadResetTokens() {
                 wg.enter()
-                Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r, err in
-                    if let r = r { merged.resetCards = r }
-                    else if err != nil { merged.resetCardsError = err }
+                Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
+                    accumulator.update { current in
+                        current.resetCards = ResetCards(fiveHour: r.fiveHour, week: r.week)
+                        current.fiveHourCardsError = r.fiveHourError
+                        current.weekCardsError = r.weekError
+                        let errors = [r.fiveHourError, r.weekError].compactMap { $0 }
+                        current.resetCardsError = errors.isEmpty ? nil : errors.joined(separator: "; ")
+                    }
                     wg.leave()
                 }
             } else {
-                merged.resetCardsError = "未找到 ZCode 登录凭证"
+                accumulator.update { current in
+                    current.fiveHourCardsError = "未找到 ZCode 登录凭证"
+                    current.weekCardsError = "未找到 ZCode 登录凭证"
+                    current.resetCardsError = "未找到 ZCode 登录凭证"
+                }
             }
             // 套餐到期（与充值卡同周期刷新）
             wg.enter()
-            Fetcher.fetchSubscription(apiKey: key) { r, _ in
-                if let r = r { merged.subscription = r }
+            Fetcher.fetchSubscription(apiKey: key) { r, err in
+                accumulator.update { current in
+                    current.subscription = r
+                    current.subscriptionError = r == nil ? (err ?? "no data") : nil
+                }
                 wg.leave()
             }
             group.enter()
@@ -640,68 +883,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
-            // 必须在旧值回填之前判定：本次新拉到的值非 nil 才算成功、才推进 lastOK，
-            // 由旧值回填得来的数据绝不更新 lastOK（否则断网时过期数据会被误标为新鲜）
-            if merged.fiveHour != nil || merged.week != nil { self.quotaLastOK = Date() }
-            if tokens, merged.tokensToday != nil || merged.tokens7d != nil
-                || merged.tokens30d != nil || merged.tools30d != nil {
-                self.tokensLastOK = Date()
-            }
-            // 网络瞬断（如睡眠唤醒）时保留上次成功数据，避免菜单栏闪 "--"
-            let old = self.usage
-            if merged.fiveHour == nil { merged.fiveHour = old.fiveHour }
-            if merged.week == nil { merged.week = old.week }
-            if merged.level == nil { merged.level = old.level }
-            if !tokens {
-                merged.tokensToday = old.tokensToday
-                merged.tokens7d = old.tokens7d
-                merged.tokens30d = old.tokens30d
-                merged.tools30d = old.tools30d
-                merged.tokensError = old.tokensError
-                merged.resetCards = old.resetCards
-                merged.resetCardsError = old.resetCardsError
-                merged.subscription = old.subscription
-            } else {
-                if merged.tokensToday == nil { merged.tokensToday = old.tokensToday }
-                if merged.tokens7d == nil { merged.tokens7d = old.tokens7d }
-                if merged.tokens30d == nil { merged.tokens30d = old.tokens30d }
-                if merged.tools30d == nil { merged.tools30d = old.tools30d }
-                if merged.resetCards == nil { merged.resetCards = old.resetCards }
-                if merged.subscription == nil { merged.subscription = old.subscription }
-            }
-            self.usage = merged
-            self.renderBar()
-            self.rebuildMenu()
+            self.finishRefresh(accumulator.snapshot(), tokens: tokens)
         }
+    }
+
+    private func finishRefresh(_ fresh: UsageData, tokens: Bool) {
+        let now = Date()
+        GLMFreshness.apply(fresh: fresh.fiveHour, failure: fresh.fiveHourError,
+            value: &usage.fiveHour, lastSuccess: &fiveHourLastOK, error: &usage.fiveHourError, now: now)
+        GLMFreshness.apply(fresh: fresh.week, failure: fresh.weekError,
+            value: &usage.week, lastSuccess: &weekLastOK, error: &usage.weekError, now: now)
+        if fresh.fiveHour != nil || fresh.week != nil { usage.quotaError = nil }
+        else if let error = fresh.quotaError { usage.quotaError = error }
+        usage.level = fresh.level ?? usage.level
+
+        if tokens {
+            GLMFreshness.apply(fresh: fresh.tokensToday, failure: fresh.tokensTodayError,
+                value: &usage.tokensToday, lastSuccess: &tokensTodayLastOK, error: &usage.tokensTodayError, now: now)
+            GLMFreshness.apply(fresh: fresh.tokens7d, failure: fresh.tokens7dError,
+                value: &usage.tokens7d, lastSuccess: &tokens7dLastOK, error: &usage.tokens7dError, now: now)
+            GLMFreshness.apply(fresh: fresh.tokens30d, failure: fresh.tokens30dError,
+                value: &usage.tokens30d, lastSuccess: &tokens30dLastOK, error: &usage.tokens30dError, now: now)
+            GLMFreshness.apply(fresh: fresh.tools30d, failure: fresh.toolsError,
+                value: &usage.tools30d, lastSuccess: &toolsLastOK, error: &usage.toolsError, now: now)
+
+            let hasCardBatch = fresh.resetCards != nil
+            var fiveCards = usage.resetCards?.fiveHour
+            var weekCards = usage.resetCards?.week
+            GLMFreshness.apply(fresh: fresh.resetCards?.fiveHour, failure: fresh.fiveHourCardsError,
+                value: &fiveCards, lastSuccess: &fiveHourCardsLastOK, error: &usage.fiveHourCardsError, now: now)
+            GLMFreshness.apply(fresh: fresh.resetCards?.week, failure: fresh.weekCardsError,
+                value: &weekCards, lastSuccess: &weekCardsLastOK, error: &usage.weekCardsError, now: now)
+            if hasCardBatch || usage.resetCards != nil {
+                usage.resetCards = ResetCards(fiveHour: fiveCards, week: weekCards)
+            }
+            if let error = fresh.resetCardsError { usage.resetCardsError = error }
+            else if fresh.resetCards != nil { usage.resetCardsError = nil }
+
+            GLMFreshness.apply(fresh: fresh.subscription, failure: fresh.subscriptionError,
+                value: &usage.subscription, lastSuccess: &subscriptionLastOK,
+                error: &usage.subscriptionError, now: now)
+        }
+
+        let tokenErrors = [usage.tokensTodayError, usage.tokens7dError, usage.tokens30dError, usage.toolsError]
+            .compactMap { $0 }
+        usage.tokensError = tokenErrors.isEmpty ? nil : tokenErrors.joined(separator: "; ")
+        renderBar()
+        rebuildMenu()
+        if refreshGate.finish() { performRefresh(tokens: true) }
     }
 
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
     // 无数据不算过期——菜单里本就显示"暂无数据"，无需再标注。
     private func isStale(_ lastOK: Date?, hasData: Bool, after: TimeInterval) -> Bool {
-        guard hasData else { return false }
-        guard let t = lastOK else { return true }
-        return Date().timeIntervalSince(t) > after
+        GLMFreshness.isStale(lastSuccess: lastOK, hasData: hasData, now: Date(), after: after)
     }
-    private var quotaStale: Bool {
-        isStale(quotaLastOK, hasData: usage.fiveHour != nil || usage.week != nil, after: quotaStaleAfter)
+    private var fiveHourStale: Bool { isStale(fiveHourLastOK, hasData: usage.fiveHour != nil, after: quotaStaleAfter) }
+    private var weekStale: Bool { isStale(weekLastOK, hasData: usage.week != nil, after: quotaStaleAfter) }
+    private var tokensTodayStale: Bool { isStale(tokensTodayLastOK, hasData: usage.tokensToday != nil, after: tokensStaleAfter) }
+    private var tokens7dStale: Bool { isStale(tokens7dLastOK, hasData: usage.tokens7d != nil, after: tokensStaleAfter) }
+    private var tokens30dStale: Bool { isStale(tokens30dLastOK, hasData: usage.tokens30d != nil, after: tokensStaleAfter) }
+    private var toolsStale: Bool { isStale(toolsLastOK, hasData: usage.tools30d != nil, after: tokensStaleAfter) }
+    private var fiveHourCardsStale: Bool {
+        isStale(fiveHourCardsLastOK, hasData: usage.resetCards?.fiveHour != nil, after: 900)
     }
-    private var tokensStale: Bool {
-        isStale(tokensLastOK, hasData: usage.tokensToday != nil || usage.tokens7d != nil
-            || usage.tokens30d != nil || usage.tools30d != nil, after: tokensStaleAfter)
+    private var weekCardsStale: Bool {
+        isStale(weekCardsLastOK, hasData: usage.resetCards?.week != nil, after: 900)
+    }
+    private var subscriptionStale: Bool {
+        isStale(subscriptionLastOK, hasData: usage.subscription != nil, after: 900)
     }
 
     // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；峰谷状态加 emoji 前缀；过期组加 ⚠️ 前缀
     // （⚠️ 放在峰谷 emoji 之后、"5H"/"7D" 文本之前，不影响 Peak 判定；token 组无菜单栏行，仅在下拉菜单标注）
     private func renderBar() {
         let peak = Peak.evaluate()
-        let staleQuota = quotaStale
-        let line1 = (peak.emoji.map { "\($0) " } ?? "") + (staleQuota ? "⚠️ " : "") + "5H \(Fmt.pct(usage.fiveHour?.usedRemainingRatio))"
-        let line2 = (staleQuota ? "⚠️ " : "") + "7D \(Fmt.pct(usage.week?.usedRemainingRatio))"
+        let line1 = (peak.emoji.map { "\($0) " } ?? "") + (fiveHourStale ? "⚠️ " : "") + "5H \(Fmt.pct(usage.fiveHour?.usedRemainingRatio))"
+        let line2 = (weekStale ? "⚠️ " : "") + "7D \(Fmt.pct(usage.week?.usedRemainingRatio))"
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
-        statusItem.button?.toolTip = "GLM 余额 · 额度最后成功 \(Fmt.lastOK(quotaLastOK))"
-            + " · Token 最后成功 \(Fmt.lastOK(tokensLastOK))"
+        statusItem.button?.toolTip = "GLM 余额 · 5H最后成功 \(Fmt.lastOK(fiveHourLastOK))"
+            + " · 7D最后成功 \(Fmt.lastOK(weekLastOK))"
+            + " · 今日Token最后成功 \(Fmt.lastOK(tokensTodayLastOK))"
+            + " · 7天Token最后成功 \(Fmt.lastOK(tokens7dLastOK))"
+            + " · 30天Token最后成功 \(Fmt.lastOK(tokens30dLastOK))"
+            + " · MCP最后成功 \(Fmt.lastOK(toolsLastOK))"
         writeStatus(line1: line1, line2: line2, peakLine: peak.line)
     }
 
@@ -712,19 +979,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 充值卡/套餐自诊断（只含到期时间与名称，不含任何密钥）
         var cardsStatus: [String] = []
         if let c = usage.resetCards {
-            cardsStatus += c.fiveHour.sorted().map { "5h:" + Fmt.fullTime.string(from: $0) }
-            cardsStatus += c.week.sorted().map { "week:" + Fmt.fullTime.string(from: $0) }
+            cardsStatus += GLMFreshness.availableCards(c.fiveHour ?? [], now: Date())
+                .map { "5h:" + Fmt.fullTime.string(from: $0) }
+            cardsStatus += GLMFreshness.availableCards(c.week ?? [], now: Date())
+                .map { "week:" + Fmt.fullTime.string(from: $0) }
         }
+        let lastSuccess: [String: String] = [
+            "fiveHour": fiveHourLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
+            "week": weekLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
+            "tokensToday": tokensTodayLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
+            "tokens7d": tokens7dLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
+            "tokens30d": tokens30dLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
+            "tools30d": toolsLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
+            "fiveHourCards": fiveHourCardsLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
+            "weekCards": weekCardsLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
+            "subscription": subscriptionLastOK.map { Fmt.iso8601.string(from: $0) } ?? ""
+        ]
+        let stale: [String: Bool] = [
+            "fiveHour": fiveHourStale, "week": weekStale,
+            "tokensToday": tokensTodayStale, "tokens7d": tokens7dStale,
+            "tokens30d": tokens30dStale, "tools30d": toolsStale,
+            "fiveHourCards": fiveHourCardsStale, "weekCards": weekCardsStale,
+            "subscription": subscriptionStale
+        ]
+        let errors: [String: String] = [
+            "fiveHour": usage.fiveHourError ?? "", "week": usage.weekError ?? "",
+            "tokensToday": usage.tokensTodayError ?? "", "tokens7d": usage.tokens7dError ?? "",
+            "tokens30d": usage.tokens30dError ?? "", "tools30d": usage.toolsError ?? "",
+            "fiveHourCards": usage.fiveHourCardsError ?? "", "weekCards": usage.weekCardsError ?? "",
+            "subscription": usage.subscriptionError ?? ""
+        ]
         let info: [String: Any] = [
             "line1": line1,
             "line2": line2,
             "peak": peakLine,
-            "updatedAt": Fmt.iso8601.string(from: Date()),
-            // 两组数据的最后成功时间（ISO8601，无则空串）与过期标记
-            "quotaLastOK": quotaLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
-            "tokensLastOK": tokensLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
-            "quotaStale": quotaStale,
-            "tokensStale": tokensStale,
+            "updatedAt": Fmt.iso8601.string(from: lastAttemptAt),
+            "lastAttemptAt": Fmt.iso8601.string(from: lastAttemptAt),
+            "lastSuccess": lastSuccess,
+            "stale": stale,
+            "errors": errors,
             "fiveHourRemaining": usage.fiveHour?.usedRemainingRatio ?? -1,
             "weekRemaining": usage.week?.usedRemainingRatio ?? -1,
             "level": usage.level ?? "",
@@ -752,19 +1045,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info("GLM 余额" + (usage.level.map { "（\($0) 套餐）" } ?? "")))
         menu.addItem(.separator())
 
-        func limitLine(_ e: LimitEntry?) -> String {
-            guard let e = e else { return "暂无数据" }
-            var s = "\(e.label)：剩余 \(Fmt.pctLong(e.usedRemainingRatio))"
-            if e.limit > 0 {
-                s += "（剩 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits）"
-            }
-            if e.reset != nil {
-                s += e.isFiveHour ? "（\(Fmt.time(e.reset)) 重置）" : "（\(Fmt.dayTime(e.reset)) 重置）"
-            }
+        func limitLine(_ e: LimitEntry?, label: String, lastOK: Date?, stale: Bool, error: String?) -> String {
+            var s = "\(label)："
+            if let e = e {
+                s += "剩余 \(Fmt.pctLong(e.usedRemainingRatio))"
+                if e.limit > 0 { s += "（剩 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits）" }
+                if e.reset != nil { s += e.isFiveHour ? "（\(Fmt.time(e.reset)) 重置）" : "（\(Fmt.dayTime(e.reset)) 重置）" }
+            } else { s += "暂无数据" }
+            if stale { s += " · ⚠️ 数据已过期" }
+            if let error = error { s += " · 刷新失败：\(error)" }
+            s += " · 最后成功 \(Fmt.lastOK(lastOK))"
             return s
         }
-        menu.addItem(info(limitLine(usage.fiveHour)))
-        menu.addItem(info(limitLine(usage.week)))
+        menu.addItem(info(limitLine(usage.fiveHour, label: "5 小时窗口", lastOK: fiveHourLastOK,
+                                  stale: fiveHourStale, error: usage.fiveHourError)))
+        menu.addItem(info(limitLine(usage.week, label: "7 天额度", lastOK: weekLastOK,
+                                  stale: weekStale, error: usage.weekError)))
 
         // 峰谷状态 + 限时活动
         let pk = Peak.evaluate()
@@ -780,60 +1076,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return (warn ? "⚠️ " : "  ") + "\(label) · \(Fmt.expires(d)) 过期"
         }
         if let cards = usage.resetCards {
-            let f5 = cards.fiveHour.sorted(), wk = cards.week.sorted()
-            if f5.isEmpty && wk.isEmpty {
+            let f5 = GLMFreshness.availableCards(cards.fiveHour ?? [], now: Date())
+            let wk = GLMFreshness.availableCards(cards.week ?? [], now: Date())
+            var parts: [String] = []
+            if cards.fiveHour != nil { parts.append("5 小时 ×\(f5.count)") }
+            if cards.week != nil { parts.append("周 ×\(wk.count)") }
+            let bothKnownEmpty = cards.fiveHour != nil && cards.week != nil && f5.isEmpty && wk.isEmpty
+            if bothKnownEmpty {
                 menu.addItem(info("充值卡（额度重置）：暂无可用"))
             } else {
-                var parts: [String] = []
-                if !f5.isEmpty { parts.append("5 小时 ×\(f5.count)") }
-                if !wk.isEmpty { parts.append("周 ×\(wk.count)") }
-                menu.addItem(info("充值卡（额度重置）：" + parts.joined(separator: " · ")))
+                if !parts.isEmpty { menu.addItem(info("充值卡（额度重置）：" + parts.joined(separator: " · "))) }
                 for d in f5 { menu.addItem(info(cardLine("5 小时卡", d))) }
                 for d in wk { menu.addItem(info(cardLine("周卡", d))) }
             }
-        } else if let e = usage.resetCardsError {
-            let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
-            menu.addItem(info("充值卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试）"))
         }
+        if let e = usage.fiveHourCardsError {
+            let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
+            menu.addItem(info("5 小时卡获取失败：\(short) · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))"))
+        }
+        if fiveHourCardsStale { menu.addItem(info("⚠️ 5 小时卡数据已过期 · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))")) }
+        if let e = usage.weekCardsError {
+            let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
+            menu.addItem(info("周卡获取失败：\(short) · 最后成功 \(Fmt.lastOK(weekCardsLastOK))"))
+        }
+        if weekCardsStale { menu.addItem(info("⚠️ 周卡数据已过期 · 最后成功 \(Fmt.lastOK(weekCardsLastOK))")) }
 
         // Token 用量（服务端统计）
         menu.addItem(.separator())
         menu.addItem(info("Token 用量（服务端统计）"))
-        func tokenLine(_ label: String, _ s: ModelUsage?) -> String {
-            guard let s = s, !s.isEmpty else { return "\(label)：暂无记录" }
-            var l = "\(label)：\(Fmt.tokens(s.totalTokens)) tokens · 调用 \(Int(s.totalCalls)) 次"
-            if !s.byModel.isEmpty {
-                l += "\n  " + s.byModel.map { "\($0.name) \(Fmt.tokens($0.tokens))" }
-                    .joined(separator: " · ")
+        func tokenLine(_ label: String, _ stats: ModelUsage?, lastOK: Date?, stale: Bool, error: String?) -> String {
+            var line: String
+            if let stats = stats, !stats.isEmpty {
+                line = "\(label)：\(Fmt.tokens(stats.totalTokens)) tokens · 调用 \(Int(stats.totalCalls)) 次"
+                if !stats.byModel.isEmpty {
+                    line += "\n  " + stats.byModel.map { "\($0.name) \(Fmt.tokens($0.tokens))" }
+                        .joined(separator: " · ")
+                }
+            } else {
+                line = "\(label)：暂无记录"
             }
-            return l
+            if stale { line += " · ⚠️ 数据已过期" }
+            if let error = error { line += " · 刷新失败：\(error)" }
+            line += " · 最后成功 \(Fmt.lastOK(lastOK))"
+            return line
         }
-        menu.addItem(info(tokenLine("今日", usage.tokensToday)))
-        menu.addItem(info(tokenLine("近 7 天", usage.tokens7d)))
-        menu.addItem(info(tokenLine("近 30 天", usage.tokens30d)))
+        menu.addItem(info(tokenLine("今日", usage.tokensToday, lastOK: tokensTodayLastOK,
+                                 stale: tokensTodayStale, error: usage.tokensTodayError)))
+        menu.addItem(info(tokenLine("近 7 天", usage.tokens7d, lastOK: tokens7dLastOK,
+                                 stale: tokens7dStale, error: usage.tokens7dError)))
+        menu.addItem(info(tokenLine("近 30 天", usage.tokens30d, lastOK: tokens30dLastOK,
+                                 stale: tokens30dStale, error: usage.tokens30dError)))
 
         if let t = usage.tools30d {
             menu.addItem(.separator())
-            menu.addItem(info("MCP 工具（近 30 天）：网络搜索 \(Int(t.networkSearch)) 次 · 网页读取 \(Int(t.webRead)) 次"))
+            var line = "MCP 工具（近 30 天）：网络搜索 \(Int(t.networkSearch)) 次 · 网页读取 \(Int(t.webRead)) 次"
+            if toolsStale { line += " · ⚠️ 数据已过期" }
+            if let last = toolsLastOK { line += " · 最后成功 \(Fmt.lastOK(last))" }
+            menu.addItem(info(line))
         }
+        if let e = usage.toolsError { menu.addItem(info("MCP 工具刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))")) }
 
-        if let e = usage.quotaError {
-            menu.addItem(info("额度获取失败：\(e)"))
+        if let sub = usage.subscription {
+            var line = "套餐：\(sub.name)"
+            if let exp = sub.expireDate { line += " · 到期 \(Fmt.fullSec.string(from: exp))" }
+            if subscriptionStale { line += " · ⚠️ 数据已过期" }
+            line += " · 最后成功 \(Fmt.lastOK(subscriptionLastOK))"
+            menu.addItem(info(line))
         }
-        if let e = usage.tokensError {
-            menu.addItem(info("Token 统计获取失败：\(e)"))
-        }
-
-        // 数据过期提示：仅对应组过期时显示，紧贴更新时间行
-        if quotaStale {
-            menu.addItem(info("⚠️ 额度数据已过期 · 最后成功 \(Fmt.lastOK(quotaLastOK))"))
-        }
-        if tokensStale {
-            menu.addItem(info("⚠️ Token 数据已过期 · 最后成功 \(Fmt.lastOK(tokensLastOK))"))
-        }
+        if let e = usage.subscriptionError { menu.addItem(info("套餐刷新失败：\(e) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))")) }
 
         menu.addItem(.separator())
-        menu.addItem(info("更新于 \(Fmt.time(usage.updatedAt))"))
+        menu.addItem(info("最近尝试刷新 \(Fmt.fullTime.string(from: lastAttemptAt)) · 各项最后成功时间见上方"))
         menu.addItem(.separator())
 
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")
@@ -886,7 +1199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    @objc private func onRefresh() { refresh(tokens: true) }
+    @objc private func onRefresh() { refresh(tokens: true, manual: true) }
 
     @objc private func onQuit() { NSApp.terminate(nil) }
 }
@@ -899,7 +1212,7 @@ func onceMode() {
     }
     let group = DispatchGroup()
     var data = UsageData()
-    // 两组数据的最后成功时间（本次拉到新值才算成功，与 App 内 quotaLastOK/tokensLastOK 口径一致）
+    // 命令行自检记录本轮是否获得了成功响应。
     var quotaOK: Date?
     var tokensOK: Date?
     group.enter()
@@ -935,12 +1248,16 @@ func onceMode() {
     var subErr: String?
     if let (jwt, maas) = CredStore.loadResetTokens() {
         group.enter()
-        Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r, err in
-            if let r = r { data.resetCards = r }
-            else { data.resetCardsError = err ?? "?" }
+        Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
+            data.resetCards = ResetCards(fiveHour: r.fiveHour, week: r.week)
+            data.fiveHourCardsError = r.fiveHourError
+            data.weekCardsError = r.weekError
+            data.resetCardsError = [r.fiveHourError, r.weekError].compactMap { $0 }.joined(separator: "; ")
             group.leave()
         }
     } else {
+        data.fiveHourCardsError = "未找到 ZCode 登录凭证"
+        data.weekCardsError = "未找到 ZCode 登录凭证"
         data.resetCardsError = "未找到 ZCode 登录凭证"
     }
     group.enter()
@@ -973,15 +1290,18 @@ func onceMode() {
         print("tools 30d: search=\(Int(t.networkSearch)) webRead=\(Int(t.webRead))")
     }
     if let c = data.resetCards {
-        var s = "cards: 5h x\(c.fiveHour.count)"
-        let f5 = c.fiveHour.sorted().map { Fmt.fullTime.string(from: $0) }.joined(separator: ", ")
+        let f5Cards = c.fiveHour ?? []
+        let weekCards = c.week ?? []
+        var s = "cards: 5h x\(f5Cards.count)"
+        let f5 = f5Cards.sorted().map { Fmt.fullTime.string(from: $0) }.joined(separator: ", ")
         if !f5.isEmpty { s += " [\(f5)]" }
-        s += " week x\(c.week.count)"
-        let wk = c.week.sorted().map { Fmt.fullTime.string(from: $0) }.joined(separator: ", ")
+        s += " week x\(weekCards.count)"
+        let wk = weekCards.sorted().map { Fmt.fullTime.string(from: $0) }.joined(separator: ", ")
         if !wk.isEmpty { s += " [\(wk)]" }
         print(s)
     }
-    if let e = data.resetCardsError { print("cards error: \(e)") }
+    if let e = data.fiveHourCardsError { print("5h cards error: \(e)") }
+    if let e = data.weekCardsError { print("week cards error: \(e)") }
     if let sub = data.subscription {
         var s = "subscription: \(sub.name)"
         if let exp = sub.expireDate { s += " expire=\(Fmt.fullSec.string(from: exp))" }
@@ -991,6 +1311,187 @@ func onceMode() {
     if let e = data.quotaError { print("quota error: \(e)") }
     print("lastOK: quota=\(Fmt.lastOK(quotaOK)) tokens=\(Fmt.lastOK(tokensOK))")
     exit(0)
+}
+
+enum GLMOfflineRegression {
+    struct Failure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    private static func expect(_ value: @autoclosure () -> Bool, _ message: String) throws {
+        if !value() { throw Failure(description: message) }
+    }
+
+    static func run() -> Int32 {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GlmUsage-self-test-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+            try expect(GLMNumber.finite(nil) == nil, "missing numeric value became zero")
+            try expect(GLMNumber.finite(true) == nil, "boolean numeric value was accepted")
+            try expect(GLMNumber.finite(Double.nan) == nil && GLMNumber.finite(Double.infinity) == nil,
+                       "non-finite numeric value was accepted")
+            try expect(GLMNumber.integer(2.5) == nil && GLMNumber.integer("9223372036854775808") == nil,
+                       "fractional or out-of-range integer was accepted")
+
+            let quotaFixture: [String: Any] = ["level": "pro", "limits": [
+                ["type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 100,
+                 "currentValue": "NaN", "remaining": 50, "percentage": 50],
+                ["type": "CREDIT_LIMIT", "unit": 6, "number": 7, "usage": 400,
+                 "currentValue": 100, "remaining": 300, "percentage": 25,
+                 "nextResetTime": now.addingTimeInterval(3_600).timeIntervalSince1970 * 1000]
+            ]]
+            let fixtureURL = root.appendingPathComponent("quota.json")
+            try JSONSerialization.data(withJSONObject: quotaFixture).write(to: fixtureURL)
+            let decoded = try JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as! [String: Any]
+            let partial = Fetcher.parseQuota(decoded, error: nil, now: now)
+            try expect(partial.fiveHour == nil && partial.fiveHourError != nil,
+                       "invalid 5H quota was not rejected")
+            try expect(partial.week?.used == 100 && partial.weekError == nil,
+                       "valid 7D quota was discarded with invalid 5H")
+
+            let reverse = Fetcher.parseQuota(["limits": [
+                ["type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 100,
+                 "currentValue": 0, "remaining": 100, "percentage": 0],
+                ["type": "CREDIT_LIMIT", "unit": 6, "number": 7, "usage": 400,
+                 "currentValue": 10, "remaining": 390, "percentage": true]
+            ]], error: nil, now: now)
+            try expect(reverse.fiveHour?.usedRatio == 0, "valid zero-use quota was rejected")
+            try expect(reverse.week == nil && reverse.weekError != nil,
+                       "invalid percentage was treated as zero")
+            let missing = Fetcher.parseQuota([:], error: nil, now: now)
+            try expect(missing.fiveHour == nil && missing.week == nil
+                       && missing.fiveHourError != nil && missing.weekError != nil,
+                       "missing quota windows were reported as success")
+
+            try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 0,
+                "totalModelCallCount": 0]])?.totalTokens == 0,
+                "valid zero model usage was rejected")
+            try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": true,
+                "totalModelCallCount": 2]]) == nil, "invalid model token count became zero")
+            try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 10]]) == nil,
+                       "missing model call count became zero")
+            try expect(Fetcher.parseToolUsage(["totalUsage": ["totalNetworkSearchCount": 1,
+                "totalWebReadMcpCount": Double.nan]]) == nil, "invalid MCP statistic became zero")
+
+            let cardPayload: [String: Any] = [
+                "available_five_hour_resets": [
+                    ["expire_at": now.addingTimeInterval(-1).timeIntervalSince1970 * 1000],
+                    ["expire_at": now.addingTimeInterval(3_600).timeIntervalSince1970 * 1000]
+                ],
+                "available_week_resets": ["invalid row"]
+            ]
+            let cards = Fetcher.parseResetCards(cardPayload, now: now)
+            try expect(cards.fiveHour?.count == 1 && cards.fiveHourError == nil,
+                       "expired card was counted or valid list rejected")
+            try expect(cards.week == nil && cards.weekError != nil,
+                       "malformed week-card list was accepted as empty")
+            let missingCards = Fetcher.parseResetCards(["error": "upstream"], now: now)
+            try expect(missingCards.fiveHour == nil && missingCards.week == nil
+                       && missingCards.fiveHourError != nil && missingCards.weekError != nil,
+                       "missing card containers were accepted as an empty response")
+            let emptyCards = Fetcher.parseResetCards(["available_five_hour_resets": [],
+                "available_week_resets": []], now: now)
+            try expect(emptyCards.fiveHour?.isEmpty == true && emptyCards.week?.isEmpty == true
+                       && emptyCards.fiveHourError == nil && emptyCards.weekError == nil,
+                       "valid empty card lists were not accepted")
+            try expect(GLMFreshness.availableCards([now.addingTimeInterval(-1), now.addingTimeInterval(30)],
+                now: now).count == 1, "expired cached card remained available")
+
+            let subscription = Fetcher.parseSubscription([[
+                "status": "VALID", "productName": "Pro",
+                "valid": "2026-09-26 18:18:52-2027-09-26 10:00:00"
+            ]])
+            try expect(subscription.0?.name == "Pro" && subscription.1 == nil,
+                       "valid subscription was not parsed")
+            try expect(Fetcher.parseSubscription(["error": "upstream"]).0 == nil,
+                       "invalid subscription container was accepted")
+
+            let old5 = LimitEntry(label: "5 小时窗口", isFiveHour: true, limit: 100, used: 40,
+                                  remaining: 60, usedRatio: 0.4, reset: nil)
+            let last5 = now.addingTimeInterval(-1_000)
+            let oldCards = [now.addingTimeInterval(3_600)]
+            var fiveValue: LimitEntry? = old5
+            var fiveLast: Date? = last5
+            var fiveError: String?
+            GLMFreshness.apply(fresh: partial.fiveHour, failure: partial.fiveHourError,
+                value: &fiveValue, lastSuccess: &fiveLast, error: &fiveError, now: now)
+            try expect(fiveValue?.used == old5.used && fiveLast == last5 && fiveError != nil,
+                       "partial quota failure did not preserve its old value/time and expose error")
+            var weekValue: LimitEntry?
+            var weekLast: Date?
+            var weekError: String?
+            GLMFreshness.apply(fresh: partial.week, failure: partial.weekError,
+                value: &weekValue, lastSuccess: &weekLast, error: &weekError, now: now)
+            try expect(weekValue?.used == 100 && weekLast == now && weekError == nil,
+                       "valid quota window did not update independently")
+            var retainedCards: [Date]? = oldCards
+            var cardsLast: Date? = last5
+            var cardsError: String?
+            GLMFreshness.apply(fresh: cards.week, failure: cards.weekError,
+                value: &retainedCards, lastSuccess: &cardsLast, error: &cardsError, now: now)
+            try expect(retainedCards == oldCards && cardsLast == last5 && cardsError != nil,
+                       "invalid card list cleared old cards or advanced last-success")
+            var independentValue: String?
+            var independentLast: Date?
+            var independentError: String?
+            GLMFreshness.apply(fresh: "ok", failure: nil, value: &independentValue,
+                lastSuccess: &independentLast, error: &independentError, now: now)
+            try expect(independentValue == "ok" && independentLast == now && last5 != independentLast,
+                       "independent data item success time was not updated")
+            try expect(GLMFreshness.isStale(lastSuccess: last5, hasData: true, now: now, after: 600),
+                       "retained old value was not marked stale")
+
+            let gate = RefreshGate()
+            try expect(gate.begin(manual: false), "initial refresh gate did not open")
+            try expect(!gate.begin(manual: false), "overlapping timer refresh started")
+            try expect(!gate.begin(manual: true) && !gate.begin(manual: true),
+                       "manual overlap started immediately")
+            try expect(gate.finish(), "manual overlaps did not coalesce to one follow-up")
+            try expect(!gate.begin(manual: false), "gate did not stay held for queued refresh")
+            try expect(!gate.finish() && gate.begin(manual: false), "gate was not released after follow-up")
+            try expect(!GLMRefreshSchedule.slowItemsDue(cycle: 4, manual: false)
+                       && GLMRefreshSchedule.slowItemsDue(cycle: 5, manual: false)
+                       && GLMRefreshSchedule.slowItemsDue(cycle: 1, manual: true),
+                       "60s/300s/manual schedule is incorrect")
+
+            let accumulator = RefreshAccumulator()
+            let group = DispatchGroup()
+            let queue = DispatchQueue(label: "GlmUsage.self-test.concurrent", attributes: .concurrent)
+            for index in 0..<4 {
+                group.enter()
+                queue.async {
+                    accumulator.update { current in
+                        switch index {
+                        case 0: current.fiveHour = old5
+                        case 1: current.week = old5
+                        case 2: current.tokensToday = ModelUsage(totalTokens: 1, totalCalls: 1, byModel: [])
+                        default: current.tools30d = ToolUsage(networkSearch: 1, webRead: 1)
+                        }
+                    }
+                    group.leave()
+                }
+            }
+            group.wait()
+            let combined = accumulator.snapshot()
+            try expect(combined.fiveHour != nil && combined.week != nil
+                       && combined.tokensToday != nil && combined.tools30d != nil,
+                       "concurrent callback merges lost results")
+
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge)")
+            return 0
+        } catch {
+            fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)
+            return 1
+        }
+    }
+}
+
+if CommandLine.arguments.contains("--self-test") {
+    exit(GLMOfflineRegression.run())
 }
 
 if CommandLine.arguments.contains("--peak-test") {
