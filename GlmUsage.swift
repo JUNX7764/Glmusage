@@ -1066,7 +1066,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else { s += "暂无数据" }
             if stale { s += " · ⚠️ 数据已过期" }
             if let error = error { s += " · 刷新失败：\(error)" }
-            s += " · 最后成功 \(Fmt.lastOK(lastOK))"
+            if lastOK != nil, stale || error != nil { s += " · 最后成功 \(Fmt.lastOK(lastOK))" }
             return s
         }
         menu.addItem(info(limitLine(usage.fiveHour, label: "5 小时窗口", lastOK: fiveHourLastOK,
@@ -1104,12 +1104,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let e = usage.fiveHourCardsError {
             let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
-            menu.addItem(info("5 小时卡获取失败：\(short) · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))"))
+            menu.addItem(info("5 小时卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试）"))
         }
         if fiveHourCardsStale { menu.addItem(info("⚠️ 5 小时卡数据已过期 · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))")) }
         if let e = usage.weekCardsError {
             let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
-            menu.addItem(info("周卡获取失败：\(short) · 最后成功 \(Fmt.lastOK(weekCardsLastOK))"))
+            menu.addItem(info("周卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试）"))
         }
         if weekCardsStale { menu.addItem(info("⚠️ 周卡数据已过期 · 最后成功 \(Fmt.lastOK(weekCardsLastOK))")) }
 
@@ -1129,7 +1129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if stale { line += " · ⚠️ 数据已过期" }
             if let error = error { line += " · 刷新失败：\(error)" }
-            line += " · 最后成功 \(Fmt.lastOK(lastOK))"
+            if lastOK != nil, stale || error != nil { line += " · 最后成功 \(Fmt.lastOK(lastOK))" }
             return line
         }
         menu.addItem(info(tokenLine("今日", usage.tokensToday, lastOK: tokensTodayLastOK,
@@ -1142,23 +1142,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let t = usage.tools30d {
             menu.addItem(.separator())
             var line = "MCP 工具（近 30 天）：网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次"
-            if toolsStale { line += " · ⚠️ 数据已过期" }
-            if let last = toolsLastOK { line += " · 最后成功 \(Fmt.lastOK(last))" }
+            if toolsStale { line += " · ⚠️ 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))" }
             menu.addItem(info(line))
         }
-        if let e = usage.toolsError { menu.addItem(info("MCP 工具刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))")) }
-
-        if let sub = usage.subscription {
-            var line = "套餐：\(sub.name)"
-            if let exp = sub.expireDate { line += " · 到期 \(Fmt.fullSec.string(from: exp))" }
-            if subscriptionStale { line += " · ⚠️ 数据已过期" }
-            line += " · 最后成功 \(Fmt.lastOK(subscriptionLastOK))"
-            menu.addItem(info(line))
-        }
-        if let e = usage.subscriptionError { menu.addItem(info("套餐刷新失败：\(e) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))")) }
+        if let e = usage.toolsError { menu.addItem(info("MCP 工具刷新失败：\(e)")) }
 
         menu.addItem(.separator())
-        menu.addItem(info("最近尝试刷新 \(Fmt.fullTime.string(from: lastAttemptAt)) · 各项最后成功时间见上方"))
+        menu.addItem(info("最近尝试刷新 \(Fmt.fullTime.string(from: lastAttemptAt))"))
         menu.addItem(.separator())
 
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")
