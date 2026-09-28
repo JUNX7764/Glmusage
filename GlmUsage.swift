@@ -170,6 +170,11 @@ enum GLMNumber {
               number >= Double(Int.min), number < Double(Int.max) else { return nil }
         return Int(number)
     }
+
+    static func nonnegativeRoundedInteger(_ value: Any?) -> Int? {
+        guard let number = finite(value), number >= 0 else { return nil }
+        return Int(exactly: number.rounded())
+    }
 }
 
 enum GLMFreshness {
@@ -369,6 +374,9 @@ enum Fetcher {
             guard let limit = GLMNumber.finite(row["usage"]), limit > 0,
                   let used = GLMNumber.finite(row["currentValue"]), used >= 0, used <= limit,
                   let remaining = GLMNumber.finite(row["remaining"]), remaining >= 0, remaining <= limit,
+                  GLMNumber.nonnegativeRoundedInteger(limit) != nil,
+                  GLMNumber.nonnegativeRoundedInteger(used) != nil,
+                  GLMNumber.nonnegativeRoundedInteger(remaining) != nil,
                   let percentage = GLMNumber.finite(row["percentage"]), (0...100).contains(percentage) else {
                 if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
                 continue
@@ -414,17 +422,17 @@ enum Fetcher {
 
     static func parseModelUsage(_ data: [String: Any]) -> ModelUsage? {
         guard let total = data["totalUsage"] as? [String: Any],
-              let tokens = GLMNumber.finite(total["totalTokensUsage"]), tokens >= 0,
-              let calls = GLMNumber.finite(total["totalModelCallCount"]), calls >= 0 else { return nil }
+              let tokens = GLMNumber.integer(total["totalTokensUsage"]), tokens >= 0,
+              let calls = GLMNumber.integer(total["totalModelCallCount"]), calls >= 0 else { return nil }
         var byModel: [(String, Double)] = []
         if let rawList = data["modelSummaryList"] {
             guard let list = rawList as? [[String: Any]] else { return nil }
             for model in list {
-                guard let count = GLMNumber.finite(model["totalTokens"]), count >= 0 else { return nil }
-                byModel.append((model["modelName"] as? String ?? "?", count))
+                guard let count = GLMNumber.integer(model["totalTokens"]), count >= 0 else { return nil }
+                byModel.append((model["modelName"] as? String ?? "?", Double(count)))
             }
         }
-        return ModelUsage(totalTokens: tokens, totalCalls: calls, byModel: byModel)
+        return ModelUsage(totalTokens: Double(tokens), totalCalls: Double(calls), byModel: byModel)
     }
 
     /// tool-usage：MCP 工具次数（网络搜索 / 网页读取）
@@ -441,9 +449,9 @@ enum Fetcher {
 
     static func parseToolUsage(_ data: [String: Any]) -> ToolUsage? {
         guard let total = data["totalUsage"] as? [String: Any],
-              let search = GLMNumber.finite(total["totalNetworkSearchCount"]), search >= 0,
-              let webRead = GLMNumber.finite(total["totalWebReadMcpCount"]), webRead >= 0 else { return nil }
-        return ToolUsage(networkSearch: search, webRead: webRead)
+              let search = GLMNumber.integer(total["totalNetworkSearchCount"]), search >= 0,
+              let webRead = GLMNumber.integer(total["totalWebReadMcpCount"]), webRead >= 0 else { return nil }
+        return ToolUsage(networkSearch: Double(search), webRead: Double(webRead))
     }
 
     // 充值卡（额度重置卡）：ZCode 侧接口，成功码为 code==0（与 open.bigmodel.cn 系的 200 不同）
@@ -638,8 +646,12 @@ enum Fmt {
         return String(format: "%.0f", v)
     }
     static func credits(_ v: Double) -> String {
-        let n = Int(v.rounded())
+        guard v.isFinite, v >= 0, let n = Int(exactly: v.rounded()) else { return "超出范围" }
         return n.formatted(.number.grouping(.automatic))
+    }
+    static func count(_ v: Double) -> String {
+        guard let n = GLMNumber.integer(v), n >= 0 else { return "超出范围" }
+        return String(n)
     }
     static let queryTime: DateFormatter = {
         let f = DateFormatter()
@@ -1107,7 +1119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         func tokenLine(_ label: String, _ stats: ModelUsage?, lastOK: Date?, stale: Bool, error: String?) -> String {
             var line: String
             if let stats = stats, !stats.isEmpty {
-                line = "\(label)：\(Fmt.tokens(stats.totalTokens)) tokens · 调用 \(Int(stats.totalCalls)) 次"
+                line = "\(label)：\(Fmt.tokens(stats.totalTokens)) tokens · 调用 \(Fmt.count(stats.totalCalls)) 次"
                 if !stats.byModel.isEmpty {
                     line += "\n  " + stats.byModel.map { "\($0.name) \(Fmt.tokens($0.tokens))" }
                         .joined(separator: " · ")
@@ -1129,7 +1141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let t = usage.tools30d {
             menu.addItem(.separator())
-            var line = "MCP 工具（近 30 天）：网络搜索 \(Int(t.networkSearch)) 次 · 网页读取 \(Int(t.webRead)) 次"
+            var line = "MCP 工具（近 30 天）：网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次"
             if toolsStale { line += " · ⚠️ 数据已过期" }
             if let last = toolsLastOK { line += " · 最后成功 \(Fmt.lastOK(last))" }
             menu.addItem(info(line))
@@ -1283,11 +1295,11 @@ func onceMode() {
     for (label, s) in [("today", data.tokensToday), ("7d", data.tokens7d), ("30d", data.tokens30d)] {
         if let s = s {
             let models = s.byModel.map { "\($0.name)=\(Fmt.tokens($0.tokens))" }.joined(separator: " ")
-            print("tokens \(label): total=\(Fmt.tokens(s.totalTokens)) calls=\(Int(s.totalCalls)) \(models)")
+            print("tokens \(label): total=\(Fmt.tokens(s.totalTokens)) calls=\(Fmt.count(s.totalCalls)) \(models)")
         }
     }
     if let t = data.tools30d {
-        print("tools 30d: search=\(Int(t.networkSearch)) webRead=\(Int(t.webRead))")
+        print("tools 30d: search=\(Fmt.count(t.networkSearch)) webRead=\(Fmt.count(t.webRead))")
     }
     if let c = data.resetCards {
         let f5Cards = c.fiveHour ?? []
@@ -1366,6 +1378,19 @@ enum GLMOfflineRegression {
             try expect(missing.fiveHour == nil && missing.week == nil
                        && missing.fiveHourError != nil && missing.weekError != nil,
                        "missing quota windows were reported as success")
+            for field in ["usage", "currentValue", "remaining"] {
+                var row: [String: Any] = ["type": "CREDIT_LIMIT", "unit": 3, "number": 5,
+                    "usage": 100, "currentValue": 20, "remaining": 80, "percentage": 20]
+                row[field] = 1e100
+                let oversized = Fetcher.parseQuota(["limits": [row]], error: nil, now: now)
+                try expect(oversized.fiveHour == nil && oversized.fiveHourError != nil,
+                           "oversized quota \(field) was accepted")
+            }
+            try expect(Fmt.credits(1e100) == "超出范围"
+                       && Fmt.credits(Double(Int.max)) == "超出范围"
+                       && Fmt.credits(1234) != "超出范围"
+                       && Fmt.count(1e100) == "超出范围",
+                       "credit/count formatting overflowed or changed normal values")
 
             try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 0,
                 "totalModelCallCount": 0]])?.totalTokens == 0,
@@ -1374,8 +1399,24 @@ enum GLMOfflineRegression {
                 "totalModelCallCount": 2]]) == nil, "invalid model token count became zero")
             try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 10]]) == nil,
                        "missing model call count became zero")
+            for count: Any in [1e100, Double(Int.max), 1.5] {
+                try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 10,
+                    "totalModelCallCount": count]]) == nil,
+                    "oversized or fractional model call count was accepted")
+            }
+            try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 10,
+                "totalModelCallCount": 3]])?.totalCalls == 3,
+                "valid model call count changed")
             try expect(Fetcher.parseToolUsage(["totalUsage": ["totalNetworkSearchCount": 1,
                 "totalWebReadMcpCount": Double.nan]]) == nil, "invalid MCP statistic became zero")
+            for count: Any in [1e100, Double(Int.max), 1.5] {
+                try expect(Fetcher.parseToolUsage(["totalUsage": ["totalNetworkSearchCount": count,
+                    "totalWebReadMcpCount": 2]]) == nil,
+                    "oversized or fractional MCP count was accepted")
+            }
+            try expect(Fetcher.parseToolUsage(["totalUsage": ["totalNetworkSearchCount": 0,
+                "totalWebReadMcpCount": 2]])?.networkSearch == 0,
+                "valid zero MCP count was rejected")
 
             let cardPayload: [String: Any] = [
                 "available_five_hour_resets": [
