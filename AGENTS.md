@@ -14,6 +14,8 @@ GLM Coding Plan 用量菜单栏工具（对标 `~/Documents/kimi/workspace/kimi-
 
 `--once` 是真实接口验收，会读取本机凭据并联网；仅在明确安排网络验收、且确认没有其他实例并发运行时执行。
 
+**部署前必做 GUI 冒烟**：`--self-test`/`--once` 全是命令行路径，抓不住 GUI 启动期崩溃（如 2026-09-28 的 inout 独占访问 SIGABRT：同一调用里把 `usage` 结构体的两个子字段同时作 inout 实参）。部署前直接跑二进制 10 秒确认驻留且 status.json 更新：`./GlmUsage.app/Contents/MacOS/GlmUsage & sleep 10; pgrep -x GlmUsage`。另注意：同一调用不得对同一存储属性的两个子字段取 inout（Swift 独占访问运行时冲突），状态合并用纯函数返回结果再顺序赋值。
+
 需要 macOS 13+ 和 Xcode CLT（`swiftc`）。部署方式：`cp -R GlmUsage.app ~/Applications/`，LaunchAgent `com.local.glm-usage` 负责启动（本机 `open`/Gatekeeper 拒绝 ad-hoc 应用，与 KimiUsage 相同，必须走 LaunchAgent 直接执行二进制）。`cp -R` 替换 .app 后先 `launchctl kickstart -k gui/$(id -u)/com.local.glm-usage`；若进程不驻留、`launchctl list` 显示退出码 78，需完整重载：`bootout` + `bootstrap`（三个 usage app 同理）。
 
 ## 架构
