@@ -1222,15 +1222,15 @@ func onceMode() {
         print("no coding-plan api key found"); exit(1)
     }
     let group = DispatchGroup()
-    var data = UsageData()
-    // 命令行自检记录本轮是否获得了成功响应。
-    var quotaOK: Date?
-    var tokensOK: Date?
+    // 与 App 主路径同款：网络回调来自不同线程，全部经加锁 accumulator 合并，
+    // 避免 --once 里多线程直接写同一 struct（wait 超时后边写边读的撕裂窗口）
+    let acc = RefreshAccumulator()
     group.enter()
     Fetcher.fetchQuota(apiKey: key) { r in
-        if r.fiveHour != nil || r.week != nil { quotaOK = Date() }
-        data.fiveHour = r.fiveHour; data.week = r.week
-        data.level = r.level; data.quotaError = r.quotaError
+        acc.update { current in
+            current.fiveHour = r.fiveHour; current.week = r.week
+            current.level = r.level; current.quotaError = r.quotaError
+        }
         group.leave()
     }
     let now = Date()
@@ -1240,11 +1240,12 @@ func onceMode() {
         group.enter()
         Fetcher.fetchModelUsage(apiKey: key, from: from, to: now) { r, err in
             if let r = r {
-                tokensOK = Date()
-                switch label {
-                case "today": data.tokensToday = r
-                case "7d": data.tokens7d = r
-                default: data.tokens30d = r
+                acc.update { current in
+                    switch label {
+                    case "today": current.tokensToday = r
+                    case "7d": current.tokens7d = r
+                    default: current.tokens30d = r
+                    }
                 }
             } else { print("tokens \(label) error: \(err ?? "?")") }
             group.leave()
@@ -1252,32 +1253,40 @@ func onceMode() {
     }
     group.enter()
     Fetcher.fetchToolUsage(apiKey: key, from: now.addingTimeInterval(-30 * 86400), to: now) { r, _ in
-        if let r = r { data.tools30d = r }
+        if let r = r { acc.update { $0.tools30d = r } }
         group.leave()
     }
     // 充值卡（额度重置卡）+ 套餐到期：与 token 统计同批拉取
-    var subErr: String?
     if let (jwt, maas) = CredStore.loadResetTokens() {
         group.enter()
         Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
-            data.resetCards = ResetCards(fiveHour: r.fiveHour, week: r.week)
-            data.fiveHourCardsError = r.fiveHourError
-            data.weekCardsError = r.weekError
-            data.resetCardsError = [r.fiveHourError, r.weekError].compactMap { $0 }.joined(separator: "; ")
+            acc.update { current in
+                current.resetCards = ResetCards(fiveHour: r.fiveHour, week: r.week)
+                current.fiveHourCardsError = r.fiveHourError
+                current.weekCardsError = r.weekError
+                current.resetCardsError = [r.fiveHourError, r.weekError].compactMap { $0 }.joined(separator: "; ")
+            }
             group.leave()
         }
     } else {
-        data.fiveHourCardsError = "未找到 ZCode 登录凭证"
-        data.weekCardsError = "未找到 ZCode 登录凭证"
-        data.resetCardsError = "未找到 ZCode 登录凭证"
+        acc.update { current in
+            current.fiveHourCardsError = "未找到 ZCode 登录凭证"
+            current.weekCardsError = "未找到 ZCode 登录凭证"
+            current.resetCardsError = "未找到 ZCode 登录凭证"
+        }
     }
     group.enter()
     Fetcher.fetchSubscription(apiKey: key) { r, err in
-        if let r = r { data.subscription = r }
-        else { subErr = err ?? "?" }
+        acc.update { current in
+            current.subscription = r
+            current.subscriptionError = r == nil ? (err ?? "?") : nil
+        }
         group.leave()
     }
     _ = group.wait(timeout: .now() + 25)
+    let data = acc.snapshot()
+    let quotaOK: Date? = (data.fiveHour != nil || data.week != nil) ? Date() : nil
+    let tokensOK: Date? = (data.tokensToday != nil || data.tokens7d != nil || data.tokens30d != nil) ? Date() : nil
 
     func line(_ e: LimitEntry?) -> String {
         guard let e = e else { return "--" }
@@ -1318,7 +1327,7 @@ func onceMode() {
         if let exp = sub.expireDate { s += " expire=\(Fmt.fullSec.string(from: exp))" }
         print(s)
     }
-    if let e = subErr { print("subscription error: \(e)") }
+    if let e = data.subscriptionError { print("subscription error: \(e)") }
     if let e = data.quotaError { print("quota error: \(e)") }
     print("lastOK: quota=\(Fmt.lastOK(quotaOK)) tokens=\(Fmt.lastOK(tokensOK))")
     exit(0)
