@@ -12,7 +12,7 @@ GLM Coding Plan 用量菜单栏工具（对标 `~/Documents/kimi/workspace/kimi-
 ./GlmUsage.app/Contents/MacOS/GlmUsage --peak-test    # 峰谷时段边界回归（改活动日期后必跑）
 ```
 
-需要 macOS 13+ 和 Xcode CLT（`swiftc`）。部署方式：`cp -R GlmUsage.app ~/Applications/`，LaunchAgent `com.local.glm-usage` 负责启动（本机 `open`/Gatekeeper 拒绝 ad-hoc 应用，与 KimiUsage 相同，必须走 LaunchAgent 直接执行二进制）。
+需要 macOS 13+ 和 Xcode CLT（`swiftc`）。部署方式：`cp -R GlmUsage.app ~/Applications/`，LaunchAgent `com.local.glm-usage` 负责启动（本机 `open`/Gatekeeper 拒绝 ad-hoc 应用，与 KimiUsage 相同，必须走 LaunchAgent 直接执行二进制）。`cp -R` 替换 .app 后先 `launchctl kickstart -k gui/$(id -u)/com.local.glm-usage`；若进程不驻留、`launchctl list` 显示退出码 78，需完整重载：`bootout` + `bootstrap`（三个 usage app 同理）。
 
 ## 架构
 
