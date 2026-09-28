@@ -188,15 +188,18 @@ enum GLMFreshness {
         cards.filter { $0 > now }.sorted()
     }
 
-    static func apply<T>(fresh: T?, failure: String?, value: inout T?,
-                         lastSuccess: inout Date?, error: inout String?, now: Date) {
+    /// 纯函数：fresh 成功 → 新值+新成功时间+清错误；仅失败 → 保留旧值/旧成功时间+记录错误；
+    /// 两者皆无 → 原样返回。调用处对结果做顺序赋值——不要把 self 的多个子字段同时作为
+    /// inout 实参传入一个调用（同一存储属性的并发独占访问会触发 Swift 运行时崩溃）。
+    static func apply<T>(fresh: T?, failure: String?, old: T?, oldLastOK: Date?, oldError: String?,
+                         now: Date) -> (value: T?, lastOK: Date?, error: String?) {
         if let fresh = fresh {
-            value = fresh
-            lastSuccess = now
-            error = nil
-        } else if let failure = failure {
-            error = failure
+            return (fresh, now, nil)
         }
+        if let failure = failure {
+            return (old, oldLastOK, failure)
+        }
+        return (old, oldLastOK, oldError)
     }
 }
 
@@ -901,40 +904,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func finishRefresh(_ fresh: UsageData, tokens: Bool) {
         let now = Date()
-        GLMFreshness.apply(fresh: fresh.fiveHour, failure: fresh.fiveHourError,
-            value: &usage.fiveHour, lastSuccess: &fiveHourLastOK, error: &usage.fiveHourError, now: now)
-        GLMFreshness.apply(fresh: fresh.week, failure: fresh.weekError,
-            value: &usage.week, lastSuccess: &weekLastOK, error: &usage.weekError, now: now)
+        let five = GLMFreshness.apply(fresh: fresh.fiveHour, failure: fresh.fiveHourError,
+            old: usage.fiveHour, oldLastOK: fiveHourLastOK, oldError: usage.fiveHourError, now: now)
+        usage.fiveHour = five.value; fiveHourLastOK = five.lastOK; usage.fiveHourError = five.error
+        let week = GLMFreshness.apply(fresh: fresh.week, failure: fresh.weekError,
+            old: usage.week, oldLastOK: weekLastOK, oldError: usage.weekError, now: now)
+        usage.week = week.value; weekLastOK = week.lastOK; usage.weekError = week.error
         if fresh.fiveHour != nil || fresh.week != nil { usage.quotaError = nil }
         else if let error = fresh.quotaError { usage.quotaError = error }
         usage.level = fresh.level ?? usage.level
 
         if tokens {
-            GLMFreshness.apply(fresh: fresh.tokensToday, failure: fresh.tokensTodayError,
-                value: &usage.tokensToday, lastSuccess: &tokensTodayLastOK, error: &usage.tokensTodayError, now: now)
-            GLMFreshness.apply(fresh: fresh.tokens7d, failure: fresh.tokens7dError,
-                value: &usage.tokens7d, lastSuccess: &tokens7dLastOK, error: &usage.tokens7dError, now: now)
-            GLMFreshness.apply(fresh: fresh.tokens30d, failure: fresh.tokens30dError,
-                value: &usage.tokens30d, lastSuccess: &tokens30dLastOK, error: &usage.tokens30dError, now: now)
-            GLMFreshness.apply(fresh: fresh.tools30d, failure: fresh.toolsError,
-                value: &usage.tools30d, lastSuccess: &toolsLastOK, error: &usage.toolsError, now: now)
+            let today = GLMFreshness.apply(fresh: fresh.tokensToday, failure: fresh.tokensTodayError,
+                old: usage.tokensToday, oldLastOK: tokensTodayLastOK, oldError: usage.tokensTodayError, now: now)
+            usage.tokensToday = today.value; tokensTodayLastOK = today.lastOK; usage.tokensTodayError = today.error
+            let seven = GLMFreshness.apply(fresh: fresh.tokens7d, failure: fresh.tokens7dError,
+                old: usage.tokens7d, oldLastOK: tokens7dLastOK, oldError: usage.tokens7dError, now: now)
+            usage.tokens7d = seven.value; tokens7dLastOK = seven.lastOK; usage.tokens7dError = seven.error
+            let thirty = GLMFreshness.apply(fresh: fresh.tokens30d, failure: fresh.tokens30dError,
+                old: usage.tokens30d, oldLastOK: tokens30dLastOK, oldError: usage.tokens30dError, now: now)
+            usage.tokens30d = thirty.value; tokens30dLastOK = thirty.lastOK; usage.tokens30dError = thirty.error
+            let tools = GLMFreshness.apply(fresh: fresh.tools30d, failure: fresh.toolsError,
+                old: usage.tools30d, oldLastOK: toolsLastOK, oldError: usage.toolsError, now: now)
+            usage.tools30d = tools.value; toolsLastOK = tools.lastOK; usage.toolsError = tools.error
 
             let hasCardBatch = fresh.resetCards != nil
-            var fiveCards = usage.resetCards?.fiveHour
-            var weekCards = usage.resetCards?.week
-            GLMFreshness.apply(fresh: fresh.resetCards?.fiveHour, failure: fresh.fiveHourCardsError,
-                value: &fiveCards, lastSuccess: &fiveHourCardsLastOK, error: &usage.fiveHourCardsError, now: now)
-            GLMFreshness.apply(fresh: fresh.resetCards?.week, failure: fresh.weekCardsError,
-                value: &weekCards, lastSuccess: &weekCardsLastOK, error: &usage.weekCardsError, now: now)
+            let fiveCards = GLMFreshness.apply(fresh: fresh.resetCards?.fiveHour, failure: fresh.fiveHourCardsError,
+                old: usage.resetCards?.fiveHour, oldLastOK: fiveHourCardsLastOK, oldError: usage.fiveHourCardsError, now: now)
+            let weekCards = GLMFreshness.apply(fresh: fresh.resetCards?.week, failure: fresh.weekCardsError,
+                old: usage.resetCards?.week, oldLastOK: weekCardsLastOK, oldError: usage.weekCardsError, now: now)
+            fiveHourCardsLastOK = fiveCards.lastOK; weekCardsLastOK = weekCards.lastOK
+            usage.fiveHourCardsError = fiveCards.error; usage.weekCardsError = weekCards.error
             if hasCardBatch || usage.resetCards != nil {
-                usage.resetCards = ResetCards(fiveHour: fiveCards, week: weekCards)
+                usage.resetCards = ResetCards(fiveHour: fiveCards.value, week: weekCards.value)
             }
             if let error = fresh.resetCardsError { usage.resetCardsError = error }
             else if fresh.resetCards != nil { usage.resetCardsError = nil }
 
-            GLMFreshness.apply(fresh: fresh.subscription, failure: fresh.subscriptionError,
-                value: &usage.subscription, lastSuccess: &subscriptionLastOK,
-                error: &usage.subscriptionError, now: now)
+            let sub = GLMFreshness.apply(fresh: fresh.subscription, failure: fresh.subscriptionError,
+                old: usage.subscription, oldLastOK: subscriptionLastOK, oldError: usage.subscriptionError, now: now)
+            usage.subscription = sub.value; subscriptionLastOK = sub.lastOK; usage.subscriptionError = sub.error
         }
 
         let tokenErrors = [usage.tokensTodayError, usage.tokens7dError, usage.tokens30dError, usage.toolsError]
@@ -1445,34 +1454,26 @@ enum GLMOfflineRegression {
                                   remaining: 60, usedRatio: 0.4, reset: nil)
             let last5 = now.addingTimeInterval(-1_000)
             let oldCards = [now.addingTimeInterval(3_600)]
-            var fiveValue: LimitEntry? = old5
-            var fiveLast: Date? = last5
-            var fiveError: String?
-            GLMFreshness.apply(fresh: partial.fiveHour, failure: partial.fiveHourError,
-                value: &fiveValue, lastSuccess: &fiveLast, error: &fiveError, now: now)
-            try expect(fiveValue?.used == old5.used && fiveLast == last5 && fiveError != nil,
+            let fiveR = GLMFreshness.apply(fresh: partial.fiveHour, failure: partial.fiveHourError,
+                old: old5, oldLastOK: last5, oldError: nil, now: now)
+            try expect(fiveR.value?.used == old5.used && fiveR.lastOK == last5 && fiveR.error != nil,
                        "partial quota failure did not preserve its old value/time and expose error")
-            var weekValue: LimitEntry?
-            var weekLast: Date?
-            var weekError: String?
-            GLMFreshness.apply(fresh: partial.week, failure: partial.weekError,
-                value: &weekValue, lastSuccess: &weekLast, error: &weekError, now: now)
-            try expect(weekValue?.used == 100 && weekLast == now && weekError == nil,
+            let weekR = GLMFreshness.apply(fresh: partial.week, failure: partial.weekError,
+                old: nil, oldLastOK: nil, oldError: nil, now: now)
+            try expect(weekR.value?.used == 100 && weekR.lastOK == now && weekR.error == nil,
                        "valid quota window did not update independently")
-            var retainedCards: [Date]? = oldCards
-            var cardsLast: Date? = last5
-            var cardsError: String?
-            GLMFreshness.apply(fresh: cards.week, failure: cards.weekError,
-                value: &retainedCards, lastSuccess: &cardsLast, error: &cardsError, now: now)
-            try expect(retainedCards == oldCards && cardsLast == last5 && cardsError != nil,
+            let cardsR = GLMFreshness.apply(fresh: cards.week, failure: cards.weekError,
+                old: oldCards, oldLastOK: last5, oldError: nil, now: now)
+            try expect(cardsR.value == oldCards && cardsR.lastOK == last5 && cardsR.error != nil,
                        "invalid card list cleared old cards or advanced last-success")
-            var independentValue: String?
-            var independentLast: Date?
-            var independentError: String?
-            GLMFreshness.apply(fresh: "ok", failure: nil, value: &independentValue,
-                lastSuccess: &independentLast, error: &independentError, now: now)
-            try expect(independentValue == "ok" && independentLast == now && last5 != independentLast,
+            let independentR = GLMFreshness.apply(fresh: "ok", failure: nil,
+                old: nil as String?, oldLastOK: nil, oldError: nil, now: now)
+            try expect(independentR.value == "ok" && independentR.lastOK == now && independentR.lastOK != last5,
                        "independent data item success time was not updated")
+            let noopR = GLMFreshness.apply(fresh: nil as String?, failure: nil,
+                old: "keep", oldLastOK: last5, oldError: "old error", now: now)
+            try expect(noopR.value == "keep" && noopR.lastOK == last5 && noopR.error == "old error",
+                       "no-data no-error round mutated retained state")
             try expect(GLMFreshness.isStale(lastSuccess: last5, hasData: true, now: now, after: 600),
                        "retained old value was not marked stale")
 
