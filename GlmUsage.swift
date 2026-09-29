@@ -111,6 +111,17 @@ struct ModelUsage {
     var isEmpty: Bool { totalTokens == 0 && totalCalls == 0 }
 }
 
+/// Token 板块按模型明细的树形行：每个模型单独一行（├/└），按用量降序、过滤 0，平局按名称排序保证稳定
+enum TokenModelLines {
+    static func render(_ models: [(name: String, tokens: Double)]) -> [String] {
+        let visible = models.filter { $0.tokens > 0 }
+            .sorted { $0.tokens != $1.tokens ? $0.tokens > $1.tokens : $0.name < $1.name }
+        return visible.enumerated().map { i, m in
+            (i == visible.count - 1 ? "└ " : "├ ") + "\(m.name) \(Fmt.tokens(m.tokens))"
+        }
+    }
+}
+
 struct ToolUsage {
     var networkSearch: Double
     var webRead: Double
@@ -1150,28 +1161,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Token 用量（服务端统计）
         menu.addItem(.separator())
         menu.addItem(info("Token 用量（服务端统计）"))
-        func tokenLine(_ label: String, _ stats: ModelUsage?, lastOK: Date?, stale: Bool, error: String?) -> String {
-            var line: String
+        func addTokenSection(_ label: String, _ stats: ModelUsage?, lastOK: Date?, stale: Bool, error: String?) {
+            var lines: [String]
             if let stats = stats, !stats.isEmpty {
-                line = "\(label)：\(Fmt.tokens(stats.totalTokens)) tokens · 调用 \(Fmt.count(stats.totalCalls)) 次"
-                if !stats.byModel.isEmpty {
-                    line += "\n  " + stats.byModel.map { "\($0.name) \(Fmt.tokens($0.tokens))" }
-                        .joined(separator: " · ")
-                }
+                lines = ["\(label)：\(Fmt.tokens(stats.totalTokens)) tokens · 调用 \(Fmt.count(stats.totalCalls)) 次"]
+                lines += TokenModelLines.render(stats.byModel)
             } else {
-                line = "\(label)：暂无记录"
+                lines = ["\(label)：暂无记录"]
             }
-            if stale { line += " · ⚠️ 数据已过期" }
-            if let error = error { line += " · 刷新失败：\(error)" }
-            if lastOK != nil, stale || error != nil { line += " · 最后成功 \(Fmt.lastOK(lastOK))" }
-            return line
+            if stale { lines[0] += " · ⚠️ 数据已过期" }
+            if let error = error { lines[0] += " · 刷新失败：\(error)" }
+            if lastOK != nil, stale || error != nil { lines[0] += " · 最后成功 \(Fmt.lastOK(lastOK))" }
+            for line in lines { menu.addItem(info(line)) }
         }
-        menu.addItem(info(tokenLine("今日", usage.tokensToday, lastOK: tokensTodayLastOK,
-                                 stale: tokensTodayStale, error: usage.tokensTodayError)))
-        menu.addItem(info(tokenLine("近 7 天", usage.tokens7d, lastOK: tokens7dLastOK,
-                                 stale: tokens7dStale, error: usage.tokens7dError)))
-        menu.addItem(info(tokenLine("近 30 天", usage.tokens30d, lastOK: tokens30dLastOK,
-                                 stale: tokens30dStale, error: usage.tokens30dError)))
+        addTokenSection("今日", usage.tokensToday, lastOK: tokensTodayLastOK,
+                        stale: tokensTodayStale, error: usage.tokensTodayError)
+        addTokenSection("近 7 天", usage.tokens7d, lastOK: tokens7dLastOK,
+                        stale: tokens7dStale, error: usage.tokens7dError)
+        addTokenSection("近 30 天", usage.tokens30d, lastOK: tokens30dLastOK,
+                        stale: tokens30dStale, error: usage.tokens30dError)
 
         if let t = usage.tools30d {
             menu.addItem(.separator())
@@ -1440,6 +1448,18 @@ enum GLMOfflineRegression {
             try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 10,
                 "totalModelCallCount": 3]])?.totalCalls == 3,
                 "valid model call count changed")
+            let tree = TokenModelLines.render([
+                (name: "GLM-5.3", tokens: 13_980_000),
+                (name: "GLM-5.3-Flash", tokens: 39_830_000),
+                (name: "GLM-4.6", tokens: 0)
+            ])
+            try expect(tree == ["├ GLM-5.3-Flash 39.83M", "└ GLM-5.3 13.98M"],
+                       "token model tree lines changed (sort order, branch markers, or zero filter)")
+            try expect(TokenModelLines.render([(name: "GLM-5.3", tokens: 5_000)]) == ["└ GLM-5.3 5.00K"],
+                       "single-model tree line lost its final branch marker")
+            try expect(TokenModelLines.render([]).isEmpty
+                       && TokenModelLines.render([(name: "GLM-4.6", tokens: 0)]).isEmpty,
+                       "empty or all-zero model list produced tree lines")
             try expect(Fetcher.parseToolUsage(["totalUsage": ["totalNetworkSearchCount": 1,
                 "totalWebReadMcpCount": Double.nan]]) == nil, "invalid MCP statistic became zero")
             for count: Any in [1e100, Double(Int.max), 1.5] {
