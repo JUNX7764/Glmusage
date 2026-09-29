@@ -1119,6 +1119,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(limitLine(usage.week, label: "7 天额度", lastOK: weekLastOK,
                                   stale: weekStale, error: usage.weekError)))
 
+        menu.addItem(.separator())
+
         // 峰谷状态 + 限时活动
         let pk = Peak.evaluate()
         menu.addItem(info(pk.line))
