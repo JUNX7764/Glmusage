@@ -40,7 +40,7 @@ enum CredStore {
         return decrypt(enc)
     }
 
-    // 充值卡（额度重置卡）接口所需的两个 ZCode 登录态 token（同一密文格式、同一把密钥）。
+    // 重置卡（额度重置卡）接口所需的两个 ZCode 登录态 token（同一密文格式、同一把密钥）。
     // 任一缺失/解密失败返回 nil，由调用方优雅降级；同样只存内存、绝不落盘。
     static func loadResetTokens() -> (jwt: String, maas: String)? {
         guard let data = FileManager.default.contents(atPath: credPath),
@@ -127,7 +127,7 @@ struct ToolUsage {
     var webRead: Double
 }
 
-/// 充值卡（官方名：额度重置卡）：按窗口类型分组的未过期卡到期时间（已过滤 expire_at <= now）
+/// 重置卡（官方名：额度重置卡）：按窗口类型分组的未过期卡到期时间（已过滤 expire_at <= now）
 struct ResetCards {
     var fiveHour: [Date]?
     var week: [Date]?
@@ -147,7 +147,7 @@ struct UsageData {
     var tokens7d: ModelUsage?
     var tokens30d: ModelUsage?
     var tools30d: ToolUsage?
-    var resetCards: ResetCards?        // 充值卡（额度重置卡）可用列表
+    var resetCards: ResetCards?        // 重置卡（额度重置卡）可用列表
     var resetCardsError: String?
     var subscription: SubscriptionInfo?
     var quotaError: String?
@@ -273,7 +273,7 @@ final class RefreshGate {
 // 时间参数为本地时区 "yyyy-MM-dd HH:mm:ss"；Authorization: Bearer <订阅 api-key>。
 // token 统计由服务端完成，无需扫描本地会话日志（与 KimiUsage 的差异点）。
 // 另有两个扩展接口：
-//   GET https://zcode.z.ai/api/v1/coding-plan/reset/status  充值卡（额度重置卡），
+//   GET https://zcode.z.ai/api/v1/coding-plan/reset/status  重置卡（额度重置卡），
 //       需 Authorization/X-Bigmodel-Authorization/Bigmodel-Target-Type 三个自定义头，成功码 code==0
 //   GET {base}/api/biz/subscription/list                    套餐订阅（code==200，data 为数组）
 
@@ -468,10 +468,10 @@ enum Fetcher {
         return ToolUsage(networkSearch: Double(search), webRead: Double(webRead))
     }
 
-    // 充值卡（额度重置卡）：ZCode 侧接口，成功码为 code==0（与 open.bigmodel.cn 系的 200 不同）
+    // 重置卡（额度重置卡）：ZCode 侧接口，成功码为 code==0（与 open.bigmodel.cn 系的 200 不同）
     static let resetBase = "https://zcode.z.ai"
 
-    /// 查询可用充值卡列表；jwt/maas 为 ZCode 登录态 token，过期/缺失由上层优雅降级
+    /// 查询可用重置卡列表；jwt/maas 为 ZCode 登录态 token，过期/缺失由上层优雅降级
     static func fetchResetCards(jwt: String, maas: String,
                                 completion: @escaping (ResetCardsResult) -> Void) {
         guard let url = URL(string: resetBase + "/api/v1/coding-plan/reset/status") else {
@@ -642,7 +642,7 @@ enum Fmt {
         f.dateFormat = "MM-dd HH:mm"
         return f.string(from: d)
     }
-    // 充值卡/套餐到期提示：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期（本地时区）
+    // 重置卡/套餐到期提示：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期（本地时区）
     static func expires(_ d: Date) -> String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "zh_CN")
@@ -893,7 +893,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 wg.leave()
             }
-            // 充值卡（额度重置卡）：ZCode 登录态 token 缺失/过期时优雅降级为错误提示
+            // 重置卡（额度重置卡）：ZCode 登录态 token 缺失/过期时优雅降级为错误提示
             if let (jwt, maas) = CredStore.loadResetTokens() {
                 wg.enter()
                 Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
@@ -913,7 +913,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     current.resetCardsError = "未找到 ZCode 登录凭证"
                 }
             }
-            // 套餐到期（与充值卡同周期刷新）
+            // 套餐到期（与重置卡同周期刷新）
             wg.enter()
             Fetcher.fetchSubscription(apiKey: key) { r, err in
                 accumulator.update { current in
@@ -1033,7 +1033,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func writeStatus(line1: String, line2: String, peakLine: String) {
         let dir = NSHomeDirectory() + "/Library/Application Support/GlmUsage"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        // 充值卡/套餐自诊断（只含到期时间与名称，不含任何密钥）
+        // 重置卡/套餐自诊断（只含到期时间与名称，不含任何密钥）
         var cardsStatus: [String] = []
         if let c = usage.resetCards {
             cardsStatus += GLMFreshness.availableCards(c.fiveHour ?? [], now: Date())
@@ -1126,7 +1126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(pk.line))
         if let ev = pk.eventLine { menu.addItem(info(ev)) }
 
-        // 充值卡（额度重置卡）板块：首轮未拉到数据时不画分隔线，避免连续双 separator；≤72 小时临期加 ⚠️
+        // 重置卡（额度重置卡）板块：首轮未拉到数据时不画分隔线，避免连续双 separator；≤72 小时临期加 ⚠️
         if usage.resetCards != nil || usage.resetCardsError != nil {
             menu.addItem(.separator())
         }
@@ -1142,9 +1142,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if cards.week != nil { parts.append("周 ×\(wk.count)") }
             let bothKnownEmpty = cards.fiveHour != nil && cards.week != nil && f5.isEmpty && wk.isEmpty
             if bothKnownEmpty {
-                menu.addItem(info("充值卡（额度重置）：暂无可用"))
+                menu.addItem(info("重置卡：暂无可用"))
             } else {
-                if !parts.isEmpty { menu.addItem(info("充值卡（额度重置）：" + parts.joined(separator: " · "))) }
+                if !parts.isEmpty { menu.addItem(info("重置卡：" + parts.joined(separator: " · "))) }
                 for d in f5 { menu.addItem(info(cardLine("5 小时卡", d))) }
                 for d in wk { menu.addItem(info(cardLine("周卡", d))) }
             }
@@ -1291,7 +1291,7 @@ func onceMode() {
         if let r = r { acc.update { $0.tools30d = r } }
         group.leave()
     }
-    // 充值卡（额度重置卡）+ 套餐到期：与 token 统计同批拉取
+    // 重置卡（额度重置卡）+ 套餐到期：与 token 统计同批拉取
     if let (jwt, maas) = CredStore.loadResetTokens() {
         group.enter()
         Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in

@@ -16,8 +16,8 @@
   - `GET https://open.bigmodel.cn/api/monitor/usage/quota/limit`
   - `GET https://open.bigmodel.cn/api/monitor/usage/model-usage?startTime=&endTime=`
   - `GET https://open.bigmodel.cn/api/monitor/usage/tool-usage?startTime=&endTime=`
-- 刷新：额度每 60s；token/MCP/充值卡/套餐每 5 分钟（可在源码 `tokenEveryCycles` 调整）；定时器容差 6s
-- 额度窗口、各 token 时间窗、MCP、两类充值卡和套餐分别记录成功时间；字段缺失或非法时保留旧值并显示错误/过期状态
+- 刷新：额度每 60s；token/MCP/重置卡/套餐每 5 分钟（可在源码 `tokenEveryCycles` 调整）；定时器容差 6s
+- 额度窗口、各 token 时间窗、MCP、两类重置卡和套餐分别记录成功时间；字段缺失或非法时保留旧值并显示错误/过期状态
 - 并行请求合并经过串行保护；同一时间最多一轮刷新，重叠手动刷新最多再补一轮完整刷新，定时刷新重叠会丢弃
 
 ## 构建

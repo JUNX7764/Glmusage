@@ -28,9 +28,9 @@ GLM Coding Plan 用量菜单栏工具（对标 `~/Documents/kimi/workspace/kimi-
   - `/api/monitor/usage/model-usage?startTime=&endTime=` — 按小时 token/调用数（本地时区 `yyyy-MM-dd HH:mm:ss`）
   - `/api/monitor/usage/tool-usage` — MCP 工具次数
   - `/api/biz/subscription/list` — 套餐信息（`status=="VALID"` 首条的 `productName` + `valid` 末尾到期时间），Bearer API key 认证，code==200
-- **充值卡（额度重置卡）**：`GET https://zcode.z.ai/api/v1/coding-plan/reset/status`（注意：ZCode 自家后端，非 open.bigmodel.cn；成功码 code==0）。需双 token 认证：`Authorization: Bearer <zcodejwttoken>` + `X-Bigmodel-Authorization: <oauth:bigmodel:access_token>` + `Bigmodel-Target-Type: PERSONAL`，两 token 均在 credentials.json（`CredStore.loadResetTokens()` 解密）。响应 `available_five_hour_resets`/`available_week_resets` 数组、每张卡 `expire_at` 为 epoch 毫秒。接口路径逆向自 ZCode app.asar（`/use` `/opportunity` `/history/read` 均为写操作，应用只读 status，绝不自动用卡）。token 是 ZCode 登录态、可能过期 → 失败时菜单降级为提示行。
+- **重置卡**（官方名：额度重置卡）：`GET https://zcode.z.ai/api/v1/coding-plan/reset/status`（注意：ZCode 自家后端，非 open.bigmodel.cn；成功码 code==0）。需双 token 认证：`Authorization: Bearer <zcodejwttoken>` + `X-Bigmodel-Authorization: <oauth:bigmodel:access_token>` + `Bigmodel-Target-Type: PERSONAL`，两 token 均在 credentials.json（`CredStore.loadResetTokens()` 解密）。响应 `available_five_hour_resets`/`available_week_resets` 数组、每张卡 `expire_at` 为 epoch 毫秒。接口路径逆向自 ZCode app.asar（`/use` `/opportunity` `/history/read` 均为写操作，应用只读 status，绝不自动用卡）。token 是 ZCode 登录态、可能过期 → 失败时菜单降级为提示行。
 - **Peak**：峰谷时段本地计算，新版积分制口径（高峰=工作日 14:00–18:00 全价，其余时间+周末全天 5 折；Asia/Shanghai 时区，不依赖系统时区；老版 V1/V2 的 3倍/1倍 口径不适用）。限时活动硬编码日期、过期自动失效：双节 2026-09-25~10-07 全天 5 折；深夜错峰 2026-09-03~10-07 每日 23:00–09:00 ZCode 内 Flash 0 消耗/其他 Agent 额度×2。菜单栏标题 emoji（🔥 高峰 / ⚡ 深夜活动）+ 下拉菜单状态行；`--peak-test` 为边界回归用例，**改活动日期后必跑**。
-- 刷新节奏：额度每 60s，token 统计/MCP/充值卡/套餐到期每 5 分钟（`tokenEveryCycles`）；Timer 容差 6s。额度窗口、各 token 时间窗、MCP、两类充值卡和套餐分别记最后成功时间，失败保留旧值并显示错误/过期状态。最多一轮刷新；重叠手动刷新合并为一轮后续完整刷新，定时重叠不排队。token 统计全靠服务端，不扫描本地会话日志（与 KimiUsage 的关键差异）。
+- 刷新节奏：额度每 60s，token 统计/MCP/重置卡/套餐到期每 5 分钟（`tokenEveryCycles`）；Timer 容差 6s。额度窗口、各 token 时间窗、MCP、两类重置卡和套餐分别记最后成功时间，失败保留旧值并显示错误/过期状态。最多一轮刷新；重叠手动刷新合并为一轮后续完整刷新，定时重叠不排队。token 统计全靠服务端，不扫描本地会话日志（与 KimiUsage 的关键差异）。
 - 自诊断写 `~/Library/Application Support/GlmUsage/status.json`。
 
 ## 约定
