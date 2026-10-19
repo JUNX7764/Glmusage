@@ -18,6 +18,10 @@ GLM Coding Plan 用量菜单栏工具（对标 `~/Documents/kimi/workspace/kimi-
 
 需要 macOS 13+ 和 Xcode CLT（`swiftc`）。部署方式：`cp -R GlmUsage.app ~/Applications/`，LaunchAgent `com.local.glm-usage` 负责启动（本机 `open`/Gatekeeper 拒绝 ad-hoc 应用，与 KimiUsage 相同，必须走 LaunchAgent 直接执行二进制）。`cp -R` 替换 .app 后先 `launchctl kickstart -k gui/$(id -u)/com.local.glm-usage`；若进程不驻留、`launchctl list` 显示退出码 78，需完整重载：`bootout` + `bootstrap`（三个 usage app 同理）。
 
+**KeepAlive 语义（2026-10-19 起，三个 usage app 同款）**：plist 与 app 内「开机自启」模板（`onToggleLogin`）均为 `KeepAlive={SuccessfulExit=false}`——菜单「退出」走 exit 0 真退出、launchd 不复活；崩溃/被 kill 仍自动拉起（launchd 默认 10s 节流，kill -9 后 10 秒内别误判为保护失效）；开机自启（RunAtLoad）不变。退出后手动恢复：`launchctl kickstart gui/$(id -u)/com.local.glm-usage`。
+
+**菜单栏图标叠死坑（2026-10-19）**：多个 usage app 同一时刻被 launchd 拉起会竞态注册 NSStatusItem，图标落同一坐标（Glm/Kimi 均曾为 x=1354）互相盖住。重载/部署三个 app 时错开 ≥5s 逐个 `bootout`+`bootstrap`。验证坐标：`osascript -e 'tell application "System Events" to tell process "GlmUsage" to get position of menu bar item 1 of menu bar 1'`（三个 x 值必须互不相同）。
+
 ## 架构
 
 单文件 `GlmUsage.swift`（AppKit 菜单栏应用，无外部依赖）：
