@@ -36,8 +36,9 @@ enum CredStore {
             if am != bm { return am }            // bigmodel 优先
             return a.key < b.key
         }
-        guard let enc = candidates.first?.enc else { return nil }
-        return decrypt(enc)
+        if let enc = candidates.first?.enc { return decrypt(enc) }
+        // 纯 OAuth 登录的凭证库没有独立 api-key 条目；监控接口实测接受 access_token 作为 Bearer 凭证
+        return decrypt(obj["oauth:bigmodel:access_token"] ?? "")
     }
 
     // 重置卡（额度重置卡）接口所需的两个 ZCode 登录态 token（同一密文格式、同一把密钥）。
