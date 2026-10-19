@@ -28,7 +28,7 @@ GLM Coding Plan 用量菜单栏工具（对标 `~/Documents/kimi/workspace/kimi-
 
 单文件 `GlmUsage.swift`（AppKit 菜单栏应用，无外部依赖）：
 
-- **CredStore**：只读解密 `~/.zcode/v2/credentials.json`（`enc:v1:` = AES-256-GCM，密钥 = SHA256(`ZCODE_CREDENTIAL_SECRET` 环境变量，未设则 `zcode-credential-fallback:darwin:<homedir>:<username>`），与 ZCode 客户端 zcode.cjs 逻辑一致；也可用 `GLM_API_KEY` 环境变量直供）。key 只存在内存，绝不写盘/入库。
+- **CredStore**：只读解密 `~/.zcode/v2/credentials.json`（`enc:v1:` = AES-256-GCM，密钥 = SHA256(`ZCODE_CREDENTIAL_SECRET` 环境变量，未设则 `zcode-credential-fallback:darwin:<homedir>:<username>`），与 ZCode 客户端 zcode.cjs 逻辑一致；也可用 `GLM_API_KEY` 环境变量直供）。api-key 候选为空时回退解密 `oauth:bigmodel:access_token` 作监控接口 Bearer——纯 OAuth 登录 ZCode 的机器无 api-key 条目，监控接口实测接受该 token（PR #1，2026-10-19 合并；有 api-key 条目的机器不受影响）。key 只存在内存，绝不写盘/入库。
 - **Fetcher**：智谱监控接口（源自官方 zai-org/zai-coding-plugins 的 glm-plan-usage 插件），base `https://open.bigmodel.cn`：
   - `/api/monitor/usage/quota/limit` — 5 小时 + 7 天（周）credits（`CREDIT_LIMIT`，unit 3=小时/6=周；官方文档 docs.bigmodel.cn/cn/coding-plan/overview：Lite 2,000/5h + 10,000/周；旧版 TOKENS_LIMIT/TIME_LIMIT 已随 2026-07 积分制改版下线；`nextResetTime` 为 epoch 毫秒）
   - `/api/monitor/usage/model-usage?startTime=&endTime=` — 按小时 token/调用数（本地时区 `yyyy-MM-dd HH:mm:ss`）
