@@ -16,7 +16,9 @@ GLM Coding Plan 用量菜单栏工具（对标 `~/Documents/kimi/workspace/kimi-
 
 **部署前必做 GUI 冒烟**：`--self-test`/`--once` 全是命令行路径，抓不住 GUI 启动期崩溃（如 2026-09-28 的 inout 独占访问 SIGABRT：同一调用里把 `usage` 结构体的两个子字段同时作 inout 实参）。部署前直接跑二进制 10 秒确认驻留且 status.json 更新：`./GlmUsage.app/Contents/MacOS/GlmUsage & sleep 10; pgrep -x GlmUsage`。另注意：同一调用不得对同一存储属性的两个子字段取 inout（Swift 独占访问运行时冲突），状态合并用纯函数返回结果再顺序赋值。
 
-需要 macOS 13+ 和 Xcode CLT（`swiftc`）。部署方式：`cp -R GlmUsage.app ~/Applications/`，LaunchAgent `com.local.glm-usage` 负责启动（本机 `open`/Gatekeeper 拒绝 ad-hoc 应用，与 KimiUsage 相同，必须走 LaunchAgent 直接执行二进制）。`cp -R` 替换 .app 后先 `launchctl kickstart -k gui/$(id -u)/com.local.glm-usage`；若进程不驻留、`launchctl list` 显示退出码 78，需完整重载：`bootout` + `bootstrap`（三个 usage app 同理）。
+需要 macOS 13+ 和 Xcode CLT（`swiftc`）。部署方式：`cp -R GlmUsage.app ~/Applications/`，LaunchAgent `com.local.glm-usage` 负责开机自启与崩溃保活（`cp -R` 替换 .app 后先 `launchctl kickstart -k gui/$(id -u)/com.local.glm-usage`；若进程不驻留、`launchctl list` 显示退出码 78，需完整重载：`bootout` + `bootstrap`，三个 usage app 同理，且错开 ≥5s 逐个重载）。
+
+**双击/open 启动有效（2026-10-19 实测更正旧结论）**：本地构建 + `cp -R` 部署的 app 无 quarantine 标记，Finder 双击与 `open` 均可正常启动（spctl 虽显示 rejected，但 Gatekeeper 只强制拦截带 quarantine 的文件）。旧记录「open/Gatekeeper 拒绝 ad-hoc 应用」不成立于当前系统。退出后的恢复方式（按用户友好度排序）：双击 `~/Applications/GlmUsage.app`、`launchctl kickstart gui/$(id -u)/com.local.glm-usage`、重启电脑。注意：一旦 app 经由下载/解压等带 quarantine 的渠道分发，双击会被拦，须 `xattr -d com.apple.quarantine` 或走系统设置「仍要打开」；本仓库工作流（本地构建直拷）不受影响。
 
 **KeepAlive 语义（2026-10-19 起，三个 usage app 同款）**：plist 与 app 内「开机自启」模板（`onToggleLogin`）均为 `KeepAlive={SuccessfulExit=false}`——菜单「退出」走 exit 0 真退出、launchd 不复活；崩溃/被 kill 仍自动拉起（launchd 默认 10s 节流，kill -9 后 10 秒内别误判为保护失效）；开机自启（RunAtLoad）不变。退出后手动恢复：`launchctl kickstart gui/$(id -u)/com.local.glm-usage`。
 
