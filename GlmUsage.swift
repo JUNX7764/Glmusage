@@ -1749,37 +1749,54 @@ if CommandLine.arguments.contains("--self-test") {
 
 if CommandLine.arguments.contains("--peak-test") {
     let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
     f.dateFormat = "yyyy-MM-dd HH:mm"
     f.timeZone = Peak.tz
-    let cases = [
-        "2026-09-24 15:00",  // 周四 · 双节前的普通工作日高峰
-        "2026-09-25 15:00",  // 周五 · 双节第一天，活动覆盖高峰
-        "2026-09-26 15:00",  // 周六下午 · 周末全天非高峰
-        "2026-09-28 13:59",  // 周一 · 双节覆盖（常规规则此刻应为高峰前 1 分钟）
-        "2026-09-28 14:00",  // 周一 · 双节覆盖（常规规则此刻应进入高峰）
-        "2026-09-28 17:59",  // 周一 · 双节覆盖（常规高峰最后一分钟）
-        "2026-09-28 18:00",  // 周一 · 双节覆盖（常规高峰结束）
-        "2026-09-28 22:00",  // 周一晚 · 下个高峰=双节后首个工作日
-        "2026-09-30 23:30",  // 深夜活动开始 + 双节
-        "2026-10-01 08:59",  // 深夜活动尾段（归属 9-30 夜）
-        "2026-10-01 09:00",  // 深夜结束 · 双节白天
-        "2026-10-07 15:00",  // 双节最后一天（周三），活动覆盖
-        "2026-10-08 01:00",  // 最后一晚深夜活动的凌晨（归属 10-07 夜）
-        "2026-10-08 13:59",  // 双节后首个工作日 · 高峰前 1 分钟，下个高峰=今天
-        "2026-10-08 14:00",  // 双节后首个工作日 · 高峰开始
-        "2026-10-08 17:59",  // 高峰最后一分钟
-        "2026-10-08 18:00",  // 高峰结束
-        "2026-10-08 15:00",  // 高峰中（周四）
-        "2026-10-09 21:00",  // 周五晚 · 下个高峰=下周一
-        "2026-10-09 01:00",  // 活动结束后凌晨 · 无深夜标记
+    let peakLine = "🔥 高峰期 · 积分全价（18:00 后恢复 5 折）"
+    let festivalLine = "🎉 双节活动：全天按非高峰 5 折（至 10-07）"
+    let nightLine = "🌙 深夜错峰：Flash 免费 · 其他 Agent 额度 ×2（至 10-07）"
+    func offPeak(_ next: String) -> String { "⚡ 非高峰 · 积分 5 折（下个高峰 \(next)）" }
+    let cases: [(String, String?, String, String?)] = [
+        ("2026-09-24 15:00", "🔥", peakLine, nil),
+        ("2026-09-25 15:00", nil, offPeak("10-08 14:00"), festivalLine),
+        ("2026-09-26 15:00", nil, offPeak("10-08 14:00"), festivalLine),
+        ("2026-09-28 13:59", nil, offPeak("10-08 14:00"), festivalLine),
+        ("2026-09-28 14:00", nil, offPeak("10-08 14:00"), festivalLine),
+        ("2026-09-28 17:59", nil, offPeak("10-08 14:00"), festivalLine),
+        ("2026-09-28 18:00", nil, offPeak("10-08 14:00"), festivalLine),
+        ("2026-09-28 22:00", nil, offPeak("10-08 14:00"), festivalLine),
+        ("2026-09-30 23:30", "⚡", offPeak("10-08 14:00"), nightLine),
+        ("2026-10-01 08:59", "⚡", offPeak("10-08 14:00"), nightLine),
+        ("2026-10-01 09:00", nil, offPeak("10-08 14:00"), festivalLine),
+        ("2026-10-07 15:00", nil, offPeak("明天 14:00"), festivalLine),
+        ("2026-10-08 01:00", "⚡", offPeak("今天 14:00"), nightLine),
+        ("2026-10-08 09:00", nil, offPeak("今天 14:00"), nil),
+        ("2026-10-08 14:00", "🔥", peakLine, nil),
+        ("2026-10-08 17:59", "🔥", peakLine, nil),
+        ("2026-10-08 18:00", nil, offPeak("明天 14:00"), nil),
+        ("2026-10-08 15:00", "🔥", peakLine, nil),
+        ("2026-10-08 21:00", nil, offPeak("明天 14:00"), nil),
+        ("2026-10-09 01:00", nil, offPeak("今天 14:00"), nil),
     ]
-    for c in cases {
-        guard let d = f.date(from: c) else { print("bad case \(c)"); continue }
+    var failures = 0
+    for (c, emoji, line, eventLine) in cases {
+        guard let d = f.date(from: c) else {
+            fputs("FAIL \(c): invalid fixture\n", stderr)
+            failures += 1
+            continue
+        }
         let r = Peak.evaluate(at: d)
-        print("\(c)  [\(r.emoji ?? "-")] \(r.line)\(r.eventLine.map { " | \($0)" } ?? "")")
+        if r.emoji == emoji && r.line == line && r.eventLine == eventLine {
+            print("PASS \(c)")
+        } else {
+            fputs("FAIL \(c)\n  expected: \(emoji ?? "-") | \(line) | \(eventLine ?? "-")\n  actual:   \(r.emoji ?? "-") | \(r.line) | \(r.eventLine ?? "-")\n", stderr)
+            failures += 1
+        }
     }
-    exit(0)
+    print("GlmUsage --peak-test: \(cases.count - failures)/\(cases.count) passed")
+    exit(failures == 0 ? 0 : 1)
 }
+
 
 if CommandLine.arguments.contains("--once") {
     onceMode()

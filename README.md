@@ -27,7 +27,7 @@ macOS 菜单栏常驻，一瞥即知智谱 GLM Coding Plan（即 ZCode 使用的
 ./build.sh
 ```
 
-发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——打 tag → 构建 → 打包 DMG/zip → 创建 GitHub Release 上传产物。
+发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——创建本地 tag → 构建与离线自测（含 Peak）→ 签名及 DMG/zip 校验 → 推送 tag → 创建 GitHub Release。验证失败不会推送远端 tag。
 
 ## 原理
 
@@ -49,6 +49,9 @@ macOS 菜单栏常驻，一瞥即知智谱 GLM Coding Plan（即 ZCode 使用的
 ./GlmUsage.app/Contents/MacOS/GlmUsage --self-test
 ./GlmUsage.app/Contents/MacOS/GlmUsage --peak-test
 
+# 脚本回归：PATH mock 故障注入，不操作真实 app、LaunchAgent 或 GitHub
+python3 -m unittest discover -s tests -p '*_test.py'
+
 # 真实自检：读取本机凭据、联网拉一次数据后退出
 ./GlmUsage.app/Contents/MacOS/GlmUsage --once
 
@@ -67,7 +70,8 @@ GLM_API_KEY=xxx ./GlmUsage.app/Contents/MacOS/GlmUsage --once
 | `Info.plist` | App Bundle 配置（LSUIElement = 菜单栏常驻） |
 | `scripts/icon_gen.swift` | 图标生成脚本（缺 icns 时 build.sh 自动调用） |
 | `scripts/update.sh` | 就地更新脚本（从 Release 下载替换；build.sh 随包内置进 .app Resources） |
-| `scripts/release.sh` | 发布脚本（打 tag → 构建 → 打包 → 创建 GitHub Release 上传产物） |
+| `scripts/release.sh` | 发布脚本（本地 tag → 构建与测试 → 资产校验 → 推 tag → GitHub Release） |
+| `tests/script_test.py` | 更新、发布、签名故障的离线回归测试 |
 
 ## License
 
