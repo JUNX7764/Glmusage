@@ -5,7 +5,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-REPO="JUNX7764/Codexusage"
+REPO="JUNX7764/Glmusage"
 TAG="${1:-}"
 
 if [ -z "$TAG" ]; then

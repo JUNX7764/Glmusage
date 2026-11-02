@@ -4,7 +4,7 @@
 # 不依赖 clone 目录）；也可手动运行。发布产物由 scripts/release.sh 制作
 set -euo pipefail
 
-REPO="JUNX7764/Codexusage"
+REPO="JUNX7764/Glmusage"
 ZIP_URL="https://github.com/${REPO}/releases/latest/download/GlmUsage.zip"
 APP_NAME="GlmUsage.app"
 LABEL="com.local.codex-usage"
