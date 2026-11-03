@@ -988,6 +988,11 @@ final class GLMPanelAction: NSButton {
         }
     }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+    // 行内文本和图标只负责显示；整个按钮区域统一接收鼠标事件。
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let parent = superview else { return super.hitTest(point) }
+        return bounds.contains(convert(point, from: parent)) ? self : nil
+    }
     override func updateTrackingAreas() { super.updateTrackingAreas(); for area in trackingAreas { removeTrackingArea(area) }; addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)) }
     override func mouseEntered(with event: NSEvent) { hovered = true }
     override func mouseExited(with event: NSEvent) { hovered = false }
@@ -1942,7 +1947,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             guard let button = buttons(panelController.view).first(where: { $0.action == action && (tag == nil || $0.tag == tag!) }) else {
                 fail("control missing \(action)"); return
             }
-            button.performClick(nil)
+            _ = button.scrollToVisible(button.bounds)
+            panelController.view.layoutSubtreeIfNeeded()
+            let location = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else {
+                    fail("cannot create mouse event for \(action)"); return
+                }
+                NSApp.sendEvent(event)
+            }
         }
         let steps: [() -> Void] = [
             { click(#selector(self.toggleModels(_:)), tag: 0) },
