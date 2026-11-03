@@ -593,6 +593,13 @@ enum Fetcher {
 // MARK: - 菜单栏堆叠两行文字渲染
 
 enum StackImage {
+    struct Line {
+        let badge: String
+        let label: String
+        let value: String
+        let remaining: Double?
+    }
+
     // 纯几何：badge（峰谷/过期 emoji）挂在文本列左侧向左突出，两行正文从同一 x 起左对齐（5H/7D 对齐）
     static func geometry(badge1Width: CGFloat, badge2Width: CGFloat,
                          text1Width: CGFloat, text2Width: CGFloat)
@@ -607,27 +614,38 @@ enum StackImage {
         return (textX, badge1X, badge2X, width)
     }
 
-    static func make(badge1: String, line1: String, badge2: String, line2: String) -> NSImage {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
-        let attrs: [NSAttributedString.Key: Any] = [
+    private static func attributed(_ line: Line, font: NSFont,
+                                   appearance: NSAppearance) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: line.label + " ", attributes: [
             .font: font,
-            .foregroundColor: NSColor.black
-        ]
-        let s1 = NSAttributedString(string: line1, attributes: attrs)
-        let s2 = NSAttributedString(string: line2, attributes: attrs)
-        let b1 = badge1.isEmpty ? nil : NSAttributedString(string: badge1, attributes: attrs)
-        let b2 = badge2.isEmpty ? nil : NSAttributedString(string: badge2, attributes: attrs)
+            .foregroundColor: NSColor.labelColor
+        ])
+        result.append(NSAttributedString(string: line.value, attributes: [
+            .font: font,
+            .foregroundColor: GLMRemainingColor.color(line.remaining, appearance: appearance)
+        ]))
+        return result
+    }
+
+    static func make(line1: Line, line2: Line, appearance: NSAppearance) -> NSImage {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
+        let s1 = attributed(line1, font: font, appearance: appearance)
+        let s2 = attributed(line2, font: font, appearance: appearance)
+        let badgeAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
+        let b1 = line1.badge.isEmpty ? nil : NSAttributedString(string: line1.badge, attributes: badgeAttrs)
+        let b2 = line2.badge.isEmpty ? nil : NSAttributedString(string: line2.badge, attributes: badgeAttrs)
         let g = geometry(badge1Width: b1?.size().width ?? 0, badge2Width: b2?.size().width ?? 0,
                          text1Width: s1.size().width, text2Width: s2.size().width)
-        let h: CGFloat = 21
-        let img = NSImage(size: NSSize(width: ceil(g.width), height: h))
-        img.lockFocus()
-        if let x = g.badge1X { b1?.draw(at: NSPoint(x: x, y: 10.5)) }
-        if let x = g.badge2X { b2?.draw(at: NSPoint(x: x, y: 0.5)) }
-        s1.draw(at: NSPoint(x: g.textX, y: 10.5))
-        s2.draw(at: NSPoint(x: g.textX, y: 0.5))
-        img.unlockFocus()
-        img.isTemplate = true   // 自动适配深色/浅色菜单栏
+        let img = NSImage(size: NSSize(width: ceil(g.width), height: 21), flipped: false) { _ in
+            appearance.performAsCurrentDrawingAppearance {
+                if let x = g.badge1X { b1?.draw(at: NSPoint(x: x, y: 10.5)) }
+                if let x = g.badge2X { b2?.draw(at: NSPoint(x: x, y: 0.5)) }
+                s1.draw(at: NSPoint(x: g.textX, y: 10.5))
+                s2.draw(at: NSPoint(x: g.textX, y: 0.5))
+            }
+            return true
+        }
+        img.isTemplate = false   // 保留百分比余量颜色；标签仍随外观使用系统文本色
         return img
     }
 }
@@ -930,14 +948,18 @@ enum GLMRemainingColor {
 
     static func color(_ remaining: Double?) -> NSColor {
         NSColor(name: nil) { appearance in
-            guard let r = remaining else { return .labelColor }
-            let percent = Int((r * 100).rounded())
-            let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            if percent >= 80 { return rgb(dark ? 0x96CDA7 : 0x3E8660) }
-            if percent >= 40 { return .labelColor }
-            if percent >= 20 { return rgb(dark ? 0xE5A37D : 0xB46539) }
-            return rgb(dark ? 0xF08B94 : 0xC8404A)
+            color(remaining, appearance: appearance)
         }
+    }
+
+    static func color(_ remaining: Double?, appearance: NSAppearance) -> NSColor {
+        guard let r = remaining else { return .labelColor }
+        let percent = Int((r * 100).rounded())
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if percent >= 80 { return rgb(dark ? 0x96CDA7 : 0x3E8660) }
+        if percent >= 40 { return .labelColor }
+        if percent >= 20 { return rgb(dark ? 0xE5A37D : 0xB46539) }
+        return rgb(dark ? 0xF08B94 : 0xC8404A)
     }
 }
 final class GLMPanelCard: NSView {
@@ -1316,13 +1338,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     // （⚠️ 放在峰谷 emoji 之后，不影响 Peak 判定；token 组无菜单栏行，仅在下拉菜单标注）
     private func renderBar() {
         let peak = Peak.evaluate()
-        let text1 = "5H \(Fmt.pct(usage.fiveHour?.usedRemainingRatio))"
-        let text2 = "7D \(Fmt.pct(usage.week?.usedRemainingRatio))"
+        let fiveRemaining = usage.fiveHour?.usedRemainingRatio
+        let weekRemaining = usage.week?.usedRemainingRatio
         let marks1 = [peak.emoji, fiveHourStale ? "⚠️" : nil].compactMap { $0 }
         let marks2: [String] = weekStale ? ["⚠️"] : []
-        statusItem.button?.image = StackImage.make(
-            badge1: marks1.joined(), line1: text1,
-            badge2: marks2.joined(), line2: text2)
+        let line1 = StackImage.Line(badge: marks1.joined(), label: "5H",
+                                    value: Fmt.pct(fiveRemaining), remaining: fiveRemaining)
+        let line2 = StackImage.Line(badge: marks2.joined(), label: "7D",
+                                    value: Fmt.pct(weekRemaining), remaining: weekRemaining)
+        let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        statusItem.button?.image = StackImage.make(line1: line1, line2: line2, appearance: appearance)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = "GLM 余额 · 5H最后成功 \(Fmt.lastOK(fiveHourLastOK))"
@@ -1331,8 +1356,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             + " · 7天Token最后成功 \(Fmt.lastOK(tokens7dLastOK))"
             + " · 30天Token最后成功 \(Fmt.lastOK(tokens30dLastOK))"
             + " · MCP最后成功 \(Fmt.lastOK(toolsLastOK))"
-        writeStatus(line1: (marks1.isEmpty ? "" : marks1.joined() + " ") + text1,
-                    line2: (marks2.isEmpty ? "" : marks2.joined() + " ") + text2,
+        writeStatus(line1: (marks1.isEmpty ? "" : marks1.joined() + " ") + "\(line1.label) \(line1.value)",
+                    line2: (marks2.isEmpty ? "" : marks2.joined() + " ") + "\(line2.label) \(line2.value)",
                     peakLine: peak.line)
     }
 
@@ -1660,10 +1685,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         func section(_ title: String, icon: String, expanded: Bool, action: Selector) -> NSView {
             let header = row(); header.spacing = 6; header.addArrangedSubview(symbol(icon)); header.addArrangedSubview(label(title, size: 12, bold: true)); header.addArrangedSubview(spacer())
-            let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: expanded ? "折叠" : "展开")!, target: self, action: action)
-            toggle.isBordered = false; toggle.contentTintColor = .secondaryLabelColor; toggle.setAccessibilityLabel((expanded ? "折叠" : "展开") + title)
-            toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true; toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true; header.addArrangedSubview(toggle)
-            return header
+            let arrow = NSImageView(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil) ?? NSImage())
+            arrow.contentTintColor = .secondaryLabelColor; arrow.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+            arrow.widthAnchor.constraint(equalToConstant: 24).isActive = true; arrow.heightAnchor.constraint(equalToConstant: 22).isActive = true; header.addArrangedSubview(arrow)
+            let item = GLMPanelAction(title: "", target: self, action: action)
+            item.isBordered = false; item.wantsLayer = true; item.layer?.cornerRadius = 6
+            let actionTitle = (expanded ? "收起" : "展开") + title
+            item.setAccessibilityLabel(actionTitle)
+            item.toolTip = actionTitle
+            header.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(header)
+            NSLayoutConstraint.activate([header.leadingAnchor.constraint(equalTo: item.leadingAnchor), header.trailingAnchor.constraint(equalTo: item.trailingAnchor), header.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
+            item.heightAnchor.constraint(equalToConstant: 26).isActive = true
+            return item
         }
         func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ last: Date?, _ stale: Bool) {
             let r = row()
@@ -2378,6 +2411,17 @@ enum GLMOfflineRegression {
             try expect(line2Only.badge1X == nil && line2Only.badge2X != nil
                        && line2Only.badge2X! + ceil(mark2) <= line2Only.textX,
                        "line-2-only badge shifted the shared text column without hanging left")
+            let previewLine = StackImage.Line(badge: "", label: "5H", value: "99%", remaining: 0.99)
+            for name in [NSAppearance.Name.aqua, .darkAqua] {
+                let appearance = NSAppearance(named: name)!
+                let green = GLMRemainingColor.color(0.99, appearance: appearance).usingColorSpace(.sRGB)
+                try expect(green.map { $0.greenComponent > $0.redComponent
+                                      && $0.greenComponent > $0.blueComponent } == true,
+                           "99% remaining did not resolve to green for \(name.rawValue)")
+                let image = StackImage.make(line1: previewLine, line2: previewLine, appearance: appearance)
+                try expect(!image.isTemplate && image.size.width > 0 && image.tiffRepresentation != nil,
+                           "menu bar color image did not render for \(name.rawValue)")
+            }
 
             // 更新检查：Release 版本号比较（v 前缀与 describe/dirty 尾巴剥离、逐段数值、短侧补 0、无法解析不提示）
             try expect(!UpdateCheck.isOutdated(local: "v1.0.1", remote: "v1.0.1"), "same release flagged outdated")
