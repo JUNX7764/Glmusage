@@ -882,6 +882,20 @@ final class UpdateChecker {
 
 final class GLMPanelStack: NSStackView { override var isFlipped: Bool { true } }
 
+final class GLMPanelBackground: NSView {
+    var opacity: CGFloat = 0.9 { didSet { needsDisplay = true } }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(opacity).cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
 // Colors describe remaining credit, including a neutral unknown state.
 enum GLMRemainingColor {
     static func color(_ remaining: Double?) -> NSColor {
@@ -940,7 +954,7 @@ final class GLMQuotaBar: NSView {
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let panelController = NSViewController()
@@ -948,6 +962,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let panelScroll = NSScrollView()
     private let panelHeaderSlot = NSView()
     private let panelFooterSlot = NSView()
+    private let panelEffect = NSVisualEffectView()
+    private let panelBackground = GLMPanelBackground()
+    private var globalClickMonitor: Any?
+    private var localClickMonitor: Any?
     private var panelConfigured = false
     private var previewWindow: NSWindow?
     private weak var activeScroll: NSScrollView?
@@ -989,6 +1007,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
         popover.behavior = .transient
+        popover.delegate = self
         popover.animates = false
         if preview {
             if CommandLine.arguments.contains("--preview-dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
@@ -1484,9 +1503,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if popover.isShown { popover.performClose(nil); return }
         if !preview { refresh(tokens: false, manual: true); checkForUpdate() }
         rebuildMenu()
-        if let button = statusItem.button { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
+        if let button = statusItem.button {
+            let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+            panelBackground.opacity = reduceTransparency ? 1 : 0.9
+            panelEffect.isHidden = reduceTransparency
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            if popover.isShown { installClickMonitors() }
+        }
         tracePopover("open")
     }
+    private func installClickMonitors() {
+        removeClickMonitors()
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            let location = NSEvent.mouseLocation
+            DispatchQueue.main.async {
+                guard let self = self, self.popover.isShown else { return }
+                if let button = self.statusItem.button, let window = button.window,
+                   window.convertToScreen(button.convert(button.bounds, to: nil)).contains(location) { return }
+                self.popover.performClose(nil)
+            }
+        }
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
+            guard let self = self, self.popover.isShown else { return event }
+            if event.type == .keyDown {
+                if event.keyCode == 53 { self.popover.performClose(nil); return nil }
+                return event
+            }
+            if event.window === self.panelController.view.window || event.window === self.statusItem.button?.window { return event }
+            self.popover.performClose(nil)
+            return event
+        }
+    }
+
+    private func removeClickMonitors() {
+        if let monitor = globalClickMonitor { NSEvent.removeMonitor(monitor); globalClickMonitor = nil }
+        if let monitor = localClickMonitor { NSEvent.removeMonitor(monitor); localClickMonitor = nil }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        removeClickMonitors()
+        if previewPopover && CommandLine.arguments.contains("--preview-trace") {
+            print("GLM_POPOVER_TRACE closed")
+            fflush(stdout)
+        }
+    }
+
     @objc private func toggleToken() { tokenExpanded.toggle(); rebuildMenu() }
     @objc private func toggleModels(_ sender: NSButton) {
         let index = sender.tag
@@ -1700,6 +1761,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if !panelConfigured {
             let container = NSView(); container.translatesAutoresizingMaskIntoConstraints = false
+            container.wantsLayer = true
+            container.layer?.cornerRadius = 16
+            container.layer?.masksToBounds = true
+            panelEffect.frame = container.bounds
+            panelEffect.autoresizingMask = [.width, .height]
+            panelEffect.material = .popover
+            panelEffect.blendingMode = .behindWindow
+            panelEffect.state = .active
+            container.addSubview(panelEffect)
+            panelBackground.frame = container.bounds
+            panelBackground.autoresizingMask = [.width, .height]
+            panelBackground.wantsLayer = true
+            container.addSubview(panelBackground)
             let headerLine = separator(); let footerLine = separator()
             for v in [panelHeaderSlot, headerLine, scroll, footerLine, panelFooterSlot] { v.translatesAutoresizingMaskIntoConstraints = false; container.addSubview(v) }
             scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
