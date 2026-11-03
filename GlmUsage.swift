@@ -893,6 +893,37 @@ enum GLMRemainingColor {
         return .systemRed
     }
 }
+final class GLMPanelCard: NSView {
+    let content = GLMPanelStack()
+    init() {
+        super.init(frame: .zero); translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true; layer?.cornerRadius = 12; layer?.borderWidth = 0.5
+        content.orientation = .vertical; content.alignment = .leading; content.spacing = 4; content.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(content)
+        NSLayoutConstraint.activate([content.topAnchor.constraint(equalTo: topAnchor, constant: 8), content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8), content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8), content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8)])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() { effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor; layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.09).cgColor } }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+}
+
+final class GLMPanelAction: NSButton {
+    var prominent = false { didSet { needsDisplay = true } }
+    private var hovered = false { didSet { needsDisplay = true } }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let color: NSColor = prominent ? NSColor(calibratedRed: 0.04, green: 0.32, blue: 0.22, alpha: hovered ? 0.8 : 1) : NSColor.labelColor.withAlphaComponent(hovered ? 0.08 : 0)
+            layer?.backgroundColor = color.cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+    override func updateTrackingAreas() { super.updateTrackingAreas(); for area in trackingAreas { removeTrackingArea(area) }; addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)) }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+}
+
 final class GLMQuotaBar: NSView {
     let remaining: Double?
     init(_ remaining: Double?) { self.remaining = remaining; super.init(frame: .zero); translatesAutoresizingMaskIntoConstraints = false; heightAnchor.constraint(equalToConstant: 8).isActive = true }
@@ -915,6 +946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var previewWindow: NSWindow?
     private weak var activeScroll: NSScrollView?
     private var tokenExpanded = true
+    private var modelsExpanded = false
     private var mcpExpanded = true
     private var updateMessage: String?
     private let preview = CommandLine.arguments.contains("--preview") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview"
@@ -1358,12 +1390,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         if let e = usage.fiveHourCardsError {
-            let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
+            let short = e
             menu.addItem(info("5 小时卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试） · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))"))
         }
         if fiveHourCardsStale { menu.addItem(info("⚠️ 5 小时卡数据已过期 · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))")) }
         if let e = usage.weekCardsError {
-            let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
+            let short = e
             menu.addItem(info("周卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试） · 最后成功 \(Fmt.lastOK(weekCardsLastOK))"))
         }
         if weekCardsStale { menu.addItem(info("⚠️ 周卡数据已过期 · 最后成功 \(Fmt.lastOK(weekCardsLastOK))")) }
@@ -1429,6 +1461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let button = statusItem.button { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
     }
     @objc private func toggleToken() { tokenExpanded.toggle(); rebuildMenu() }
+    @objc private func toggleModels() { modelsExpanded.toggle(); rebuildMenu() }
     @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildMenu() }
     @objc private func manualUpdate() {
         if preview { updateMessage = "预览：当前已是最新版本"; rebuildMenu(); return }
@@ -1457,6 +1490,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             usage.fiveHourCardsError = "模拟登录过期"
         }
         if CommandLine.arguments.contains("--preview-long") {
+            modelsExpanded = true
             usage.tokensToday = ModelUsage(totalTokens: 9000000, totalCalls: 500, byModel: (1...30).map { ("glm-very-long-model-name-\($0)", Double($0 * 10000)) })
         }
     }
@@ -1464,9 +1498,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func buildPanel(_ menu: NSMenu) {
         let savedOffset = activeScroll?.contentView.bounds.origin ?? .zero
         let width: CGFloat = CommandLine.arguments.contains("--preview-narrow") ? 280 : 336
-        let inner = width - 28
-        let root = GLMPanelStack(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 6
-        root.edgeInsets = NSEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
+        let inner = width - 32
+        let root = GLMPanelStack(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 8
+        root.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false
         func add(_ v: NSView) { root.addArrangedSubview(v); v.widthAnchor.constraint(equalToConstant: inner).isActive = true }
         func label(_ text: String, size: CGFloat = 11, bold: Bool = false, color: NSColor = .labelColor) -> NSTextField {
@@ -1474,11 +1508,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             f.lineBreakMode = .byWordWrapping; f.maximumNumberOfLines = 0; return f
         }
         func row() -> NSStackView { let r = NSStackView(); r.orientation = .horizontal; r.alignment = .centerY; r.spacing = 4; return r }
-        func button(_ title: String, _ action: Selector, prominent: Bool = false) -> NSButton {
-            let b = NSButton(title: title, target: self, action: action); b.isBordered = !prominent; b.focusRingType = .none
-            if prominent { b.wantsLayer = true; b.layer?.backgroundColor = NSColor(calibratedRed: 0.04, green: 0.32, blue: 0.22, alpha: 1).cgColor; b.layer?.cornerRadius = 6
-                b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: NSColor.white, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]) }
+        func spacer() -> NSView { let v = NSView(); v.setContentHuggingPriority(.init(1), for: .horizontal); v.setContentCompressionResistancePriority(.init(1), for: .horizontal); return v }
+        func symbol(_ name: String, color: NSColor = NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1)) -> NSImageView {
+            let v = NSImageView(image: NSImage(systemSymbolName: name, accessibilityDescription: nil) ?? NSImage()); v.contentTintColor = color
+            v.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular); v.setContentHuggingPriority(.required, for: .horizontal); return v
+        }
+        func separator() -> NSBox { let line = NSBox(); line.boxType = .separator; line.heightAnchor.constraint(equalToConstant: 1).isActive = true; return line }
+        func button(_ title: String, _ action: Selector, prominent: Bool = false) -> GLMPanelAction {
+            let b = GLMPanelAction(title: title, target: self, action: action); b.isBordered = false; b.focusRingType = .none; b.wantsLayer = true; b.layer?.cornerRadius = 6; b.prominent = prominent
+            b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: prominent ? NSColor.white : NSColor.labelColor, .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular)])
+            b.heightAnchor.constraint(greaterThanOrEqualToConstant: prominent ? 30 : 24).isActive = true
             return b
+        }
+        func section(_ title: String, icon: String, expanded: Bool, action: Selector) -> NSView {
+            let header = row(); header.spacing = 6; header.addArrangedSubview(symbol(icon)); header.addArrangedSubview(label(title, size: 12, bold: true)); header.addArrangedSubview(spacer())
+            let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: expanded ? "折叠" : "展开")!, target: self, action: action)
+            toggle.isBordered = false; toggle.contentTintColor = .secondaryLabelColor; toggle.setAccessibilityLabel((expanded ? "折叠" : "展开") + title)
+            toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true; toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true; header.addArrangedSubview(toggle)
+            return header
         }
         func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ last: Date?, _ stale: Bool) {
             let r = row()
@@ -1494,20 +1541,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else if stale { add(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
         }
         if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
+        let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor); resetHeading.alignment = .right; add(resetHeading)
         quota(usage.fiveHour, "5 小时", usage.fiveHourError, fiveHourLastOK, fiveHourStale)
         quota(usage.week, "7 天", usage.weekError, weekLastOK, weekStale)
         if let sub = usage.subscription { add(label("套餐：\(sub.name)" + (sub.expireDate.map { " · \(Fmt.dayTime($0)) 到期" } ?? ""), color: .secondaryLabelColor)) }
         if let error = usage.subscriptionError { add(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed)) }
         else if subscriptionStale { add(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange)) }
-        // Peak and reset-card rows use the existing source-specific formatting and errors.
-        var inPreamble = true
-        for item in menu.items {
-            let t = item.title
-            if t == "Token 用量（服务端统计）" { inPreamble = false }
-            if !inPreamble || item.isSeparatorItem || item.action != nil || t.hasPrefix("GLM 余额") || t.hasPrefix("5 小时窗口：") || t.hasPrefix("7 天额度：") { continue }
-            add(label(t, color: (t.contains("失败") || t.contains("数据已过期") || t.contains("⚠️")) ? .systemRed : .secondaryLabelColor))
+        let peak = Peak.evaluate()
+        let peakCard = GLMPanelCard()
+        let peakTitle = row(); peakTitle.spacing = 8; peakTitle.addArrangedSubview(symbol("clock")); peakTitle.addArrangedSubview(label("峰谷状态", size: 13, bold: true)); peakTitle.addArrangedSubview(spacer())
+        peakCard.content.addArrangedSubview(peakTitle); peakTitle.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
+        for line in [peak.line, peak.eventLine].compactMap({ $0 }) {
+            let field = label(line, size: 11); peakCard.content.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
         }
-        add(button("Token 用量（服务端统计）  \(tokenExpanded ? "▴" : "▾")", #selector(toggleToken)))
+        add(peakCard)
+        let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 8; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 13, bold: true)); cardHead.addArrangedSubview(spacer())
+        cards.content.addArrangedSubview(cardHead); cardHead.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
+        if let c = usage.resetCards {
+            for (name, dates) in [("5 小时卡", c.fiveHour), ("周卡", c.week)] {
+                if let dates = dates {
+                    let available = GLMFreshness.availableCards(dates, now: Date())
+                    if available.isEmpty { let l = label("\(name) · 暂无可用", color: .secondaryLabelColor); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
+                    for d in available { let l = label("\(name) · \(Fmt.expires(d)) 过期", color: d.timeIntervalSinceNow <= 72 * 3600 ? .systemOrange : .labelColor); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
+                }
+            }
+        } else { let l = label("暂无数据", color: .secondaryLabelColor); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
+        for (name, error, stale, last) in [("5 小时卡", usage.fiveHourCardsError, fiveHourCardsStale, fiveHourCardsLastOK), ("周卡", usage.weekCardsError, weekCardsStale, weekCardsLastOK)] {
+            let message: String? = error.map { "\(name)获取失败：\($0)（ZCode 登录态可能过期，打开 ZCode 后重试） · 最后成功 \(Fmt.lastOK(last))" } ?? (stale ? "\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))" : nil)
+            if let message = message { let l = label(message, color: .systemRed); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
+        }
+        add(cards)
+        add(section("Token 用量（服务端统计）", icon: "square.stack.3d.up.fill", expanded: tokenExpanded, action: #selector(toggleToken)))
         let windows: [(String, ModelUsage?, Date?, Bool, String?)] = [
             ("今日", usage.tokensToday, tokensTodayLastOK, tokensTodayStale, usage.tokensTodayError),
             ("近 7 天", usage.tokens7d, tokens7dLastOK, tokens7dStale, usage.tokens7dError),
@@ -1515,7 +1579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         func tableRow(_ a: String, _ b: String, _ c: String, header: Bool = false) {
             let r = row()
             for (index, text) in [a, b, c].enumerated() {
-                let f = label(text, size: 11, bold: header, color: header ? .secondaryLabelColor : .labelColor)
+                let f = label(text, size: 11, bold: !header && index > 0, color: header ? .secondaryLabelColor : (index == 1 ? NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) : .labelColor))
                 f.widthAnchor.constraint(equalToConstant: index == 0 ? inner * 0.31 : inner * 0.32).isActive = true
                 if index > 0 { f.alignment = .right }; r.addArrangedSubview(f)
             }; add(r)
@@ -1525,17 +1589,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for (name, stats, _, _, _) in windows {
                 tableRow(name, stats.map { Fmt.tokens($0.totalTokens) } ?? "--", stats.map { Fmt.count($0.totalCalls) } ?? "--")
             }
-            for (name, stats, _, _, _) in windows {
-                guard let stats = stats, !stats.byModel.isEmpty else { continue }
-                add(label("\(name) · 分模型", size: 10, color: .secondaryLabelColor))
-                for model in TokenModelLines.render(stats.byModel) { add(label(model, color: .secondaryLabelColor)) }
-            }
         }
         for (name, _, last, stale, error) in windows {
             if let error = error { add(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
             else if stale { add(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
         }
-        add(button("MCP 工具（近 30 天）  \(mcpExpanded ? "▴" : "▾")", #selector(toggleMCP)))
+        if tokenExpanded {
+            add(section("分模型明细", icon: "list.bullet", expanded: modelsExpanded, action: #selector(toggleModels)))
+            if modelsExpanded {
+                for (name, stats, _, _, _) in windows {
+                    guard let stats = stats, !stats.byModel.isEmpty else { continue }
+                    add(label("\(name) · 分模型", size: 10, color: .secondaryLabelColor))
+                    for model in TokenModelLines.render(stats.byModel) { add(label(model, color: .secondaryLabelColor)) }
+                }
+            }
+        }
+        add(section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP)))
         if mcpExpanded {
             if let t = usage.tools30d { add(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor)) }
             else { add(label("暂无数据", color: .secondaryLabelColor)) }
@@ -1543,31 +1612,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let e = usage.toolsError { add(label("MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemRed)) }
         else if toolsStale { add(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange)) }
 
-        let header = label("GLM 余额" + (usage.level.map { " · \($0)" } ?? ""), size: 15, bold: true)
+        let header = row(); header.spacing = 12
+        let icon = NSImageView(image: NSApp.applicationIconImage); icon.widthAnchor.constraint(equalToConstant: 32).isActive = true; icon.heightAnchor.constraint(equalToConstant: 32).isActive = true; header.addArrangedSubview(icon)
+        header.addArrangedSubview(label("GLM 余额" + (usage.level.map { "（\($0) 套餐）" } ?? ""), size: 15, bold: true)); header.addArrangedSubview(spacer())
         let scroll = NSScrollView(); scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
         scroll.translatesAutoresizingMaskIntoConstraints = false; scroll.documentView = root
         NSLayoutConstraint.activate([root.topAnchor.constraint(equalTo: scroll.contentView.topAnchor), root.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), root.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor)])
         activeScroll = scroll
         let footer = GLMPanelStack(); footer.orientation = .vertical; footer.alignment = .leading; footer.spacing = 4
-        let meta = row(); let shortVersion = BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version
-        let version = button("版本 \(shortVersion)", #selector(manualUpdate)); version.toolTip = "\(BuildInfo.version) · 检查新版本"; meta.addArrangedSubview(version)
-        meta.addArrangedSubview(label("刷新 \(Fmt.time(lastAttemptAt))", size: 10, color: .secondaryLabelColor)); footer.addArrangedSubview(meta)
+        let meta = row(); meta.spacing = 8
+        meta.addArrangedSubview(label("最近尝试刷新 \(Fmt.time(lastAttemptAt))", size: 11, color: .secondaryLabelColor)); meta.addArrangedSubview(spacer())
+        let shortVersion = BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version
+        let version = button("版本 \(shortVersion)", #selector(manualUpdate)); version.toolTip = "\(BuildInfo.version) · 点击检查更新"; meta.addArrangedSubview(version); footer.addArrangedSubview(meta)
+        meta.widthAnchor.constraint(equalToConstant: inner).isActive = true
         if let msg = updateMessage { footer.addArrangedSubview(label(msg, color: .secondaryLabelColor)) }
-        let actions = row(); actions.distribution = .fillEqually
-        let refresh = button("立即刷新", #selector(onRefresh), prominent: true); refresh.keyEquivalent = "r"; refresh.keyEquivalentModifierMask = .command; actions.addArrangedSubview(refresh)
-        actions.addArrangedSubview(button((!preview && isLoginItemEnabled() ? "☑ " : "☐ ") + "开机自启", #selector(onToggleLogin)))
-        let quit = button("退出", #selector(onQuit)); quit.keyEquivalent = "q"; quit.keyEquivalentModifierMask = .command; actions.addArrangedSubview(quit)
+        let actions = row(); actions.spacing = 6
+        let refresh = button("立即刷新", #selector(onRefresh), prominent: true); refresh.keyEquivalent = "r"; refresh.keyEquivalentModifierMask = .command; refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true; actions.addArrangedSubview(refresh)
+        let login = NSButton(checkboxWithTitle: "开机自启", target: self, action: #selector(onToggleLogin)); login.font = .systemFont(ofSize: 12); login.state = (!preview && isLoginItemEnabled()) ? .on : .off; actions.addArrangedSubview(login); actions.addArrangedSubview(spacer())
+        let quit = button("退出", #selector(onQuit)); quit.keyEquivalent = "q"; quit.keyEquivalentModifierMask = .command; quit.widthAnchor.constraint(equalToConstant: 40).isActive = true; actions.addArrangedSubview(quit)
         footer.addArrangedSubview(actions); actions.widthAnchor.constraint(equalToConstant: inner).isActive = true
         let container = NSView(); container.translatesAutoresizingMaskIntoConstraints = false
-        for v in [header, scroll, footer] { v.translatesAutoresizingMaskIntoConstraints = false; container.addSubview(v) }
+        let headerLine = separator(); let footerLine = separator()
+        for v in [header, headerLine, scroll, footerLine, footer] { v.translatesAutoresizingMaskIntoConstraints = false; container.addSubview(v) }
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: container.topAnchor, constant: 12), header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14), header.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
-            scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8), scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            footer.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 4), footer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14), footer.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14), footer.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10)])
+            headerLine.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12), headerLine.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), headerLine.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            scroll.topAnchor.constraint(equalTo: headerLine.bottomAnchor), scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            footerLine.topAnchor.constraint(equalTo: scroll.bottomAnchor), footerLine.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), footerLine.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            footer.topAnchor.constraint(equalTo: footerLine.bottomAnchor, constant: 8), footer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), footer.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16), footer.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)])
         let controller = NSViewController(); controller.view = container
         root.layoutSubtreeIfNeeded(); footer.layoutSubtreeIfNeeded()
         let maxHeight = (NSScreen.main?.visibleFrame.height ?? 800) * 0.82
-        let height = min(maxHeight, max(250, root.fittingSize.height + footer.fittingSize.height + 42))
+        let height = min(maxHeight, max(250, root.fittingSize.height + footer.fittingSize.height + 78))
         controller.preferredContentSize = NSSize(width: width, height: height)
         DispatchQueue.main.async {
             scroll.layoutSubtreeIfNeeded()
