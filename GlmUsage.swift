@@ -1516,6 +1516,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         usage.tools30d = ToolUsage(networkSearch: 36, webRead: 18)
         usage.resetCards = ResetCards(fiveHour: [now.addingTimeInterval(864000)], week: [now.addingTimeInterval(1728000)])
         fiveHourLastOK = now; weekLastOK = now; tokensTodayLastOK = now; tokens7dLastOK = now; tokens30dLastOK = now; toolsLastOK = now; fiveHourCardsLastOK = now; weekCardsLastOK = now
+        if CommandLine.arguments.contains("--preview-quota-alignment") {
+            usage.fiveHour = LimitEntry(label: "5 小时窗口", isFiveHour: true, limit: 2000, used: 0, remaining: 2000, usedRatio: 0, reset: nil)
+            usage.subscription = SubscriptionInfo(name: "GLM Coding Pro", expireDate: Date(timeIntervalSince1970: 1_820_000_000))
+            subscriptionLastOK = now
+        }
         if CommandLine.arguments.contains("--preview-empty") {
             usage.tokensToday = nil
             usage.tokens7d = ModelUsage(totalTokens: 0, totalCalls: 0, byModel: [])
@@ -1573,6 +1578,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let pct = label(Fmt.pct(ratio), size: 12, bold: true, color: GLMRemainingColor.color(ratio)); pct.widthAnchor.constraint(equalToConstant: 34).isActive = true; r.addArrangedSubview(pct)
             let bar = GLMQuotaBar(ratio); bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true; r.addArrangedSubview(bar)
             let reset = label(entry?.reset.map { Fmt.fullTime.string(from: $0) } ?? "--", size: 10, bold: true)
+            reset.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+            reset.alignment = .right
+            reset.lineBreakMode = .byTruncatingTail
+            reset.maximumNumberOfLines = 1
+            reset.widthAnchor.constraint(equalToConstant: 110).isActive = true
             reset.setContentCompressionResistancePriority(.required, for: .horizontal); r.addArrangedSubview(reset); add(r)
             if let e = entry { add(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
             else { add(label("暂无数据", color: .secondaryLabelColor)) }
@@ -1583,7 +1593,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor); resetHeading.alignment = .right; add(resetHeading)
         quota(usage.fiveHour, "5 小时", usage.fiveHourError, fiveHourLastOK, fiveHourStale)
         quota(usage.week, "7 天", usage.weekError, weekLastOK, weekStale)
-        if let sub = usage.subscription { add(label("套餐：\(sub.name)" + (sub.expireDate.map { " · \(Fmt.dayTime($0)) 到期" } ?? ""), color: .secondaryLabelColor)) }
+        if let sub = usage.subscription {
+            let expiry = sub.expireDate.map { "套餐到期：\(Fmt.fullTime.string(from: $0))" } ?? "套餐到期：暂无数据"
+            add(label(expiry, color: .secondaryLabelColor))
+        }
         if let error = usage.subscriptionError { add(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed)) }
         else if subscriptionStale { add(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange)) }
         let peak = Peak.evaluate()
