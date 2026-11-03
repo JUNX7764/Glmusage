@@ -946,7 +946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var previewWindow: NSWindow?
     private weak var activeScroll: NSScrollView?
     private var tokenExpanded = true
-    private var modelsExpanded = false
+    private var expandedModelWindows: Set<Int> = []
     private var mcpExpanded = true
     private var updateMessage: String?
     private let preview = CommandLine.arguments.contains("--preview") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview"
@@ -1461,7 +1461,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let button = statusItem.button { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
     }
     @objc private func toggleToken() { tokenExpanded.toggle(); rebuildMenu() }
-    @objc private func toggleModels() { modelsExpanded.toggle(); rebuildMenu() }
+    @objc private func toggleModels(_ sender: NSButton) {
+        let index = sender.tag
+        guard (0..<3).contains(index) else { return }
+        if expandedModelWindows.contains(index) { expandedModelWindows.remove(index) }
+        else { expandedModelWindows.insert(index) }
+        rebuildMenu()
+    }
     @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildMenu() }
     @objc private func manualUpdate() {
         if preview { updateMessage = "预览：当前已是最新版本"; rebuildMenu(); return }
@@ -1483,6 +1489,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         usage.tools30d = ToolUsage(networkSearch: 36, webRead: 18)
         usage.resetCards = ResetCards(fiveHour: [now.addingTimeInterval(864000)], week: [now.addingTimeInterval(1728000)])
         fiveHourLastOK = now; weekLastOK = now; tokensTodayLastOK = now; tokens7dLastOK = now; tokens30dLastOK = now; toolsLastOK = now; fiveHourCardsLastOK = now; weekCardsLastOK = now
+        if CommandLine.arguments.contains("--preview-empty") {
+            usage.tokensToday = nil
+            usage.tokens7d = ModelUsage(totalTokens: 0, totalCalls: 0, byModel: [])
+        }
         if CommandLine.arguments.contains("--preview-errors") {
             usage.week = nil; usage.weekError = "模拟网络错误：无法获取额度"
             usage.tokensTodayError = "模拟服务端错误，保留上次结果"
@@ -1490,7 +1500,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             usage.fiveHourCardsError = "模拟登录过期"
         }
         if CommandLine.arguments.contains("--preview-long") {
-            modelsExpanded = true
+            expandedModelWindows.insert(0)
             usage.tokensToday = ModelUsage(totalTokens: 9000000, totalCalls: 500, byModel: (1...30).map { ("glm-very-long-model-name-\($0)", Double($0 * 10000)) })
         }
     }
@@ -1576,33 +1586,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ("今日", usage.tokensToday, tokensTodayLastOK, tokensTodayStale, usage.tokensTodayError),
             ("近 7 天", usage.tokens7d, tokens7dLastOK, tokens7dStale, usage.tokens7dError),
             ("近 30 天", usage.tokens30d, tokens30dLastOK, tokens30dStale, usage.tokens30dError)]
-        func tableRow(_ a: String, _ b: String, _ c: String, header: Bool = false) {
-            let r = row()
-            for (index, text) in [a, b, c].enumerated() {
-                let f = label(text, size: 11, bold: !header && index > 0, color: header ? .secondaryLabelColor : (index == 1 ? NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) : .labelColor))
-                f.widthAnchor.constraint(equalToConstant: index == 0 ? inner * 0.31 : inner * 0.32).isActive = true
+        func tableCells(_ values: [String], header: Bool) -> NSStackView {
+            let r = row(); r.spacing = 4
+            for (index, text) in values.enumerated() {
+                let f = label(text, size: header ? 10 : 11, bold: !header && index > 0, color: header ? .secondaryLabelColor : (index == 1 ? NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) : .labelColor))
+                f.widthAnchor.constraint(equalToConstant: index == 0 ? inner * 0.30 : inner * 0.30).isActive = true
                 if index > 0 { f.alignment = .right }; r.addArrangedSubview(f)
-            }; add(r)
+            }
+            return r
         }
         if tokenExpanded {
-            tableRow("周期", "Token", "调用次数", header: true)
-            for (name, stats, _, _, _) in windows {
-                tableRow(name, stats.map { Fmt.tokens($0.totalTokens) } ?? "--", stats.map { Fmt.count($0.totalCalls) } ?? "--")
+            let tableHeader = tableCells(["周期", "Token", "调用次数"], header: true); add(tableHeader)
+            for (index, window) in windows.enumerated() {
+                let (name, stats, _, _, _) = window
+                let models = stats.map { TokenModelLines.render($0.byModel) } ?? []
+                let expanded = expandedModelWindows.contains(index)
+                let cells = tableCells([name, stats.map { Fmt.tokens($0.totalTokens) } ?? "--", stats.map { Fmt.count($0.totalCalls) } ?? "--"], header: false)
+                let item = GLMPanelAction(title: "", target: self, action: #selector(toggleModels(_:)))
+                item.isBordered = false; item.wantsLayer = true; item.layer?.cornerRadius = 5; item.tag = index
+                item.isEnabled = !models.isEmpty
+                let summary = "\(name)，Token \(stats.map { Fmt.tokens($0.totalTokens) } ?? "暂无数据")，调用 \(stats.map { Fmt.count($0.totalCalls) } ?? "暂无数据") 次"
+                item.setAccessibilityLabel(summary + (models.isEmpty ? "，无模型明细" : "，\(expanded ? "收起" : "展开")模型明细"))
+                item.toolTip = models.isEmpty ? "暂无模型明细" : (expanded ? "收起模型明细" : "展开模型明细")
+                cells.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(cells)
+                NSLayoutConstraint.activate([cells.leadingAnchor.constraint(equalTo: item.leadingAnchor), cells.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
+                if !models.isEmpty {
+                    let arrow = NSImageView(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil) ?? NSImage())
+                    arrow.contentTintColor = .secondaryLabelColor; arrow.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+                    arrow.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(arrow)
+                    NSLayoutConstraint.activate([arrow.trailingAnchor.constraint(equalTo: item.trailingAnchor, constant: -3), arrow.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
+                }
+                item.heightAnchor.constraint(equalToConstant: 23).isActive = true; add(item)
+                if expanded {
+                    for model in models { add(label(model, color: .secondaryLabelColor)) }
+                }
             }
         }
         for (name, _, last, stale, error) in windows {
             if let error = error { add(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
             else if stale { add(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
-        }
-        if tokenExpanded {
-            add(section("分模型明细", icon: "list.bullet", expanded: modelsExpanded, action: #selector(toggleModels)))
-            if modelsExpanded {
-                for (name, stats, _, _, _) in windows {
-                    guard let stats = stats, !stats.byModel.isEmpty else { continue }
-                    add(label("\(name) · 分模型", size: 10, color: .secondaryLabelColor))
-                    for model in TokenModelLines.render(stats.byModel) { add(label(model, color: .secondaryLabelColor)) }
-                }
-            }
         }
         add(section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP)))
         if mcpExpanded {
