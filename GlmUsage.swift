@@ -112,11 +112,16 @@ struct ModelUsage {
     var isEmpty: Bool { totalTokens == 0 && totalCalls == 0 }
 }
 
-/// Token 板块按模型明细的树形行：每个模型单独一行（├/└），按用量降序、过滤 0，平局按名称排序保证稳定
-enum TokenModelLines {
-    static func render(_ models: [(name: String, tokens: Double)]) -> [String] {
-        let visible = models.filter { $0.tokens > 0 }
+/// Token 板块按模型明细：按用量降序、过滤 0，平局按名称排序保证稳定
+enum TokenModelList {
+    static func visible(_ models: [(name: String, tokens: Double)]) -> [(name: String, tokens: Double)] {
+        models.filter { $0.tokens > 0 }
             .sorted { $0.tokens != $1.tokens ? $0.tokens > $1.tokens : $0.name < $1.name }
+    }
+
+    /// 旧式 NSMenu fallback 保留树形文本；主面板使用独立对齐的列。
+    static func render(_ models: [(name: String, tokens: Double)]) -> [String] {
+        let visible = visible(models)
         return visible.enumerated().map { i, m in
             (i == visible.count - 1 ? "└ " : "├ ") + "\(m.name) \(Fmt.tokens(m.tokens))"
         }
@@ -546,24 +551,42 @@ enum Fetcher {
         guard let name = sub["productName"] as? String, !name.isEmpty else {
             return (nil, "invalid subscription name")
         }
-        return (SubscriptionInfo(name: name,
-                                 expireDate: parseValidEnd(sub["valid"] as? String ?? "")), nil)
+        return (SubscriptionInfo(name: name, expireDate: parseSubscriptionExpiry(sub)), nil)
     }
 
-    // valid 形如 "2026-09-26 18:18:52-2027-09-26 10:00:00"：日期对内部也含 '-'，
-    // 用正则取最后一个完整 "yyyy-MM-dd HH:mm:ss"（即到期时间），空格转 T 后按本地时区解析
-    private static func parseValidEnd(_ valid: String) -> Date? {
+    /// valid 形如 "2026-09-26 18:18:52-2027-09-26 10:00:00"，但部分套餐返回的是
+    /// 后续周期区间，不能直接总取末端。nextRenewTime 才是当前周期边界：若它与
+    /// valid 中某一天一致，取该天对应的完整时间（保留接口给出的时分秒）；否则
+    /// 直接取 nextRenewTime。旧响应没有 nextRenewTime 时才回退到 valid 末端。
+    private static func parseSubscriptionExpiry(_ sub: [String: Any]) -> Date? {
+        let valid = sub["valid"] as? String ?? ""
+        let dates = parseValidDates(valid)
+        if let next = sub["nextRenewTime"] as? String, next.count >= 10 {
+            let day = String(next.prefix(10))
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = "yyyy-MM-dd"
+            if let nextDay = f.date(from: day) {
+                if let match = dates.first(where: { Calendar.current.isDate($0, inSameDayAs: nextDay) }) {
+                    return match
+                }
+                return nextDay
+            }
+        }
+        return dates.last
+    }
+
+    private static func parseValidDates(_ valid: String) -> [Date] {
         guard let re = try? NSRegularExpression(pattern: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#) else {
-            return nil
+            return []
         }
         let ns = valid as NSString
-        guard let m = re.matches(in: valid, range: NSRange(location: 0, length: ns.length)).last else {
-            return nil
+        return re.matches(in: valid, range: NSRange(location: 0, length: ns.length)).compactMap { m in
+            let s = ns.substring(with: m.range).replacingOccurrences(of: " ", with: "T")
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"   // 无时区字段，按本地时区解释
+            return f.date(from: s)
         }
-        let s = ns.substring(with: m.range).replacingOccurrences(of: " ", with: "T")
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"   // 无时区字段，按本地时区解释
-        return f.date(from: s)
     }
 }
 
@@ -898,13 +921,23 @@ final class GLMPanelBackground: NSView {
 
 // Colors describe remaining credit, including a neutral unknown state.
 enum GLMRemainingColor {
+    private static func rgb(_ hex: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
+                green: CGFloat((hex >> 8) & 0xff) / 255,
+                blue: CGFloat(hex & 0xff) / 255,
+                alpha: 1)
+    }
+
     static func color(_ remaining: Double?) -> NSColor {
-        guard let r = remaining else { return .secondaryLabelColor }
-        let percent = Int((r * 100).rounded())
-        if percent >= 80 { return .systemGreen }
-        if percent >= 40 { return .labelColor }
-        if percent >= 20 { return .systemOrange }
-        return .systemRed
+        NSColor(name: nil) { appearance in
+            guard let r = remaining else { return .labelColor }
+            let percent = Int((r * 100).rounded())
+            let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            if percent >= 80 { return rgb(dark ? 0x96CDA7 : 0x3E8660) }
+            if percent >= 40 { return .labelColor }
+            if percent >= 20 { return rgb(dark ? 0xE5A37D : 0xB46539) }
+            return rgb(dark ? 0xF08B94 : 0xC8404A)
+        }
     }
 }
 final class GLMPanelCard: NSView {
@@ -1452,7 +1485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             var lines: [String]
             if let stats = stats, !stats.isEmpty {
                 lines = ["\(label)：\(Fmt.tokens(stats.totalTokens)) tokens · 调用 \(Fmt.count(stats.totalCalls)) 次"]
-                lines += TokenModelLines.render(stats.byModel)
+                lines += TokenModelList.render(stats.byModel)
             } else {
                 lines = ["\(label)：暂无记录"]
             }
@@ -1689,12 +1722,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             ("今日", usage.tokensToday, tokensTodayLastOK, tokensTodayStale, usage.tokensTodayError),
             ("近 7 天", usage.tokens7d, tokens7dLastOK, tokens7dStale, usage.tokens7dError),
             ("近 30 天", usage.tokens30d, tokens30dLastOK, tokens30dStale, usage.tokens30dError)]
-        func tableCells(_ values: [String], header: Bool) -> NSStackView {
+        func tableCells(_ values: [String], header: Bool, modelDetail: Bool = false) -> NSStackView {
             let r = row(); r.spacing = 4
+            let widths = [inner * 0.44, inner * 0.24, inner * 0.20]
             for (index, text) in values.enumerated() {
-                let f = label(text, size: header ? 10 : 11, bold: !header && index > 0, color: header ? .secondaryLabelColor : (index == 1 ? NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) : .labelColor))
-                f.widthAnchor.constraint(equalToConstant: index == 0 ? inner * 0.30 : inner * 0.30).isActive = true
-                if index > 0 { f.alignment = .right }; r.addArrangedSubview(f)
+                let color: NSColor = header || modelDetail ? .secondaryLabelColor : (index == 1 ? NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) : .labelColor)
+                let f = label(text, size: header ? 10 : 11, bold: !header && !modelDetail && index > 0, color: color)
+                if index > 0 { f.alignment = .right }
+                if modelDetail {
+                    f.maximumNumberOfLines = 1
+                    f.lineBreakMode = index == 0 ? .byTruncatingMiddle : .byTruncatingTail
+                    if index == 0 { f.toolTip = text }
+                    if index == 1 { f.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular) }
+                }
+                if modelDetail && index == 0 {
+                    let cell = row(); cell.spacing = 0
+                    cell.widthAnchor.constraint(equalToConstant: widths[index]).isActive = true
+                    let indent = spacer(); indent.widthAnchor.constraint(equalToConstant: 12).isActive = true
+                    f.widthAnchor.constraint(equalToConstant: widths[index] - 12).isActive = true
+                    cell.addArrangedSubview(indent); cell.addArrangedSubview(f); r.addArrangedSubview(cell)
+                } else {
+                    f.widthAnchor.constraint(equalToConstant: widths[index]).isActive = true
+                    r.addArrangedSubview(f)
+                }
             }
             return r
         }
@@ -1702,7 +1752,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             let tableHeader = tableCells(["周期", "Token", "调用次数"], header: true); add(tableHeader)
             for (index, window) in windows.enumerated() {
                 let (name, stats, _, _, _) = window
-                let models = stats.map { TokenModelLines.render($0.byModel) } ?? []
+                let models = stats.map { TokenModelList.visible($0.byModel) } ?? []
                 let expanded = expandedModelWindows.contains(index)
                 let cells = tableCells([name, stats.map { Fmt.tokens($0.totalTokens) } ?? "--", stats.map { Fmt.count($0.totalCalls) } ?? "--"], header: false)
                 let item = GLMPanelAction(title: "", target: self, action: #selector(toggleModels(_:)))
@@ -1721,7 +1771,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 }
                 item.heightAnchor.constraint(equalToConstant: 23).isActive = true; add(item)
                 if expanded {
-                    for model in models { add(label(model, color: .secondaryLabelColor)) }
+                    root.setCustomSpacing(4, after: item)
+                    for (modelIndex, model) in models.enumerated() {
+                        let detail = tableCells([model.name, Fmt.tokens(model.tokens), ""], header: false, modelDetail: true)
+                        detail.heightAnchor.constraint(equalToConstant: 20).isActive = true
+                        add(detail)
+                        root.setCustomSpacing(modelIndex == models.count - 1 ? 12 : 4, after: detail)
+                    }
                 }
             }
         }
@@ -2171,18 +2227,21 @@ enum GLMOfflineRegression {
             try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 10,
                 "totalModelCallCount": 3]])?.totalCalls == 3,
                 "valid model call count changed")
-            let tree = TokenModelLines.render([
+            let visibleModels = TokenModelList.visible([
                 (name: "GLM-5.3", tokens: 13_980_000),
                 (name: "GLM-5.3-Flash", tokens: 39_830_000),
                 (name: "GLM-4.6", tokens: 0)
             ])
-            try expect(tree == ["├ GLM-5.3-Flash 39.83M", "└ GLM-5.3 13.98M"],
-                       "token model tree lines changed (sort order, branch markers, or zero filter)")
-            try expect(TokenModelLines.render([(name: "GLM-5.3", tokens: 5_000)]) == ["└ GLM-5.3 5.00K"],
-                       "single-model tree line lost its final branch marker")
-            try expect(TokenModelLines.render([]).isEmpty
-                       && TokenModelLines.render([(name: "GLM-4.6", tokens: 0)]).isEmpty,
-                       "empty or all-zero model list produced tree lines")
+            try expect(visibleModels.map { $0.name } == ["GLM-5.3-Flash", "GLM-5.3"]
+                       && visibleModels.map { $0.tokens } == [39_830_000, 13_980_000],
+                       "token model sorting or zero filter changed")
+            let singleModel = TokenModelList.visible([(name: "GLM-5.3", tokens: 5_000)])
+            try expect(singleModel.count == 1 && singleModel.first?.name == "GLM-5.3"
+                       && singleModel.first?.tokens == 5_000,
+                       "single visible model was changed")
+            try expect(TokenModelList.visible([]).isEmpty
+                       && TokenModelList.visible([(name: "GLM-4.6", tokens: 0)]).isEmpty,
+                       "empty or all-zero model list produced detail rows")
             try expect(Fetcher.parseToolUsage(["totalUsage": ["totalNetworkSearchCount": 1,
                 "totalWebReadMcpCount": Double.nan]]) == nil, "invalid MCP statistic became zero")
             for count: Any in [1e100, Double(Int.max), 1.5] {
@@ -2224,6 +2283,17 @@ enum GLMOfflineRegression {
             ]])
             try expect(subscription.0?.name == "Pro" && subscription.1 == nil,
                        "valid subscription was not parsed")
+            try expect(subscription.0?.expireDate.map { Fmt.fullSec.string(from: $0) }
+                       == "2027-09-26 10:00:00",
+                       "legacy valid range did not fall back to its end date")
+            let currentCycle = Fetcher.parseSubscription([[
+                "status": "VALID", "productName": "GLM Coding Lite",
+                "valid": "2027-09-26 10:00:00-2028-09-26 10:00:00",
+                "nextRenewTime": "2027-09-26", "inCurrentPeriod": 1
+            ]])
+            try expect(currentCycle.0?.expireDate.map { Fmt.fullSec.string(from: $0) }
+                       == "2027-09-26 10:00:00",
+                       "nextRenewTime did not select the current cycle boundary")
             try expect(Fetcher.parseSubscription(["error": "upstream"]).0 == nil,
                        "invalid subscription container was accepted")
 
