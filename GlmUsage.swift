@@ -943,13 +943,20 @@ final class GLMQuotaBar: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
+    private let panelController = NSViewController()
+    private let panelRoot = GLMPanelStack()
+    private let panelScroll = NSScrollView()
+    private let panelHeaderSlot = NSView()
+    private let panelFooterSlot = NSView()
+    private var panelConfigured = false
     private var previewWindow: NSWindow?
     private weak var activeScroll: NSScrollView?
     private var tokenExpanded = true
     private var expandedModelWindows: Set<Int> = []
     private var mcpExpanded = true
     private var updateMessage: String?
-    private let preview = CommandLine.arguments.contains("--preview") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview"
+    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
@@ -982,14 +989,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
         popover.behavior = .transient
+        popover.animates = false
         if preview {
             if CommandLine.arguments.contains("--preview-dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
             installPreviewData()
             rebuildMenu()
             statusItem.button?.title = "GLM 预览"
-            previewWindow?.center()
-            previewWindow?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            if previewPopover && CommandLine.arguments.contains("--preview-popover-ui") {
+                let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 300, height: 60), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                window.title = "GLM 弹出层测试"
+                window.isReleasedWhenClosed = false
+                let openButton = NSButton(title: "开合菜单栏预览", target: self, action: #selector(togglePanel))
+                openButton.frame = NSRect(x: 60, y: 14, width: 180, height: 32)
+                window.contentView?.addSubview(openButton)
+                previewWindow = window
+                window.makeKeyAndOrderFront(nil)
+            }
+            if !previewPopover {
+                previewWindow?.center()
+                previewWindow?.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    self?.togglePanel()
+                    if CommandLine.arguments.contains("--preview-popover-test") { self?.testPreviewPopover() }
+                }
+            }
             if let i = CommandLine.arguments.firstIndex(of: "--preview-screenshot"), CommandLine.arguments.count > i + 1 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
                     guard let view = self?.previewWindow?.contentView else { return }
@@ -1459,6 +1485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !preview { refresh(tokens: false, manual: true); checkForUpdate() }
         rebuildMenu()
         if let button = statusItem.button { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
+        tracePopover("open")
     }
     @objc private func toggleToken() { tokenExpanded.toggle(); rebuildMenu() }
     @objc private func toggleModels(_ sender: NSButton) {
@@ -1509,7 +1536,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let savedOffset = activeScroll?.contentView.bounds.origin ?? .zero
         let width: CGFloat = CommandLine.arguments.contains("--preview-narrow") ? 280 : 336
         let inner = width - 32
-        let root = GLMPanelStack(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 8
+        let root = panelRoot
+        for view in root.arrangedSubviews { root.removeArrangedSubview(view); view.removeFromSuperview() }
+        root.orientation = .vertical; root.alignment = .leading; root.spacing = 8
         root.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false
         func add(_ v: NSView) { root.addArrangedSubview(v); v.widthAnchor.constraint(equalToConstant: inner).isActive = true }
@@ -1637,9 +1666,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let header = row(); header.spacing = 12
         let icon = NSImageView(image: NSApp.applicationIconImage); icon.widthAnchor.constraint(equalToConstant: 32).isActive = true; icon.heightAnchor.constraint(equalToConstant: 32).isActive = true; header.addArrangedSubview(icon)
         header.addArrangedSubview(label("GLM 余额" + (usage.level.map { "（\($0) 套餐）" } ?? ""), size: 15, bold: true)); header.addArrangedSubview(spacer())
-        let scroll = NSScrollView(); scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
-        scroll.translatesAutoresizingMaskIntoConstraints = false; scroll.documentView = root
-        NSLayoutConstraint.activate([root.topAnchor.constraint(equalTo: scroll.contentView.topAnchor), root.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), root.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor)])
+        let scroll = panelScroll
         activeScroll = scroll
         let footer = GLMPanelStack(); footer.orientation = .vertical; footer.alignment = .leading; footer.spacing = 4
         let meta = row(); meta.spacing = 8
@@ -1653,33 +1680,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let login = NSButton(checkboxWithTitle: "开机自启", target: self, action: #selector(onToggleLogin)); login.font = .systemFont(ofSize: 12); login.state = (!preview && isLoginItemEnabled()) ? .on : .off; actions.addArrangedSubview(login); actions.addArrangedSubview(spacer())
         let quit = button("退出", #selector(onQuit)); quit.keyEquivalent = "q"; quit.keyEquivalentModifierMask = .command; quit.widthAnchor.constraint(equalToConstant: 40).isActive = true; actions.addArrangedSubview(quit)
         footer.addArrangedSubview(actions); actions.widthAnchor.constraint(equalToConstant: inner).isActive = true
-        let container = NSView(); container.translatesAutoresizingMaskIntoConstraints = false
-        let headerLine = separator(); let footerLine = separator()
-        for v in [header, headerLine, scroll, footerLine, footer] { v.translatesAutoresizingMaskIntoConstraints = false; container.addSubview(v) }
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: container.topAnchor, constant: 12), header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14), header.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
-            headerLine.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12), headerLine.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), headerLine.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            scroll.topAnchor.constraint(equalTo: headerLine.bottomAnchor), scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            footerLine.topAnchor.constraint(equalTo: scroll.bottomAnchor), footerLine.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), footerLine.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            footer.topAnchor.constraint(equalTo: footerLine.bottomAnchor, constant: 8), footer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), footer.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16), footer.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)])
-        let controller = NSViewController(); controller.view = container
+        func install(_ view: NSView, in slot: NSView) {
+            for old in slot.subviews { old.removeFromSuperview() }
+            view.translatesAutoresizingMaskIntoConstraints = false; slot.addSubview(view)
+            NSLayoutConstraint.activate([view.topAnchor.constraint(equalTo: slot.topAnchor), view.bottomAnchor.constraint(equalTo: slot.bottomAnchor), view.leadingAnchor.constraint(equalTo: slot.leadingAnchor), view.trailingAnchor.constraint(equalTo: slot.trailingAnchor)])
+        }
+        if !panelConfigured {
+            let container = NSView(); container.translatesAutoresizingMaskIntoConstraints = false
+            let headerLine = separator(); let footerLine = separator()
+            for v in [panelHeaderSlot, headerLine, scroll, footerLine, panelFooterSlot] { v.translatesAutoresizingMaskIntoConstraints = false; container.addSubview(v) }
+            scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+            scroll.documentView = root
+            NSLayoutConstraint.activate([
+                root.topAnchor.constraint(equalTo: scroll.contentView.topAnchor), root.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), root.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+                panelHeaderSlot.topAnchor.constraint(equalTo: container.topAnchor, constant: 12), panelHeaderSlot.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14), panelHeaderSlot.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+                headerLine.topAnchor.constraint(equalTo: panelHeaderSlot.bottomAnchor, constant: 12), headerLine.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), headerLine.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+                scroll.topAnchor.constraint(equalTo: headerLine.bottomAnchor), scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                footerLine.topAnchor.constraint(equalTo: scroll.bottomAnchor), footerLine.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), footerLine.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+                panelFooterSlot.topAnchor.constraint(equalTo: footerLine.bottomAnchor, constant: 8), panelFooterSlot.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), panelFooterSlot.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16), panelFooterSlot.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)])
+            panelController.view = container
+            if !preview || previewPopover { popover.contentViewController = panelController }
+            panelConfigured = true
+        }
+        install(header, in: panelHeaderSlot)
+        install(footer, in: panelFooterSlot)
         root.layoutSubtreeIfNeeded(); footer.layoutSubtreeIfNeeded()
-        let maxHeight = (NSScreen.main?.visibleFrame.height ?? 800) * 0.82
-        let height = min(maxHeight, max(250, root.fittingSize.height + footer.fittingSize.height + 78))
-        controller.preferredContentSize = NSSize(width: width, height: height)
+        let maxHeight = (statusItem.button?.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        let height = min(maxHeight * 0.82, max(250, root.fittingSize.height + footer.fittingSize.height + 78))
+        let desiredSize = NSSize(width: width, height: height)
+        // A visible popover keeps a fixed frame. Additional content scrolls until the next open.
+        if !popover.isShown {
+            panelController.preferredContentSize = desiredSize
+            if !preview || previewPopover { popover.contentSize = desiredSize }
+        }
         DispatchQueue.main.async {
             scroll.layoutSubtreeIfNeeded()
             let maxY = max(0, root.frame.height - scroll.contentView.bounds.height)
             scroll.contentView.scroll(to: NSPoint(x: 0, y: min(maxY, max(0, savedOffset.y))))
             scroll.reflectScrolledClipView(scroll.contentView)
         }
-        if preview {
+        if preview && !previewPopover {
             if previewWindow == nil {
                 let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: [.titled, .closable], backing: .buffered, defer: false)
                 window.title = "GLM 用量 · 假数据预览"; window.isReleasedWhenClosed = false; previewWindow = window
+                window.contentViewController = panelController
             }
-            previewWindow?.contentViewController = controller; previewWindow?.setContentSize(controller.preferredContentSize)
-        } else { popover.contentViewController = controller; popover.contentSize = controller.preferredContentSize }
+            previewWindow?.setContentSize(desiredSize)
+        }
+        tracePopover("rebuild")
+    }
+
+    // Optional geometry trace is confined to the isolated fake-data preview.
+    private func tracePopover(_ reason: String) {
+        guard previewPopover && CommandLine.arguments.contains("--preview-trace") else { return }
+        for delay in [0.0, 0.05, 0.2] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self, self.popover.isShown, let frame = self.panelController.view.window?.frame else { return }
+                print("GLM_POPOVER_TRACE \(reason) +\(delay) x=\(frame.minX) y=\(frame.minY) w=\(frame.width) h=\(frame.height)")
+                fflush(stdout)
+            }
+        }
+    }
+
+    // Offline regression: uses the actual NSPopover and its AppKit controls, with fake data only.
+    private func testPreviewPopover() {
+        guard previewPopover, popover.isShown, let window = panelController.view.window else {
+            fputs("GLM popover test: FAIL opening\n", stderr); exit(1)
+        }
+        let initial = window.frame
+        let originalController = popover.contentViewController
+        let originalDocument = panelScroll.documentView
+        func buttons(_ view: NSView) -> [NSButton] {
+            ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap { buttons($0) }
+        }
+        func fail(_ message: String) { fputs("GLM popover test: FAIL \(message)\n", stderr); exit(1) }
+        func verify(_ step: String) {
+            guard popover.isShown, panelController.view.window === window, window.frame.equalTo(initial),
+                  popover.contentViewController === originalController, panelScroll.documentView === originalDocument else {
+                fail("frame or view identity changed at \(step)"); return
+            }
+            print("GLM_POPOVER_TEST \(step): \(NSStringFromRect(window.frame))")
+            fflush(stdout)
+        }
+        func click(_ action: Selector, tag: Int? = nil) {
+            guard let button = buttons(panelController.view).first(where: { $0.action == action && (tag == nil || $0.tag == tag!) }) else {
+                fail("control missing \(action)"); return
+            }
+            button.performClick(nil)
+        }
+        let steps: [() -> Void] = [
+            { click(#selector(self.toggleModels(_:)), tag: 0) },
+            { click(#selector(self.toggleModels(_:)), tag: 1) },
+            { click(#selector(self.toggleModels(_:)), tag: 2) },
+            { click(#selector(self.toggleModels(_:)), tag: 1) },
+            { click(#selector(self.toggleToken)) },
+            { click(#selector(self.toggleToken)) },
+            { click(#selector(self.toggleMCP)) },
+            { click(#selector(self.toggleMCP)) },
+            { click(#selector(self.onRefresh)) }
+        ]
+        func run(_ index: Int) {
+            if index == steps.count {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    verify("async-refresh")
+                    guard self.expandedModelWindows == [0, 2] else { fail("model expansion state lost"); return }
+                    self.popover.performClose(nil)
+                    guard !self.popover.isShown else { fail("close"); return }
+                    self.togglePanel()
+                    guard self.popover.isShown, self.expandedModelWindows == [0, 2] else { fail("reopen or state"); return }
+                    guard let screen = self.statusItem.button?.window?.screen ?? NSScreen.main else { fail("missing screen"); return }
+                    let visible = screen.visibleFrame
+                    self.popover.performClose(nil)
+                    for x in [visible.minX + 2, visible.maxX - 22] {
+                        let host = NSWindow(contentRect: NSRect(x: x, y: visible.maxY - 20, width: 20, height: 18), styleMask: [.borderless], backing: .buffered, defer: false)
+                        host.level = .statusBar; host.orderFront(nil)
+                        guard let anchor = host.contentView else { fail("edge anchor"); return }
+                        self.popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+                        guard self.popover.isShown, let frame = self.panelController.view.window?.frame,
+                              frame.minX >= visible.minX - 1, frame.maxX <= visible.maxX + 1,
+                              frame.minY >= visible.minY - 1, frame.maxY <= visible.maxY + 40 else { fail("screen-edge placement"); return }
+                        print("GLM_POPOVER_TEST edge: \(NSStringFromRect(frame))")
+                        self.popover.performClose(nil); host.orderOut(nil)
+                    }
+                    print("GLM popover test: PASS (actual popover, controls, async refresh, close/reopen, left/right edges)")
+                    exit(0)
+                }
+                return
+            }
+            steps[index]()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { verify("step-\(index)"); run(index + 1) }
+        }
+        run(0)
     }
 
     // MARK: 开机自启（LaunchAgent）
@@ -1719,7 +1850,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func onRefresh() {
-        if preview { updateMessage = "预览数据已刷新"; rebuildMenu(); return }
+        if preview {
+            if previewPopover {
+                updateMessage = "正在刷新预览…"; rebuildMenu()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self = self else { return }
+                    self.updateMessage = "预览数据已刷新"; self.rebuildMenu()
+                }
+            } else { updateMessage = "预览数据已刷新"; rebuildMenu() }
+            return
+        }
         refresh(tokens: true, manual: true)
     }
 
