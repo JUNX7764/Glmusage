@@ -831,15 +831,18 @@ final class UpdateChecker {
     private var etag: String?
     private var lastCheck: Date?
     private var inFlight = false
+    private var completions: [() -> Void] = []
+    private(set) var lastError: String?
 
     /// force=false 时按 interval 节流；completion 固定主线程回调
     func check(force: Bool = false, completion: @escaping () -> Void = {}) {
-        guard !inFlight else { return }
+        if inFlight { completions.append(completion); return }
         if !force, let last = lastCheck, Date().timeIntervalSince(last) < UpdateCheck.interval {
             completion()
             return
         }
         inFlight = true
+        completions.append(completion)
         var req = URLRequest(url: UpdateCheck.apiURL, timeoutInterval: 15)
         req.cachePolicy = .reloadIgnoringLocalCacheData   // ETag/304 语义自己管，不用 URLCache
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -852,14 +855,17 @@ final class UpdateChecker {
                 self.lastCheck = Date()
                 let http = resp as? HTTPURLResponse
                 if http?.statusCode == 304 {
+                    self.lastError = nil
                     // 内容未变：结论保持
                 } else if err == nil, let data = data, http?.statusCode == 200,
                           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                           let tag = obj["tag_name"] as? String {
+                    self.lastError = nil
                     self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
                     if let e = http?.value(forHTTPHeaderField: "ETag"), !e.isEmpty { self.etag = e }
-                }
-                completion()
+                } else { self.lastError = "检查失败，请稍后重试" }
+                let callbacks = self.completions; self.completions.removeAll()
+                callbacks.forEach { $0() }
             }
         }.resume()
     }
@@ -867,8 +873,16 @@ final class UpdateChecker {
 
 // MARK: - App
 
+final class GLMPanelStack: NSStackView { override var isFlipped: Bool { true } }
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private let popover = NSPopover()
+    private var previewWindow: NSWindow?
+    private var tokenExpanded = true
+    private var mcpExpanded = true
+    private var updateMessage: String?
+    private let preview = CommandLine.arguments.contains("--preview") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview"
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
@@ -898,6 +912,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSLog("[GlmUsage] launched, creating status item")
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(togglePanel)
+        popover.behavior = .transient
+        if preview {
+            if CommandLine.arguments.contains("--preview-dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
+            installPreviewData()
+            rebuildMenu()
+            statusItem.button?.title = "GLM 预览"
+            previewWindow?.center()
+            previewWindow?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            if let i = CommandLine.arguments.firstIndex(of: "--preview-screenshot"), CommandLine.arguments.count > i + 1 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    guard let view = self?.previewWindow?.contentView else { return }
+                    view.layoutSubtreeIfNeeded()
+                    if let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                        view.cacheDisplay(in: view.bounds, to: image)
+                        if let data = image.representation(using: .png, properties: [:]) { try? data.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1])) }
+                    }
+                }
+            }
+            return
+        }
         rebuildMenu()
         renderBar()
         refresh(tokens: true)
@@ -1090,7 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 菜单栏图标 + 下拉菜单的统一渲染入口；菜单打开期间延迟重建到关闭时
     private func updateUI() {
         renderBar()
-        if menuOpen { pendingMenuRebuild = true } else { rebuildMenu() }
+        rebuildMenu()
     }
 
     // 打开菜单即触发一轮全量刷新（RefreshGate 防重入、合并重复请求）与一次节流更新检查；
@@ -1287,12 +1324,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let e = usage.fiveHourCardsError {
             let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
-            menu.addItem(info("5 小时卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试）"))
+            menu.addItem(info("5 小时卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试） · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))"))
         }
         if fiveHourCardsStale { menu.addItem(info("⚠️ 5 小时卡数据已过期 · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))")) }
         if let e = usage.weekCardsError {
             let short = e.count > 60 ? String(e.prefix(60)) + "…" : e
-            menu.addItem(info("周卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试）"))
+            menu.addItem(info("周卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试） · 最后成功 \(Fmt.lastOK(weekCardsLastOK))"))
         }
         if weekCardsStale { menu.addItem(info("⚠️ 周卡数据已过期 · 最后成功 \(Fmt.lastOK(weekCardsLastOK))")) }
 
@@ -1325,7 +1362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if toolsStale { line += " · ⚠️ 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))" }
             menu.addItem(info(line))
         }
-        if let e = usage.toolsError { menu.addItem(info("MCP 工具刷新失败：\(e)")) }
+        if let e = usage.toolsError { menu.addItem(info("MCP 工具刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))")) }
 
         menu.addItem(.separator())
         menu.addItem(info("最近尝试刷新 \(Fmt.fullTime.string(from: lastAttemptAt))"))
@@ -1346,8 +1383,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quit.target = self
         menu.addItem(quit)
 
-        statusItem.menu = menu
-        menu.delegate = self
+        buildPanel(menu)
+
+    }
+
+    @objc private func togglePanel() {
+        if popover.isShown { popover.performClose(nil); return }
+        if !preview { refresh(tokens: false, manual: true); checkForUpdate() }
+        rebuildMenu()
+        if let button = statusItem.button { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
+    }
+    @objc private func toggleToken() { tokenExpanded.toggle(); rebuildMenu() }
+    @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildMenu() }
+    @objc private func manualUpdate() {
+        if preview { updateMessage = "预览：当前已是最新版本"; rebuildMenu(); return }
+        updateMessage = "正在检查更新…"; rebuildMenu()
+        UpdateChecker.shared.check(force: true) { [weak self] in
+            guard let self = self else { return }
+            self.updateMessage = UpdateChecker.shared.lastError ?? (UpdateChecker.shared.available ? "发现新版本" : "当前已是最新版本")
+            self.rebuildMenu()
+        }
+    }
+
+    private func installPreviewData() {
+        let now = Date()
+        usage.level = "Pro"
+        usage.fiveHour = LimitEntry(label: "5 小时窗口", isFiveHour: true, limit: 2000, used: 640, remaining: 1360, usedRatio: 0.32, reset: now.addingTimeInterval(7200))
+        usage.week = LimitEntry(label: "7 天额度", isFiveHour: false, limit: 10000, used: 2700, remaining: 7300, usedRatio: 0.27, reset: now.addingTimeInterval(259200))
+        let stats = ModelUsage(totalTokens: 1840000, totalCalls: 142, byModel: [("glm-4.7", 1200000), ("glm-4.5-air", 640000)])
+        usage.tokensToday = stats; usage.tokens7d = stats; usage.tokens30d = stats
+        usage.tools30d = ToolUsage(networkSearch: 36, webRead: 18)
+        usage.resetCards = ResetCards(fiveHour: [now.addingTimeInterval(864000)], week: [now.addingTimeInterval(1728000)])
+        fiveHourLastOK = now; weekLastOK = now; tokensTodayLastOK = now; tokens7dLastOK = now; tokens30dLastOK = now; toolsLastOK = now; fiveHourCardsLastOK = now; weekCardsLastOK = now
+        if CommandLine.arguments.contains("--preview-errors") {
+            usage.week = nil; usage.weekError = "模拟网络错误：无法获取额度"
+            usage.tokensTodayError = "模拟服务端错误，保留上次结果"
+            usage.toolsError = "模拟 MCP 认证失败"
+            usage.fiveHourCardsError = "模拟登录过期"
+        }
+        if CommandLine.arguments.contains("--preview-long") {
+            usage.tokensToday = ModelUsage(totalTokens: 9000000, totalCalls: 500, byModel: (1...30).map { ("glm-very-long-model-name-\($0)", Double($0 * 10000)) })
+        }
+    }
+
+    private func buildPanel(_ menu: NSMenu) {
+        let width: CGFloat = CommandLine.arguments.contains("--preview-narrow") ? 280 : 336
+        let root = GLMPanelStack(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 6
+        root.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        let innerWidth = width - 28
+        func add(_ v: NSView) { root.addArrangedSubview(v); v.widthAnchor.constraint(equalToConstant: innerWidth).isActive = true }
+        func label(_ text: String, size: CGFloat = 11, bold: Bool = false, color: NSColor = .labelColor) -> NSTextField {
+            let f = NSTextField(wrappingLabelWithString: text); f.font = .systemFont(ofSize: size, weight: bold ? .semibold : .regular); f.textColor = color
+            f.lineBreakMode = .byWordWrapping; f.maximumNumberOfLines = 0; return f
+        }
+        func button(_ title: String, _ action: Selector, prominent: Bool = false) -> NSButton {
+            let b = NSButton(title: title, target: self, action: action); b.isBordered = !prominent; b.focusRingType = .none
+            if prominent { b.wantsLayer = true; b.layer?.backgroundColor = NSColor(calibratedRed: 0.04, green: 0.32, blue: 0.22, alpha: 1).cgColor; b.layer?.cornerRadius = 6
+                b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: NSColor.white, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]) }
+            return b
+        }
+        add(label("GLM 余额" + (usage.level.map { " · \($0)" } ?? ""), size: 15, bold: true))
+        func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ last: Date?, _ stale: Bool) {
+            let row = NSStackView(); row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 5
+            let title = label(name, size: 11, bold: true); title.widthAnchor.constraint(equalToConstant: 38).isActive = true; row.addArrangedSubview(title)
+            let pct = label(Fmt.pct(entry?.usedRemainingRatio), size: 12, bold: true); pct.widthAnchor.constraint(equalToConstant: 43).isActive = true; row.addArrangedSubview(pct)
+            let bar = NSProgressIndicator(); bar.isIndeterminate = false; bar.minValue = 0; bar.maxValue = 1; bar.doubleValue = entry?.usedRemainingRatio ?? 0; bar.controlSize = .small; bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 24).isActive = true; row.addArrangedSubview(bar)
+            let reset = label(entry?.reset.map { (entry?.isFiveHour == true ? Fmt.time($0) : Fmt.dayTime($0)) + " 重置" } ?? "重置时间 --", size: 11, bold: true)
+            reset.setContentCompressionResistancePriority(.required, for: .horizontal); row.addArrangedSubview(reset); add(row)
+            if let e = entry { add(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
+            else { add(label("暂无数据", color: .secondaryLabelColor)) }
+            if let e = error { add(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
+            else if stale { add(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
+        }
+        quota(usage.fiveHour, "5 小时", usage.fiveHourError, fiveHourLastOK, fiveHourStale)
+        quota(usage.week, "7 天", usage.weekError, weekLastOK, weekStale)
+        if let sub = usage.subscription { add(label("套餐：\(sub.name)" + (sub.expireDate.map { " · \(Fmt.dayTime($0)) 到期" } ?? ""), color: .secondaryLabelColor)) }
+        if let error = usage.subscriptionError { add(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed)) }
+        else if subscriptionStale { add(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange)) }
+        var section = 0
+        var mcpAdded = false
+        for item in menu.items {
+            let t = item.title
+            if t == "Token 用量（服务端统计）" { section = 1; add(button("Token 用量（服务端统计）  \(tokenExpanded ? "▴" : "▾")", #selector(toggleToken))); continue }
+            if t.hasPrefix("MCP 工具") { if section != 2 { section = 2; mcpAdded = true; add(button("MCP 工具（近 30 天）  \(mcpExpanded ? "▴" : "▾")", #selector(toggleMCP))) } }
+            if t.hasPrefix("最近尝试刷新") {
+                if !mcpAdded { add(button("MCP 工具（近 30 天）  \(mcpExpanded ? "▴" : "▾")", #selector(toggleMCP))); if mcpExpanded { add(label("暂无数据", color: .secondaryLabelColor)) } }
+                section = 3
+            }
+            if item.isSeparatorItem || t.hasPrefix("GLM 余额") || t.hasPrefix("5 小时窗口：") || t.hasPrefix("7 天额度：") { continue }
+            if section == 1 && !tokenExpanded && !t.contains("失败") && !t.contains("过期") { continue }
+            if section == 2 && !mcpExpanded && !t.contains("失败") && !t.contains("过期") { continue }
+            if t == "立即刷新" { add(button("立即刷新", #selector(onRefresh), prominent: true)); continue }
+            if t == "开机自启" { let b = button((!preview && isLoginItemEnabled() ? "☑ " : "☐ ") + t, #selector(onToggleLogin)); add(b); continue }
+            if t.hasPrefix("版本 ") { add(button(t + " · 检查更新", #selector(manualUpdate))); if let msg = updateMessage { add(label(msg, color: .secondaryLabelColor)) }; continue }
+            if t == "退出" { add(button(t, #selector(onQuit))); continue }
+            if item.action == #selector(onUpdateApp) { add(button(t, #selector(onUpdateApp), prominent: true)); continue }
+            add(label(t, color: (t.contains("失败") || t.contains("数据已过期") || t.contains("⚠️")) ? .systemRed : .secondaryLabelColor))
+        }
+        let scroll = NSScrollView(); scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        scroll.documentView = root
+        NSLayoutConstraint.activate([root.topAnchor.constraint(equalTo: scroll.contentView.topAnchor), root.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), root.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor)])
+        let controller = NSViewController(); controller.view = scroll
+        root.layoutSubtreeIfNeeded()
+        let maxHeight = (NSScreen.main?.visibleFrame.height ?? 800) * 0.82
+        let height = min(maxHeight, max(250, root.fittingSize.height + 8))
+        controller.preferredContentSize = NSSize(width: width, height: height)
+        DispatchQueue.main.async {
+            scroll.layoutSubtreeIfNeeded()
+            scroll.contentView.scroll(to: .zero)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+        if preview {
+            if previewWindow == nil {
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                window.title = "GLM 用量 · 假数据预览"
+                window.isReleasedWhenClosed = false
+                previewWindow = window
+            }
+            previewWindow?.contentViewController = controller
+            previewWindow?.setContentSize(controller.preferredContentSize)
+        } else {
+            popover.contentViewController = controller
+            popover.contentSize = controller.preferredContentSize
+        }
     }
 
     // MARK: 开机自启（LaunchAgent）
@@ -1361,6 +1520,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func onToggleLogin() {
+        if preview { updateMessage = "预览模式不会修改开机自启"; rebuildMenu(); return }
         if isLoginItemEnabled() {
             try? FileManager.default.removeItem(atPath: launchAgentPath)
         } else {
@@ -1385,7 +1545,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateUI()
     }
 
-    @objc private func onRefresh() { refresh(tokens: true, manual: true) }
+    @objc private func onRefresh() {
+        if preview { updateMessage = "预览数据已刷新"; rebuildMenu(); return }
+        refresh(tokens: true, manual: true)
+    }
 
     // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
     private func checkForUpdate() {
