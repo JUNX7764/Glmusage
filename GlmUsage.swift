@@ -622,12 +622,22 @@ enum Fmt {
         guard let v = v else { return "暂无数据" }
         return String(format: "%.2f%%", v * 100)
     }
-    static func time(_ d: Date?) -> String {
-        guard let d = d else { return "" }
+    // 展示用 formatter 静态缓存：菜单每轮重建要调十几次，新建 DateFormatter 开销大
+    private static func zhFormatter(_ format: String) -> DateFormatter {
         let f = DateFormatter()
         f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "HH:mm"
-        return f.string(from: d)
+        f.dateFormat = format
+        return f
+    }
+    private static let timeFmt = zhFormatter("HH:mm")
+    private static let dayTimeFmt = zhFormatter("MM-dd HH:mm")
+    private static let expiresTodayFmt = zhFormatter("'今天' HH:mm")
+    private static let expiresTomorrowFmt = zhFormatter("'明天' HH:mm")
+    private static let expiresFullFmt = zhFormatter("yyyy-MM-dd HH:mm")
+
+    static func time(_ d: Date?) -> String {
+        guard let d = d else { return "" }
+        return timeFmt.string(from: d)
     }
     // 最后成功时间的占位口径：无记录用 "--"（time() 对 nil 返回空串，不适合过期提示行）
     static func lastOK(_ d: Date?) -> String {
@@ -638,24 +648,14 @@ enum Fmt {
     static let iso8601 = ISO8601DateFormatter()
     static func dayTime(_ d: Date?) -> String {
         guard let d = d else { return "" }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "MM-dd HH:mm"
-        return f.string(from: d)
+        return dayTimeFmt.string(from: d)
     }
     // 重置卡/套餐到期提示：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期（本地时区）
     static func expires(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
         let cal = Calendar.current
-        if cal.isDateInToday(d) {
-            f.dateFormat = "'今天' HH:mm"
-        } else if cal.isDateInTomorrow(d) {
-            f.dateFormat = "'明天' HH:mm"
-        } else {
-            f.dateFormat = "yyyy-MM-dd HH:mm"
-        }
-        return f.string(from: d)
+        if cal.isDateInToday(d) { return expiresTodayFmt.string(from: d) }
+        if cal.isDateInTomorrow(d) { return expiresTomorrowFmt.string(from: d) }
+        return expiresFullFmt.string(from: d)
     }
     // 自诊断 / --once 输出用完整日期时间（本地时区）
     static let fullTime: DateFormatter = {
@@ -791,8 +791,8 @@ enum BuildInfo {
 enum UpdateCheck {
     static let apiURL = URL(string: "https://api.github.com/repos/JUNX7764/Glmusage/releases/latest")!
     static let releasesPage = URL(string: "https://github.com/JUNX7764/Glmusage/releases")!
-    /// GitHub 匿名限额 60 次/小时/IP，2 小时一查绰绰有余
-    static let interval: TimeInterval = 2 * 3600
+    /// GitHub 匿名限额 60 次/小时/IP，30 分钟一查仅 2 次/小时；ETag/304 条件请求不耗配额
+    static let interval: TimeInterval = 30 * 60
 
     /// 版本号归一化：v1.0.1 / v1.0.1-3-gabc / v1.0.1-dirty → [1, 0, 1]；
     /// 破折号后缀（预发布/dirty/git describe 尾巴）丢弃，任一段非数字视为无法比较
@@ -867,13 +867,16 @@ final class UpdateChecker {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
     private var cycle = 0
     private let refreshGate = RefreshGate()
+    // 菜单打开期间不重建菜单（避免打开中的菜单被替换闪断），关闭时补一次
+    private var menuOpen = false
+    private var pendingMenuRebuild = false
     private let launchAgentLabel = "com.local.glm-usage"
     // token 统计每 N 个刷新周期拉一次（主循环 30s × 10 = 5 分钟；额度窗口每轮都刷）
     private let tokenEveryCycles = 10
@@ -906,7 +909,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // 显式容差让系统合并定时器唤醒（Apple 节能指南建议 ≥间隔 10%；30s → 6s）
         timer?.tolerance = 6
-        // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 2 小时
+        // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 30 分钟；
+        // 打开菜单也会触发一次（同一 interval 节流，不增加请求频率）
         updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateCheck.interval, repeats: true) { [weak self] _ in
             self?.checkForUpdate()
         }
@@ -1079,9 +1083,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let tokenErrors = [usage.tokensTodayError, usage.tokens7dError, usage.tokens30dError, usage.toolsError]
             .compactMap { $0 }
         usage.tokensError = tokenErrors.isEmpty ? nil : tokenErrors.joined(separator: "; ")
-        renderBar()
-        rebuildMenu()
+        updateUI()
         if refreshGate.finish() { performRefresh(tokens: true) }
+    }
+
+    /// 菜单栏图标 + 下拉菜单的统一渲染入口；菜单打开期间延迟重建到关闭时
+    private func updateUI() {
+        renderBar()
+        if menuOpen { pendingMenuRebuild = true } else { rebuildMenu() }
+    }
+
+    // 打开菜单即触发一轮全量刷新（RefreshGate 防重入、合并重复请求）与一次节流更新检查；
+    // 数据到位时若菜单仍打开，重建延迟到关闭后，下次打开即为最新
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        refresh(tokens: false, manual: true)
+        checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpen = false
+        if pendingMenuRebuild {
+            pendingMenuRebuild = false
+            rebuildMenu()
+        }
     }
 
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
@@ -1322,6 +1347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quit)
 
         statusItem.menu = menu
+        menu.delegate = self
     }
 
     // MARK: 开机自启（LaunchAgent）
@@ -1356,14 +1382,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             """
             try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
         }
-        rebuildMenu()
+        updateUI()
     }
 
     @objc private func onRefresh() { refresh(tokens: true, manual: true) }
 
     // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
     private func checkForUpdate() {
-        UpdateChecker.shared.check { [weak self] in self?.rebuildMenu() }
+        UpdateChecker.shared.check { [weak self] in self?.updateUI() }
     }
 
     // 更新横幅点击：唤起 Terminal 代跑 .app 内置 update.sh（从 GitHub Releases 下载最新

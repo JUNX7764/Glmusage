@@ -6,3 +6,6 @@
 # 图标生成中间产物（保留 icns 成品）
 AppIcon.iconset/
 icon_1024x1024.png
+
+# Python 测试缓存
+__pycache__/
