@@ -444,11 +444,12 @@ enum Fetcher {
                 if isFive { result.fiveHourError = "invalid \(window): \(detail)" } else { result.weekError = "invalid \(window): \(detail)" }
                 continue
             }
-            // 额度与百分比可能来自服务端的不同快照。字段均在有效范围时保留余额，
-            // 不一致只降级为警告；UI 按 remaining / usage 计算，避免百分比和 credits 打架。
+            // 服务端的 currentValue / remaining 分别取整，percentage 也会截断或向上取整。
+            // 按余额计算进度，允许 1 个百分点的取整差异；明显矛盾仍提示警告。
             var warnings: [String] = []
+            let usedRatio = (limit - remaining) / limit
             if abs((min(used, limit) + remaining) - limit) > max(1.5, limit * 0.000001)
-                || abs(percentage - min(used, limit) / limit * 100) > 0.51 + 50 / limit {
+                || abs(percentage - usedRatio * 100) > 1.000001 {
                 warnings.append("invalid \(window): inconsistent usage/currentValue/remaining/percentage")
             }
             let reset: Date?
@@ -458,7 +459,7 @@ enum Fetcher {
                 } else { reset = nil; warnings.append("invalid \(window): nextResetTime") }
             } else { reset = nil }
             let entry = LimitEntry(label: label, isFiveHour: isFive, limit: limit, used: used,
-                                   remaining: remaining, usedRatio: (limit - remaining) / limit, reset: reset)
+                                   remaining: remaining, usedRatio: usedRatio, reset: reset)
             let warning = warnings.isEmpty ? nil : warnings.joined(separator: "; ")
             if isFive, result.fiveHour == nil {
                 result.fiveHour = entry
@@ -2670,14 +2671,34 @@ enum GLMOfflineRegression {
                 old: nil, oldLastOK: nil, oldError: "previous failure", now: now)
             try expect(warningFresh.value != nil && warningFresh.lastOK == now && warningFresh.error == nil,
                        "valid quota with reset warning was treated as a failed refresh")
+            // 2026-11-04 实际接口的脱敏额度字段：两窗口均有效，不应出现橙色异常提示。
+            let roundedQuotaJSON = """
+            {"limits":[
+              {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":2000,
+               "currentValue":0,"remaining":1999,"percentage":1},
+              {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":10000,
+               "currentValue":2961,"remaining":7038,"percentage":29}
+            ]}
+            """
+            let roundedQuota = try JSONSerialization.jsonObject(with: Data(roundedQuotaJSON.utf8)) as! [String: Any]
+            let rounded = Fetcher.parseQuota(roundedQuota, error: nil, now: now)
+            try expect(rounded.fiveHour?.remaining == 1999 && rounded.week?.remaining == 7038
+                       && rounded.fiveHourWarning == nil && rounded.weekWarning == nil
+                       && rounded.fiveHourError == nil && rounded.weekError == nil,
+                       "server-rounded 5H/7D quota fields caused false warnings")
+            try expect(abs((rounded.fiveHour?.usedRemainingRatio ?? -1) - 0.9995) < 0.000001
+                       && abs((rounded.week?.usedRemainingRatio ?? -1) - 0.7038) < 0.000001,
+                       "rounded quota did not preserve remaining-credit progress")
             for (remaining, percentage, warned) in [(80.0, 20.0, false), (79.0, 20.4, false),
+                                                      (80.0, 19.0, false), (80.0, 21.0, false),
+                                                      (80.0, 18.99, true), (80.0, 21.01, true),
                                                       (10.0, 20.0, true), (80.0, 80.0, true)] {
                 let value = Fetcher.parseQuota(["limits": [["type": "CREDIT_LIMIT", "unit": 3, "number": 5,
                     "usage": 100, "currentValue": 20, "remaining": remaining, "percentage": percentage]]], error: nil, now: now)
                 let ratioMatches = value.fiveHour.map { abs($0.usedRemainingRatio - remaining / 100) < 0.000001 } ?? false
                 let hasWarning = value.fiveHourWarning?.contains("inconsistent") ?? false
                 try expect(ratioMatches && value.fiveHourError == nil && hasWarning == warned,
-                           "quota inconsistency was not degraded to a remaining-credits warning")
+                           "quota rounding tolerance hid an inconsistency or raised a false warning")
             }
             let reverse = Fetcher.parseQuota(["limits": [
                 ["type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 100,
