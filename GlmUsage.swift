@@ -99,7 +99,7 @@ struct LimitEntry {
     var limit: Double          // usage 字段 = 窗口总额度（credits）
     var used: Double           // currentValue
     var remaining: Double
-    var usedRatio: Double      // 0..1（percentage/100）
+    var usedRatio: Double      // 0..1（由 usage / remaining 推导，保证与剩余 credits 一致）
     var reset: Date?
     var usedRemainingRatio: Double { max(0, min(1, 1 - usedRatio)) }  // 剩余比例
 }
@@ -444,29 +444,29 @@ enum Fetcher {
                 if isFive { result.fiveHourError = "invalid \(window): \(detail)" } else { result.weekError = "invalid \(window): \(detail)" }
                 continue
             }
-            // 容许额度四舍五入误差及百分比四舍五入（各 0.5 个单位）。
-            guard abs((min(used, limit) + remaining) - limit) <= max(1.5, limit * 0.000001),
-                  abs(percentage - min(used, limit) / limit * 100) <= 0.51 + 50 / limit else {
-                if isFive { result.fiveHourError = "invalid \(window): inconsistent usage/currentValue/remaining/percentage" }
-                else { result.weekError = "invalid \(window): inconsistent usage/currentValue/remaining/percentage" }
-                continue
+            // 额度与百分比可能来自服务端的不同快照。字段均在有效范围时保留余额，
+            // 不一致只降级为警告；UI 按 remaining / usage 计算，避免百分比和 credits 打架。
+            var warnings: [String] = []
+            if abs((min(used, limit) + remaining) - limit) > max(1.5, limit * 0.000001)
+                || abs(percentage - min(used, limit) / limit * 100) > 0.51 + 50 / limit {
+                warnings.append("invalid \(window): inconsistent usage/currentValue/remaining/percentage")
             }
             let reset: Date?
-            var resetError: String?
             if let rawReset = row["nextResetTime"] {
                 if let milliseconds = GLMNumber.finite(rawReset), milliseconds > 0 {
                     reset = Date(timeIntervalSince1970: milliseconds / 1000)
-                } else { reset = nil; resetError = "invalid \(window): nextResetTime" }
+                } else { reset = nil; warnings.append("invalid \(window): nextResetTime") }
             } else { reset = nil }
             let entry = LimitEntry(label: label, isFiveHour: isFive, limit: limit, used: used,
-                                   remaining: remaining, usedRatio: percentage / 100, reset: reset)
+                                   remaining: remaining, usedRatio: (limit - remaining) / limit, reset: reset)
+            let warning = warnings.isEmpty ? nil : warnings.joined(separator: "; ")
             if isFive, result.fiveHour == nil {
                 result.fiveHour = entry
-                result.fiveHourWarning = resetError
+                result.fiveHourWarning = warning
             }
             if isWeek, result.week == nil {
                 result.week = entry
-                result.weekWarning = resetError
+                result.weekWarning = warning
             }
         }
         if result.fiveHour == nil && !sawFive { result.fiveHourError = "missing 5H quota" }
@@ -2670,11 +2670,14 @@ enum GLMOfflineRegression {
                 old: nil, oldLastOK: nil, oldError: "previous failure", now: now)
             try expect(warningFresh.value != nil && warningFresh.lastOK == now && warningFresh.error == nil,
                        "valid quota with reset warning was treated as a failed refresh")
-            for (remaining, percentage, rejected) in [(80.0, 20.0, false), (79.0, 20.4, false),
-                                                        (10.0, 20.0, true), (80.0, 80.0, true)] {
+            for (remaining, percentage, warned) in [(80.0, 20.0, false), (79.0, 20.4, false),
+                                                      (10.0, 20.0, true), (80.0, 80.0, true)] {
                 let value = Fetcher.parseQuota(["limits": [["type": "CREDIT_LIMIT", "unit": 3, "number": 5,
                     "usage": 100, "currentValue": 20, "remaining": remaining, "percentage": percentage]]], error: nil, now: now)
-                try expect((value.fiveHour == nil) == rejected, "quota consistency/rounding check failed")
+                let ratioMatches = value.fiveHour.map { abs($0.usedRemainingRatio - remaining / 100) < 0.000001 } ?? false
+                let hasWarning = value.fiveHourWarning?.contains("inconsistent") ?? false
+                try expect(ratioMatches && value.fiveHourError == nil && hasWarning == warned,
+                           "quota inconsistency was not degraded to a remaining-credits warning")
             }
             let reverse = Fetcher.parseQuota(["limits": [
                 ["type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 100,
