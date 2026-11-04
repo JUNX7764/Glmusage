@@ -139,6 +139,20 @@ struct ResetCards {
     var week: [Date]?
 }
 
+/// 重置卡类型（服务器 reset_type 取值）
+enum ResetCardType: String {
+    case fiveHour = "FIVE_HOUR"
+    case week = "WEEK"
+    var displayName: String { self == .fiveHour ? "5 小时重置卡" : "周重置卡" }
+}
+
+/// 使用重置卡的结果：retryable=true 表示结果未知（网络/5xx），保留同一幂等 key 重试不会重复扣卡
+struct ResetUseOutcome {
+    var used: Bool
+    var error: String?
+    var retryable: Bool
+}
+
 /// 套餐订阅信息（subscription/list）
 struct SubscriptionInfo {
     var name: String
@@ -391,8 +405,10 @@ enum Fetcher {
                 if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
                 continue
             }
+            // currentValue 允许超过 usage：周额度用尽后服务端会返回 60004/60000 这类超额值
+            // （percentage=100、remaining=0），属于合法状态，不应把整个窗口判为非法
             guard let limit = GLMNumber.finite(row["usage"]), limit > 0,
-                  let used = GLMNumber.finite(row["currentValue"]), used >= 0, used <= limit,
+                  let used = GLMNumber.finite(row["currentValue"]), used >= 0,
                   let remaining = GLMNumber.finite(row["remaining"]), remaining >= 0, remaining <= limit,
                   GLMNumber.nonnegativeRoundedInteger(limit) != nil,
                   GLMNumber.nonnegativeRoundedInteger(used) != nil,
@@ -477,13 +493,12 @@ enum Fetcher {
     // 重置卡（额度重置卡）：ZCode 侧接口，成功码为 code==0（与 open.bigmodel.cn 系的 200 不同）
     static let resetBase = "https://zcode.z.ai"
 
-    /// 查询可用重置卡列表；jwt/maas 为 ZCode 登录态 token，过期/缺失由上层优雅降级
-    static func fetchResetCards(jwt: String, maas: String,
-                                completion: @escaping (ResetCardsResult) -> Void) {
-        guard let url = URL(string: resetBase + "/api/v1/coding-plan/reset/status") else {
-            completion(ResetCardsResult(fiveHourError: "bad url", weekError: "bad url")); return
-        }
+    /// 重置卡接口统一请求构造（GET status / POST use 共用同一套双 token 认证头）
+    private static func resetRequest(_ path: String, jwt: String, maas: String,
+                                     method: String = "GET", body: [String: Any]? = nil) -> URLRequest? {
+        guard let url = URL(string: resetBase + path) else { return nil }
         var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = method
         // zcodejwttoken 明文可能已自带 "Bearer " 前缀，避免重复拼接
         let auth = jwt.lowercased().hasPrefix("bearer ") ? jwt : "Bearer \(jwt)"
         req.setValue(auth, forHTTPHeaderField: "Authorization")
@@ -491,6 +506,16 @@ enum Fetcher {
         req.setValue("PERSONAL", forHTTPHeaderField: "Bigmodel-Target-Type")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("GlmUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
+        if let body { req.httpBody = try? JSONSerialization.data(withJSONObject: body) }
+        return req
+    }
+
+    /// 查询可用重置卡列表；jwt/maas 为 ZCode 登录态 token，过期/缺失由上层优雅降级
+    static func fetchResetCards(jwt: String, maas: String,
+                                completion: @escaping (ResetCardsResult) -> Void) {
+        guard let req = resetRequest("/api/v1/coding-plan/reset/status", jwt: jwt, maas: maas) else {
+            completion(ResetCardsResult(fiveHourError: "bad url", weekError: "bad url")); return
+        }
         URLSession.shared.dataTask(with: req) { data, resp, err in
             guard err == nil, let data = data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -531,6 +556,51 @@ enum Fetcher {
         let week = cards("available_week_resets")
         return ResetCardsResult(fiveHour: five.0, week: week.0,
                                 fiveHourError: five.1, weekError: week.1)
+    }
+
+    /// 使用一张重置卡（写操作；仅由用户在界面上确认后调用，绝不自动触发）
+    /// idempotencyKey 由调用方生成并在结果未知时保留复用——服务器按 key 幂等，重试不会重复扣卡
+    static func useResetCard(jwt: String, maas: String, resetType: ResetCardType,
+                             idempotencyKey: String,
+                             completion: @escaping (ResetUseOutcome) -> Void) {
+        let trimmed = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 64,
+              let req = resetRequest("/api/v1/coding-plan/reset/use", jwt: jwt, maas: maas,
+                                     method: "POST",
+                                     body: ["idempotency_key": trimmed,
+                                            "reset_type": resetType.rawValue]) else {
+            completion(ResetUseOutcome(used: false, error: "bad request", retryable: false)); return
+        }
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            if let err = err {
+                completion(ResetUseOutcome(used: false, error: err.localizedDescription, retryable: true)); return
+            }
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                completion(ResetUseOutcome(used: false, error: "bad response", retryable: true)); return
+            }
+            completion(parseResetUseResponse(obj, httpStatus: (resp as? HTTPURLResponse)?.statusCode))
+        }.resume()
+    }
+
+    /// 纯解析：成功 = code==0 且 data.used==true；服务端明确拒绝不可重试，网络/5xx 结果未知可安全重试
+    static func parseResetUseResponse(_ obj: [String: Any], httpStatus: Int?) -> ResetUseOutcome {
+        if let http = httpStatus, http != 200 {
+            return ResetUseOutcome(used: false, error: "HTTP \(http)", retryable: http >= 500)
+        }
+        let code = GLMNumber.integer(obj["code"]) ?? -1
+        guard code == 0 else {
+            let msg = (obj["msg"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+            return ResetUseOutcome(used: false, error: "code \(code)\(msg.isEmpty ? "" : " \(msg)")",
+                                   retryable: false)
+        }
+        guard let d = obj["data"] as? [String: Any] else {
+            return ResetUseOutcome(used: false, error: "no data", retryable: true)
+        }
+        if (d["used"] as? Bool) == true {
+            return ResetUseOutcome(used: true, error: nil, retryable: false)
+        }
+        return ResetUseOutcome(used: false, error: "服务器未确认使用成功", retryable: false)
     }
 
     /// 套餐订阅：取 status=="VALID" 的第一条；到期时间解析失败时仅降级显示名称
@@ -1135,6 +1205,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     // 强制重解析；轻推限流 30s 防止闪烁。KVO 负责即时响应，对账负责兜底粘滞。
     private var appearancePollTimer: Timer?
     private var lastBarNudge: Date?
+    // 重置卡使用：进行中防重入；结果未知（网络/5xx）时按类型保留同一幂等 key，重试不重复扣卡
+    private var resetUseInFlight = false
+    private var pendingResetKeys: [String: String] = [:]
     private let popover = NSPopover()
     private let panelController = NSViewController()
     private let panelRoot = GLMPanelStack()
@@ -1653,6 +1726,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 if !parts.isEmpty { menu.addItem(info("重置卡：" + parts.joined(separator: " · "))) }
                 for d in f5 { menu.addItem(info(cardLine("5 小时卡", d))) }
                 for d in wk { menu.addItem(info(cardLine("周卡", d))) }
+                // 使用入口（写操作）：仅在确有可用卡时出现，点击后弹确认框
+                func useItem(_ type: ResetCardType, count: Int) {
+                    let item = NSMenuItem(title: resetUseInFlight
+                        ? "\(type.displayName)使用中…"
+                        : "使用\(type.displayName)（剩 \(count) 张）…",
+                        action: #selector(onUseReset(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = type.rawValue
+                    item.isEnabled = !resetUseInFlight
+                    menu.addItem(item)
+                }
+                if !f5.isEmpty { useItem(.fiveHour, count: f5.count) }
+                if !wk.isEmpty { useItem(.week, count: wk.count) }
             }
         }
         if let e = usage.fiveHourCardsError {
@@ -1770,6 +1856,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     }
 
     @objc private func toggleToken() { tokenExpanded.toggle(); rebuildMenu() }
+
+    // 面板标题行的小重置图标：一类卡可用直接确认；两类都有先选类型；无卡提示
+    @objc private func onResetCardIcon(_ sender: NSButton) {
+        guard !resetUseInFlight else { return }
+        let f5 = GLMFreshness.availableCards(usage.resetCards?.fiveHour ?? [], now: Date())
+        let wk = GLMFreshness.availableCards(usage.resetCards?.week ?? [], now: Date())
+        switch (f5.isEmpty, wk.isEmpty) {
+        case (true, true):
+            setUpdateMessage("重置卡：暂无可用", dismissAfter: 4)
+        case (false, true):
+            beginUseReset(.fiveHour)
+        case (true, false):
+            beginUseReset(.week)
+        case (false, false):
+            let picker = NSMenu()
+            let five = NSMenuItem(title: "使用 5 小时重置卡（剩 \(f5.count) 张）",
+                                  action: #selector(onUseReset(_:)), keyEquivalent: "")
+            five.target = self; five.representedObject = ResetCardType.fiveHour.rawValue
+            let week = NSMenuItem(title: "使用周重置卡（剩 \(wk.count) 张）",
+                                  action: #selector(onUseReset(_:)), keyEquivalent: "")
+            week.target = self; week.representedObject = ResetCardType.week.rawValue
+            picker.addItem(five); picker.addItem(week)
+            picker.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
+        }
+    }
+
+    // 重置卡使用入口（菜单项 representedObject → 类型）
+    @objc private func onUseReset(_ sender: Any) {
+        guard let item = sender as? NSMenuItem,
+              let raw = item.representedObject as? String,
+              let type = ResetCardType(rawValue: raw) else { return }
+        beginUseReset(type)
+    }
+
+    /// 使用一张重置卡：二次确认 → 写接口 → 刷新对账；绝不自动触发
+    private func beginUseReset(_ type: ResetCardType) {
+        guard !resetUseInFlight else { return }
+        if preview { setUpdateMessage("预览模式：不执行真实重置卡操作", dismissAfter: 3); return }
+        guard let (jwt, maas) = CredStore.loadResetTokens() else {
+            setUpdateMessage("使用\(type.displayName)失败：未找到 ZCode 登录凭证", dismissAfter: 5); return
+        }
+        let available = GLMFreshness.availableCards(
+            type == .fiveHour ? (usage.resetCards?.fiveHour ?? []) : (usage.resetCards?.week ?? []),
+            now: Date())
+        guard let nearest = available.min() else {
+            setUpdateMessage("\(type.displayName)：暂无可用", dismissAfter: 4); return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "使用一张\(type.displayName)？"
+        alert.informativeText = "剩余 \(available.count) 张，最近一张 \(Fmt.expires(nearest)) 到期。\n使用后立即重置对应额度窗口，操作不可撤销。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "使用")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        resetUseInFlight = true
+        // 上次结果未知则复用同一幂等 key（服务器按 key 幂等，重试不会重复扣卡）
+        let key = pendingResetKeys[type.rawValue] ?? UUID().uuidString
+        pendingResetKeys[type.rawValue] = key
+        rebuildMenu()
+        Fetcher.useResetCard(jwt: jwt, maas: maas, resetType: type, idempotencyKey: key) { [weak self] outcome in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.resetUseInFlight = false
+                if outcome.used {
+                    self.pendingResetKeys.removeValue(forKey: type.rawValue)
+                    self.setUpdateMessage("已使用\(type.displayName) ✓", dismissAfter: 3)
+                } else {
+                    if !outcome.retryable { self.pendingResetKeys.removeValue(forKey: type.rawValue) }
+                    let suffix = outcome.retryable ? "（结果未知，已刷新卡数；未扣卡可重试）" : ""
+                    self.setUpdateMessage("使用\(type.displayName)失败：\(outcome.error ?? "未知错误")\(suffix)", dismissAfter: 6)
+                }
+                // 成功/失败都刷新额度与卡数：成功立刻反映新窗口，结果未知用于对账
+                self.refresh(tokens: false, manual: true)
+                // 服务端从确认用卡到额度接口反映新窗口可能有秒级延迟：成功后 3 秒补刷一次，避免用量条短暂停在旧值
+                if outcome.used {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                        self?.refresh(tokens: false)
+                    }
+                }
+            }
+        }
+    }
     @objc private func toggleModels(_ sender: NSButton) {
         let index = sender.tag
         guard (0..<3).contains(index) else { return }
@@ -1910,7 +2080,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             let field = label(line, size: 11); peakCard.content.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
         }
         add(peakCard)
-        let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 8; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 13, bold: true)); cardHead.addArrangedSubview(spacer())
+        let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 8; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 13, bold: true))
+        // 「🎫 使用重置卡」按钮（图标+文字，表意=消耗一张卡）：一类卡可用直接确认，两类都有先选类型，无卡提示；使用中不可点
+        let resetBtn = GLMPanelAction(title: "使用重置卡", target: self, action: #selector(onResetCardIcon(_:)))
+        resetBtn.isBordered = false
+        resetBtn.focusRingType = .none
+        resetBtn.image = NSImage(systemSymbolName: "ticket.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+        resetBtn.imagePosition = .imageLeft
+        resetBtn.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        resetBtn.contentTintColor = .secondaryLabelColor
+        resetBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        resetBtn.isEnabled = !resetUseInFlight
+        resetBtn.toolTip = resetUseInFlight ? "重置卡使用中…" : "使用一张重置卡，立即重置对应额度窗口"
+        resetBtn.setAccessibilityLabel(resetUseInFlight ? "重置卡使用中" : "使用重置卡")
+        cardHead.addArrangedSubview(resetBtn)
+        cardHead.addArrangedSubview(spacer())
         cards.content.addArrangedSubview(cardHead); cardHead.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
         if let c = usage.resetCards {
             for (name, dates) in [("5 小时卡", c.fiveHour), ("周卡", c.week)] {
@@ -2397,6 +2582,14 @@ enum GLMOfflineRegression {
                        "invalid 5H quota was not rejected")
             try expect(partial.week?.used == 100 && partial.weekError == nil,
                        "valid 7D quota was discarded with invalid 5H")
+            // 超额用尽（currentValue > usage）是服务端合法状态：应保留窗口并显示 100% 已用
+            let overUsed = Fetcher.parseQuota(["limits": [
+                ["type": "CREDIT_LIMIT", "unit": 6, "number": 1, "usage": 60_000,
+                 "currentValue": 60_004, "remaining": 0, "percentage": 100]
+            ]], error: nil, now: now)
+            try expect(overUsed.week?.usedRatio == 1 && overUsed.week?.remaining == 0
+                       && overUsed.weekError == nil,
+                       "over-quota (currentValue > usage) window was rejected")
 
             let reverse = Fetcher.parseQuota(["limits": [
                 ["type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 100,
@@ -2489,6 +2682,21 @@ enum GLMOfflineRegression {
                        "valid empty card lists were not accepted")
             try expect(GLMFreshness.availableCards([now.addingTimeInterval(-1), now.addingTimeInterval(30)],
                 now: now).count == 1, "expired cached card remained available")
+
+            // 使用重置卡响应解析：成功 / 明确拒绝不可重试 / 5xx 可重试 / 缺 used 不算成功
+            let useOK = Fetcher.parseResetUseResponse(["code": 0, "data": ["used": true]], httpStatus: 200)
+            try expect(useOK.used && useOK.error == nil && !useOK.retryable,
+                       "successful reset use response was rejected")
+            let useRejected = Fetcher.parseResetUseResponse(["code": 40_001, "msg": "no available reset"], httpStatus: 200)
+            try expect(!useRejected.used && !useRejected.retryable
+                       && (useRejected.error?.contains("no available reset") ?? false),
+                       "definitive reset use rejection was treated as retryable")
+            let use5xx = Fetcher.parseResetUseResponse([:], httpStatus: 502)
+            try expect(!use5xx.used && use5xx.retryable, "5xx reset use response was not retryable")
+            let useNoFlag = Fetcher.parseResetUseResponse(["code": 0, "data": [String: Any]()], httpStatus: 200)
+            try expect(!useNoFlag.used, "reset use without used=true was accepted")
+            try expect(ResetCardType.fiveHour.rawValue == "FIVE_HOUR" && ResetCardType.week.rawValue == "WEEK",
+                       "reset card type wire values changed")
 
             let subscription = Fetcher.parseSubscription([[
                 "status": "VALID", "productName": "Pro",
