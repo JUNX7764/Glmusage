@@ -385,6 +385,24 @@ exit 0
         self.assertEqual(self.marker(installed), "old")
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
 
+    def test_target_release_cannot_point_to_other_tag_assets(self):
+        installed = self.prepare_update()
+        zip_url = f"https://github.com/{REPO}/releases/download/v3.0.0/{EXECUTABLE}.zip"
+        releases = [{"tag_name": "v2.0.0", "draft": False, "prerelease": False, "assets": [
+            {"name": f"{EXECUTABLE}.zip", "browser_download_url": zip_url},
+            {"name": f"{EXECUTABLE}.zip.sha256", "browser_download_url": zip_url + ".sha256"}]}]
+        result = self.run_update(MOCK_RELEASES_JSON=json.dumps(releases))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_update_peak_failure_preserves_old_app(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_PEAK_TEST_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
     def test_loaded_agent_mismatch_rejected_even_when_plist_matches(self):
         installed = self.prepare_update()
         result = self.run_update(MOCK_LOADED_BINARY="/other/GlmUsage")

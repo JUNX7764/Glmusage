@@ -156,6 +156,7 @@ struct UsageData {
     var resetCards: ResetCards?        // 重置卡（额度重置卡）可用列表
     var resetCardsError: String?
     var subscription: SubscriptionInfo?
+    var subscriptionSucceeded = false
     var quotaError: String?
     var tokensError: String?
     var fiveHourError: String?
@@ -217,6 +218,22 @@ enum GLMFreshness {
             return (old, oldLastOK, failure)
         }
         return (old, oldLastOK, oldError)
+    }
+}
+
+enum GLMSubscriptionFreshness {
+    static func apply(fresh: SubscriptionInfo?, succeeded: Bool, failure: String?, old: SubscriptionInfo?,
+                      oldLastOK: Date?, oldError: String?, now: Date) -> (SubscriptionInfo?, Date?, String?) {
+        if succeeded { return (fresh, now, nil) }
+        if let failure = failure { return (old, oldLastOK, failure) }
+        return (old, oldLastOK, oldError)
+    }
+}
+
+enum GLMRefreshDispatch {
+    static func start(slowDue: Bool, quota: () -> Void, slow: () -> Void) {
+        quota()
+        if slowDue { slow() }
     }
 }
 
@@ -386,38 +403,53 @@ enum Fetcher {
             if isWeek { sawWeek = true }
 
             let label = isFive ? "5 小时窗口" : "7 天额度"
-            let invalid = "invalid \(isFive ? "5H" : "7D") quota fields"
+            let window = isFive ? "5H" : "7D"
+            let invalid = "invalid \(window) quota fields"
             if type == "CREDIT_LIMIT" && (unit == nil || (isFive && number != 5)) {
                 if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
                 continue
             }
-            guard let limit = GLMNumber.finite(row["usage"]), limit > 0,
+            let fields = ["usage", "currentValue", "remaining", "percentage"]
+            let bad = fields.filter { GLMNumber.finite(row[$0]) == nil }
+            guard bad.isEmpty, let limit = GLMNumber.finite(row["usage"]), limit > 0,
                   let used = GLMNumber.finite(row["currentValue"]), used >= 0, used <= limit,
                   let remaining = GLMNumber.finite(row["remaining"]), remaining >= 0, remaining <= limit,
                   GLMNumber.nonnegativeRoundedInteger(limit) != nil,
                   GLMNumber.nonnegativeRoundedInteger(used) != nil,
                   GLMNumber.nonnegativeRoundedInteger(remaining) != nil,
                   let percentage = GLMNumber.finite(row["percentage"]), (0...100).contains(percentage) else {
-                if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
+                var invalidFields = bad
+                if let n = GLMNumber.finite(row["usage"]), n <= 0 || GLMNumber.nonnegativeRoundedInteger(n) == nil { invalidFields.append("usage") }
+                if let n = GLMNumber.finite(row["currentValue"]), n < 0 || n > (GLMNumber.finite(row["usage"]) ?? 0) || GLMNumber.nonnegativeRoundedInteger(n) == nil { invalidFields.append("currentValue") }
+                if let n = GLMNumber.finite(row["remaining"]), n < 0 || n > (GLMNumber.finite(row["usage"]) ?? 0) || GLMNumber.nonnegativeRoundedInteger(n) == nil { invalidFields.append("remaining") }
+                if let n = GLMNumber.finite(row["percentage"]), !(0...100).contains(n) { invalidFields.append("percentage") }
+                let detail = invalidFields.joined(separator: ", ")
+                if isFive { result.fiveHourError = "invalid \(window): \(detail)" } else { result.weekError = "invalid \(window): \(detail)" }
+                continue
+            }
+            // 容许额度四舍五入误差及百分比四舍五入（各 0.5 个单位）。
+            guard abs((used + remaining) - limit) <= max(1.5, limit * 0.000001),
+                  abs(percentage - used / limit * 100) <= 0.51 + 50 / limit else {
+                if isFive { result.fiveHourError = "invalid \(window): inconsistent usage/currentValue/remaining/percentage" }
+                else { result.weekError = "invalid \(window): inconsistent usage/currentValue/remaining/percentage" }
                 continue
             }
             let reset: Date?
+            var resetError: String?
             if let rawReset = row["nextResetTime"] {
-                guard let milliseconds = GLMNumber.finite(rawReset), milliseconds > 0 else {
-                    if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
-                    continue
-                }
-                reset = Date(timeIntervalSince1970: milliseconds / 1000)
+                if let milliseconds = GLMNumber.finite(rawReset), milliseconds > 0 {
+                    reset = Date(timeIntervalSince1970: milliseconds / 1000)
+                } else { reset = nil; resetError = "invalid \(window): nextResetTime" }
             } else { reset = nil }
             let entry = LimitEntry(label: label, isFiveHour: isFive, limit: limit, used: used,
                                    remaining: remaining, usedRatio: percentage / 100, reset: reset)
             if isFive, result.fiveHour == nil {
                 result.fiveHour = entry
-                result.fiveHourError = nil
+                result.fiveHourError = resetError
             }
             if isWeek, result.week == nil {
                 result.week = entry
-                result.weekError = nil
+                result.weekError = resetError
             }
         }
         if result.fiveHour == nil && !sawFive { result.fiveHourError = "missing 5H quota" }
@@ -545,8 +577,9 @@ enum Fetcher {
 
     static func parseSubscription(_ data: Any?) -> (SubscriptionInfo?, String?) {
         guard let list = data as? [[String: Any]] else { return (nil, "unexpected payload") }
+        guard list.allSatisfy({ $0["status"] is String }) else { return (nil, "invalid subscription status") }
         guard let sub = list.first(where: { ($0["status"] as? String) == "VALID" }) else {
-            return (nil, "no valid subscription")
+            return (nil, nil)
         }
         guard let name = sub["productName"] as? String, !name.isEmpty else {
             return (nil, "invalid subscription name")
@@ -823,7 +856,7 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
     private var timer: Timer?
     private var directory: URL?
 
-    func start(script: String) {
+    func start(script: String, tag: String, appPath: String) {
         if let window = window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         do {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("usage-update-" + UUID().uuidString, isDirectory: true)
@@ -836,7 +869,7 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             #!/bin/bash
             cd "$1" || exit 1
             export UPDATE_PROGRESS_FILE="$1/progress"
-            /bin/bash "$1/update.sh" > "$1/log" 2>&1
+            /bin/bash "$1/update.sh" "$3" "$4" > "$1/log" 2>&1
             result=$?
             printf '%s' "$result" > "$1/result"
             if [ "$result" -ne 0 ] && /usr/bin/grep -q '4/5' "$1/log"; then
@@ -861,7 +894,7 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             let launch = Process()
             launch.executableURL = URL(fileURLWithPath: "/bin/launchctl")
             let jobLabel = "com.local.usage-update." + UUID().uuidString
-            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel]
+            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel, tag, appPath]
             launch.standardOutput = FileHandle.nullDevice; launch.standardError = FileHandle.nullDevice
             try launch.run(); launch.waitUntilExit()
             guard launch.terminationStatus == 0 else { throw NSError(domain: "Update", code: Int(launch.terminationStatus)) }
@@ -981,6 +1014,7 @@ enum UpdateCheck {
 final class UpdateChecker {
     static let shared = UpdateChecker()
     private(set) var available = false
+    private(set) var targetTag: String?
     private var etag: String?
     private var lastCheck: Date?
     private var inFlight = false
@@ -1017,8 +1051,10 @@ final class UpdateChecker {
                     self.hasValidResult = true
                     if let tag = UpdateCheck.latestDownloadableTag(in: releases) {
                         self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
+                        self.targetTag = self.available ? tag : nil
                     } else {
                         self.available = false
+                        self.targetTag = nil
                     }
                     if let e = http?.value(forHTTPHeaderField: "ETag"), !e.isEmpty { self.etag = e }
                 } else { self.lastError = "检查失败，请稍后重试" }
@@ -1160,6 +1196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var usage = UsageData()
     private var cycle = 0
     private let refreshGate = RefreshGate()
+    private let quotaGate = RefreshGate()
     // 菜单打开期间不重建菜单（避免打开中的菜单被替换闪断），关闭时补一次
     private var menuOpen = false
     private var pendingMenuRebuild = false
@@ -1256,8 +1293,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     // 拉取数据
     private func refresh(tokens: Bool, manual: Bool = false) {
-        guard refreshGate.begin(manual: manual) else { return }
-        performRefresh(tokens: tokens || manual)
+        GLMRefreshDispatch.start(slowDue: tokens || manual, quota: { refreshQuota(manual: manual) }, slow: {
+            guard refreshGate.begin(manual: manual) else { return }
+            performRefresh(tokens: true)
+        })
+    }
+
+    private func refreshQuota(manual: Bool) {
+        guard quotaGate.begin(manual: manual) else { return }
+        guard let key = CredStore.loadApiKey() else {
+            var failed = UsageData()
+            failed.fiveHourError = "未找到 ZCode 凭证"; failed.weekError = failed.fiveHourError
+            failed.quotaError = failed.fiveHourError
+            finishQuota(failed)
+            return
+        }
+        Fetcher.fetchQuota(apiKey: key) { [weak self] data in
+            DispatchQueue.main.async { self?.finishQuota(data) }
+        }
+    }
+
+    private func finishQuota(_ fresh: UsageData) {
+        let now = Date()
+        let five = GLMFreshness.apply(fresh: fresh.fiveHour, failure: fresh.fiveHourError,
+            old: usage.fiveHour, oldLastOK: fiveHourLastOK, oldError: usage.fiveHourError, now: now)
+        usage.fiveHour = five.value; fiveHourLastOK = five.lastOK; usage.fiveHourError = fresh.fiveHour != nil ? fresh.fiveHourError : five.error
+        let week = GLMFreshness.apply(fresh: fresh.week, failure: fresh.weekError,
+            old: usage.week, oldLastOK: weekLastOK, oldError: usage.weekError, now: now)
+        usage.week = week.value; weekLastOK = week.lastOK; usage.weekError = fresh.week != nil ? fresh.weekError : week.error
+        if fresh.fiveHour != nil || fresh.week != nil { usage.quotaError = nil }
+        else if let error = fresh.quotaError { usage.quotaError = error }
+        usage.level = fresh.level ?? usage.level
+        updateUI()
+        if quotaGate.finish() {
+            _ = quotaGate.finish()
+            refreshQuota(manual: false)
+        }
     }
 
     private func performRefresh(tokens: Bool) {
@@ -1283,19 +1354,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         let accumulator = RefreshAccumulator()
         let group = DispatchGroup()
-
-        group.enter()
-        Fetcher.fetchQuota(apiKey: key) { r in
-            accumulator.update { current in
-                current.fiveHour = r.fiveHour
-                current.week = r.week
-                current.level = r.level
-                current.quotaError = r.quotaError
-                current.fiveHourError = r.fiveHourError
-                current.weekError = r.weekError
-            }
-            group.leave()
-        }
 
         if tokens {
             let now = Date()
@@ -1358,7 +1416,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             Fetcher.fetchSubscription(apiKey: key) { r, err in
                 accumulator.update { current in
                     current.subscription = r
-                    current.subscriptionError = r == nil ? (err ?? "no data") : nil
+                    current.subscriptionSucceeded = err == nil
+                    current.subscriptionError = err
                 }
                 wg.leave()
             }
@@ -1374,16 +1433,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     private func finishRefresh(_ fresh: UsageData, tokens: Bool) {
         let now = Date()
-        let five = GLMFreshness.apply(fresh: fresh.fiveHour, failure: fresh.fiveHourError,
-            old: usage.fiveHour, oldLastOK: fiveHourLastOK, oldError: usage.fiveHourError, now: now)
-        usage.fiveHour = five.value; fiveHourLastOK = five.lastOK; usage.fiveHourError = five.error
-        let week = GLMFreshness.apply(fresh: fresh.week, failure: fresh.weekError,
-            old: usage.week, oldLastOK: weekLastOK, oldError: usage.weekError, now: now)
-        usage.week = week.value; weekLastOK = week.lastOK; usage.weekError = week.error
-        if fresh.fiveHour != nil || fresh.week != nil { usage.quotaError = nil }
-        else if let error = fresh.quotaError { usage.quotaError = error }
-        usage.level = fresh.level ?? usage.level
-
         if tokens {
             let today = GLMFreshness.apply(fresh: fresh.tokensToday, failure: fresh.tokensTodayError,
                 old: usage.tokensToday, oldLastOK: tokensTodayLastOK, oldError: usage.tokensTodayError, now: now)
@@ -1411,9 +1460,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             if let error = fresh.resetCardsError { usage.resetCardsError = error }
             else if fresh.resetCards != nil { usage.resetCardsError = nil }
 
-            let sub = GLMFreshness.apply(fresh: fresh.subscription, failure: fresh.subscriptionError,
-                old: usage.subscription, oldLastOK: subscriptionLastOK, oldError: usage.subscriptionError, now: now)
-            usage.subscription = sub.value; subscriptionLastOK = sub.lastOK; usage.subscriptionError = sub.error
+            let subscription = GLMSubscriptionFreshness.apply(fresh: fresh.subscription, succeeded: fresh.subscriptionSucceeded,
+                failure: fresh.subscriptionError, old: usage.subscription, oldLastOK: subscriptionLastOK,
+                oldError: usage.subscriptionError, now: now)
+            usage.subscription = subscription.0; subscriptionLastOK = subscription.1; usage.subscriptionError = subscription.2
         }
 
         let tokenErrors = [usage.tokensTodayError, usage.tokens7dError, usage.tokens30dError, usage.toolsError]
@@ -1433,7 +1483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     // 数据到位时若菜单仍打开，重建延迟到关闭后，下次打开即为最新
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
-        refresh(tokens: false, manual: true)
+        refresh(tokens: false)
         checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
     }
 
@@ -1722,7 +1772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     @objc private func togglePanel() {
         if popover.isShown { popover.performClose(nil); return }
-        if !preview { refresh(tokens: false, manual: true); checkForUpdate() }
+        if !preview { refresh(tokens: false); checkForUpdate() }
         rebuildMenu()
         if let button = statusItem.button {
             let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
@@ -1880,7 +1930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             let ratio = entry?.usedRemainingRatio
             let pct = label(Fmt.pct(ratio), size: 12, bold: true, color: GLMRemainingColor.color(ratio)); pct.widthAnchor.constraint(equalToConstant: 34).isActive = true; r.addArrangedSubview(pct)
             let bar = GLMQuotaBar(ratio); bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true; r.addArrangedSubview(bar)
-            let reset = label(entry?.reset.map { Fmt.fullTime.string(from: $0) } ?? "--", size: 10, bold: true)
+            let reset = label(entry?.reset.map { Fmt.fullTime.string(from: $0) } ?? "时间未知", size: 10, bold: true)
             reset.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
             reset.alignment = .right
             reset.lineBreakMode = .byTruncatingTail
@@ -1889,7 +1939,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             reset.setContentCompressionResistancePriority(.required, for: .horizontal); r.addArrangedSubview(reset); add(r)
             if let e = entry { add(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
             else { add(label("暂无数据", color: .secondaryLabelColor)) }
-            if let e = error { add(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
+            if let e = error { add(label("\(entry == nil ? "刷新失败" : "部分数据异常")：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
             else if stale { add(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
         }
         if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
@@ -2234,7 +2284,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         guard let script = Bundle.main.path(forResource: "update", ofType: "sh") else {
             NSWorkspace.shared.open(UpdateCheck.releasesPage); return
         }
-        UpdateProgressController.shared.start(script: script)
+        guard let tag = UpdateChecker.shared.targetTag else { return }
+        UpdateProgressController.shared.start(script: script, tag: tag, appPath: Bundle.main.bundleURL.path)
     }
 
     @objc private func onQuit() { NSApp.terminate(nil) }
@@ -2255,6 +2306,7 @@ func onceMode() {
         acc.update { current in
             current.fiveHour = r.fiveHour; current.week = r.week
             current.level = r.level; current.quotaError = r.quotaError
+            current.fiveHourError = r.fiveHourError; current.weekError = r.weekError
         }
         group.leave()
     }
@@ -2304,7 +2356,8 @@ func onceMode() {
     Fetcher.fetchSubscription(apiKey: key) { r, err in
         acc.update { current in
             current.subscription = r
-            current.subscriptionError = r == nil ? (err ?? "?") : nil
+            current.subscriptionSucceeded = err == nil
+            current.subscriptionError = err
         }
         group.leave()
     }
@@ -2316,7 +2369,7 @@ func onceMode() {
     func line(_ e: LimitEntry?) -> String {
         guard let e = e else { return "--" }
         var s = "remaining=\(Fmt.pctLong(e.usedRemainingRatio)) used=\(Fmt.credits(e.used))/\(Fmt.credits(e.limit))"
-        if e.reset != nil { s += " reset=\(Fmt.dayTime(e.reset))" }
+        s += " reset=\(e.reset.map { Fmt.dayTime($0) } ?? "未知")"
         return s
     }
     let pk = Peak.evaluate()
@@ -2352,7 +2405,10 @@ func onceMode() {
         if let exp = sub.expireDate { s += " expire=\(Fmt.fullSec.string(from: exp))" }
         print(s)
     }
+    if data.subscriptionSucceeded && data.subscription == nil { print("subscription: no valid subscription") }
     if let e = data.subscriptionError { print("subscription error: \(e)") }
+    if let e = data.fiveHourError { print("5h quota: \(e)") }
+    if let e = data.weekError { print("7d quota: \(e)") }
     if let e = data.quotaError { print("quota error: \(e)") }
     print("lastOK: quota=\(Fmt.lastOK(quotaOK)) tokens=\(Fmt.lastOK(tokensOK))")
     exit(0)
@@ -2398,6 +2454,21 @@ enum GLMOfflineRegression {
             try expect(partial.week?.used == 100 && partial.weekError == nil,
                        "valid 7D quota was discarded with invalid 5H")
 
+            let badReset = Fetcher.parseQuota(["limits": [
+                ["type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 100,
+                 "currentValue": 20, "remaining": 80, "percentage": 20, "nextResetTime": "bad"],
+                ["type": "CREDIT_LIMIT", "unit": 6, "number": 7, "usage": 400,
+                 "currentValue": 100, "remaining": 300, "percentage": 25]
+            ]], error: nil, now: now)
+            try expect(badReset.fiveHour?.remaining == 80 && badReset.fiveHour?.reset == nil
+                       && (badReset.fiveHourError?.contains("nextResetTime") ?? false)
+                       && badReset.weekError == nil, "bad reset suppressed quota or contaminated other window")
+            for (remaining, percentage, rejected) in [(80.0, 20.0, false), (79.0, 20.4, false),
+                                                        (10.0, 20.0, true), (80.0, 80.0, true)] {
+                let value = Fetcher.parseQuota(["limits": [["type": "CREDIT_LIMIT", "unit": 3, "number": 5,
+                    "usage": 100, "currentValue": 20, "remaining": remaining, "percentage": percentage]]], error: nil, now: now)
+                try expect((value.fiveHour == nil) == rejected, "quota consistency/rounding check failed")
+            }
             let reverse = Fetcher.parseQuota(["limits": [
                 ["type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 100,
                  "currentValue": 0, "remaining": 100, "percentage": 0],
@@ -2490,6 +2561,28 @@ enum GLMOfflineRegression {
             try expect(GLMFreshness.availableCards([now.addingTimeInterval(-1), now.addingTimeInterval(30)],
                 now: now).count == 1, "expired cached card remained available")
 
+            let emptySubscription = Fetcher.parseSubscription([["status": "EXPIRED", "productName": "Old"]])
+            try expect(emptySubscription.0 == nil && emptySubscription.1 == nil, "no active subscription must be a successful empty result")
+            try expect(Fetcher.parseSubscription([["productName": "Old"]]).1 != nil, "missing subscription status accepted")
+            let oldSub = SubscriptionInfo(name: "Old", expireDate: now)
+            let oldDate = now.addingTimeInterval(-300)
+            let cleared = GLMSubscriptionFreshness.apply(fresh: nil, succeeded: true, failure: nil,
+                old: oldSub, oldLastOK: oldDate, oldError: "old error", now: now)
+            try expect(cleared.0 == nil && cleared.1 == now && cleared.2 == nil, "empty subscription did not clear old data")
+            let retained = GLMSubscriptionFreshness.apply(fresh: nil, succeeded: false, failure: "network",
+                old: oldSub, oldLastOK: oldDate, oldError: nil, now: now)
+            try expect(retained.0?.name == "Old" && retained.0?.expireDate == now && retained.1 == oldDate
+                       && retained.2 == "network", "failed subscription did not retain old data and freshness")
+            let slowEntered = DispatchSemaphore(value: 0), releaseSlow = DispatchSemaphore(value: 0)
+            let quotaArrived = DispatchSemaphore(value: 0)
+            GLMRefreshDispatch.start(slowDue: true, quota: {
+                DispatchQueue.global().async { quotaArrived.signal() }
+            }, slow: {
+                DispatchQueue.global().async { slowEntered.signal(); releaseSlow.wait() }
+            })
+            try expect(slowEntered.wait(timeout: .now() + 2) == .success && quotaArrived.wait(timeout: .now() + 2) == .success,
+                       "quota was blocked by delayed slow request")
+            releaseSlow.signal()
             let subscription = Fetcher.parseSubscription([[
                 "status": "VALID", "productName": "Pro",
                 "valid": "2026-09-26 18:18:52-2027-09-26 10:00:00"
