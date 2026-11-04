@@ -405,8 +405,10 @@ enum Fetcher {
                 if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
                 continue
             }
+            // currentValue 允许超过 usage：周额度用尽后服务端会返回 60004/60000 这类超额值
+            // （percentage=100、remaining=0），属于合法状态，不应把整个窗口判为非法
             guard let limit = GLMNumber.finite(row["usage"]), limit > 0,
-                  let used = GLMNumber.finite(row["currentValue"]), used >= 0, used <= limit,
+                  let used = GLMNumber.finite(row["currentValue"]), used >= 0,
                   let remaining = GLMNumber.finite(row["remaining"]), remaining >= 0, remaining <= limit,
                   GLMNumber.nonnegativeRoundedInteger(limit) != nil,
                   GLMNumber.nonnegativeRoundedInteger(used) != nil,
@@ -2423,6 +2425,14 @@ enum GLMOfflineRegression {
                        "invalid 5H quota was not rejected")
             try expect(partial.week?.used == 100 && partial.weekError == nil,
                        "valid 7D quota was discarded with invalid 5H")
+            // 超额用尽（currentValue > usage）是服务端合法状态：应保留窗口并显示 100% 已用
+            let overUsed = Fetcher.parseQuota(["limits": [
+                ["type": "CREDIT_LIMIT", "unit": 6, "number": 1, "usage": 60_000,
+                 "currentValue": 60_004, "remaining": 0, "percentage": 100]
+            ]], error: nil, now: now)
+            try expect(overUsed.week?.usedRatio == 1 && overUsed.week?.remaining == 0
+                       && overUsed.weekError == nil,
+                       "over-quota (currentValue > usage) window was rejected")
 
             let reverse = Fetcher.parseQuota(["limits": [
                 ["type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 100,
