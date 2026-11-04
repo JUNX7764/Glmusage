@@ -50,3 +50,4 @@ GLM Coding Plan 用量菜单栏工具（对标 `~/Documents/kimi/workspace/kimi-
 工作区内容变化后（新增项目、引入构建工具），用 Edit 更新对应章节，不要整篇重写。
 
 - 就地更新脚本接口：`update.sh <目标 tag> <当前 app 路径>`；仅处理目标副本，严格验证目标版本及实际加载的 LaunchAgent，检测其他运行副本时安全中止。离线脚本回归运行 `python3 -m unittest tests/script_test.py`。
+- 更新进度在面板内原位展示（更新按钮变进度行，不弹独立窗口、不抢占焦点）：`UpdateProgressController` 为可订阅状态机，`Process` + `nohup` 直启子进程保留 TCC 责任应用归属（不要改回 `launchctl submit` 裸 shell：责任进程变成 `/bin/bash` 会导致换包 `mv` 被 `Operation not permitted` 拒绝）；关闭面板不中断更新，重开按状态恢复进度行；失败保留 alert 与 `usage-update-*/log` 日志兜底。预览参数：`--preview-updating`（下载中 62%）、`--preview-updating-install`（安装重启阶段）。

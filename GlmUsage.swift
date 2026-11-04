@@ -919,17 +919,45 @@ enum Peak {
 }
 
 
-// 更新任务由独立 launchd 作业执行，应用退出换包时作业仍可完成或回滚。
-final class UpdateProgressController: NSObject, NSWindowDelegate {
+// 从应用直接启动更新子进程，保留 TCC 的责任应用归属。
+// nohup 与独立的临时脚本确保应用退出换包后，子进程仍能完成更新或回滚。
+// 进度在下拉面板内原位展示（更新按钮变进度行），不再弹独立窗口、不抢占焦点：
+// 任务与 UI 解耦，关闭面板不影响更新，重开面板时根据这里的状态恢复进度行；
+// 失败另用 alert 兜底，因为那一刻面板可能已经关闭。
+final class UpdateProgressController: NSObject {
     static let shared = UpdateProgressController()
-    private var window: NSWindow?
-    private var progress: NSProgressIndicator?
-    private var status: NSTextField?
+    static let didChangeNotification = Notification.Name("GlmUsage.UpdateProgress.didChange")
+
+    enum Phase: Equatable {
+        case idle, preparing, downloading, verifying, staging, installing, finished, failed
+    }
+
+    private(set) var phase: Phase = .idle
+    private(set) var fraction: Double = 0   // 仅 downloading 阶段有意义，0–100
+    /// 进行中（含安装重启阶段）；失败/结束后恢复为可点击的更新按钮
+    var isActive: Bool { [.preparing, .downloading, .verifying, .staging, .installing].contains(phase) }
+    var statusLine: String {
+        switch phase {
+        case .idle: return ""
+        case .preparing: return "正在准备更新…"
+        case .downloading: return "正在下载更新… \(Int(fraction))%"
+        case .verifying: return "正在校验更新…"
+        case .staging: return "正在准备安装…"
+        case .installing: return "正在安装并重启…"
+        case .finished: return "更新完成，正在重启…"
+        case .failed: return "更新失败"
+        }
+    }
+    /// 安装阶段的重启预告：用户需要知道应用即将自己退出，不是异常消失
+    var detailLine: String? {
+        phase == .installing ? "应用将自动退出并重启，无需手动操作" : nil
+    }
+
     private var timer: Timer?
     private var directory: URL?
 
     func start(script: String, tag: String, appPath: String) {
-        if let window = window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        guard !isActive else { return }   // 进度行已替换按钮，这里再兜底防重入
         do {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("usage-update-" + UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -941,73 +969,155 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             #!/bin/bash
             cd "$1" || exit 1
             export UPDATE_PROGRESS_FILE="$1/progress"
-            /bin/bash "$1/update.sh" "$3" "$4" > "$1/log" 2>&1
+            /bin/bash "$1/update.sh" "$2" "$3" > "$1/log" 2>&1
             result=$?
             printf '%s' "$result" > "$1/result"
             if [ "$result" -ne 0 ] && /usr/bin/grep -q '4/5' "$1/log"; then
-                /usr/bin/osascript -e 'display dialog "更新失败，已尝试恢复旧版本。请重新打开应用后重试。" with title "更新失败" buttons {"好"} default button 1 with icon caution' >/dev/null 2>&1
+                detail=$(/usr/bin/grep '!!' "$1/log" | /usr/bin/tail -1)
+                /usr/bin/osascript - "${detail:-更新未完成，请查看日志。}" "$1/log" <<'APPLESCRIPT' >/dev/null 2>&1
+            on run argv
+                display dialog ((item 1 of argv) & return & return & "日志：" & (item 2 of argv)) with title "更新失败" buttons {"好"} default button 1 with icon caution
+            end run
+            APPLESCRIPT
             fi
             if [ "$result" -eq 0 ]; then /bin/sleep 5; /bin/rm -rf "$1"; fi
-            /bin/launchctl remove "$2" >/dev/null 2>&1
             exit "$result"
             """
             try wrapperText.write(to: wrapper, atomically: true, encoding: .utf8)
-            let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 370, height: 130), styleMask: [.titled], backing: .buffered, defer: false)
-            win.title = "软件更新"
-            win.isReleasedWhenClosed = false
-            win.delegate = self
-            let label = NSTextField(labelWithString: "正在准备更新…")
-            label.frame = NSRect(x: 24, y: 78, width: 322, height: 24)
-            let bar = NSProgressIndicator(frame: NSRect(x: 24, y: 43, width: 322, height: 18))
-            bar.style = .bar; bar.isIndeterminate = true; bar.startAnimation(nil)
-            win.contentView?.addSubview(label); win.contentView?.addSubview(bar)
-            status = label; progress = bar; window = win
-            win.center(); win.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+            phase = .preparing
+            fraction = 0
+            notify()
             let launch = Process()
-            launch.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            let jobLabel = "com.local.usage-update." + UUID().uuidString
-            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel, tag, appPath]
+            launch.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+            launch.arguments = ["/bin/bash", wrapper.path, dir.path, tag, appPath]
+            launch.currentDirectoryURL = dir
+            launch.standardInput = FileHandle.nullDevice
             launch.standardOutput = FileHandle.nullDevice; launch.standardError = FileHandle.nullDevice
-            try launch.run(); launch.waitUntilExit()
-            guard launch.terminationStatus == 0 else { throw NSError(domain: "Update", code: Int(launch.terminationStatus)) }
+            try launch.run()
             timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.refresh() }
         } catch {
             finishError("无法启动更新，请稍后重试。")
         }
     }
 
+    private func notify() {
+        NotificationCenter.default.post(name: Self.didChangeNotification, object: self)
+    }
+
+    private func setPhase(_ newPhase: Phase, fraction newFraction: Double? = nil) {
+        let changed = phase != newPhase || (newFraction.map { $0 != fraction } ?? false)
+        phase = newPhase
+        if let newFraction = newFraction { fraction = newFraction }
+        if changed { notify() }
+    }
+
     private func refresh() {
         guard let dir = directory else { return }
         let log = (try? String(contentsOf: dir.appendingPathComponent("log"), encoding: .utf8)) ?? ""
-        if log.contains("4/5") { status?.stringValue = "正在安装并重启…"; indeterminate() }
-        else if log.contains("3/5") { status?.stringValue = "正在准备安装…"; indeterminate() }
-        else if log.contains("2/5") { status?.stringValue = "正在校验更新…"; indeterminate() }
+        if log.contains("4/5") || log.contains("5/5") { setPhase(.installing) }
+        else if log.contains("3/5") { setPhase(.staging) }
+        else if log.contains("2/5") { setPhase(.verifying) }
         else if log.contains("下载 v") {
-            status?.stringValue = "正在下载更新…"
+            var value: Double?
             if let text = try? String(contentsOf: dir.appendingPathComponent("progress"), encoding: .utf8),
                let regex = try? NSRegularExpression(pattern: #"([0-9]+(?:\.[0-9]+)?)%"#),
                let match = regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).last,
-               let range = Range(match.range(at: 1), in: text), let value = Double(text[range]) {
-                progress?.stopAnimation(nil); progress?.isIndeterminate = false
-                progress?.minValue = 0; progress?.maxValue = 100; progress?.doubleValue = value
-                status?.stringValue = "正在下载更新… \(Int(value))%"
+               let range = Range(match.range(at: 1), in: text) {
+                value = Double(text[range])
+            }
+            setPhase(.downloading, fraction: value)   // 百分比尚未写出时保留旧值
+        }
+        if let result = try? String(contentsOf: dir.appendingPathComponent("result"), encoding: .utf8) {
+            if result != "0" {
+                let detail = log.components(separatedBy: .newlines).last(where: { $0.contains("!!") }) ?? "请检查网络后重试。"
+                finishError(detail.replacingOccurrences(of: "!! ", with: ""))
+            } else {
+                // 正常路径下旧进程已被脚本替换重启，走不到这里；兜底停止轮询
+                timer?.invalidate(); timer = nil
+                setPhase(.finished)
             }
         }
-        if let result = try? String(contentsOf: dir.appendingPathComponent("result"), encoding: .utf8), result != "0" {
-            let detail = log.components(separatedBy: .newlines).last(where: { $0.contains("!!") }) ?? "请检查网络后重试。"
-            finishError(detail.replacingOccurrences(of: "!! ", with: ""))
-        }
     }
-    private func indeterminate() {
-        guard progress?.isIndeterminate == false else { return }
-        progress?.isIndeterminate = true; progress?.startAnimation(nil)
-    }
+
     private func finishError(_ detail: String) {
         timer?.invalidate(); timer = nil
-        window?.close(); window = nil
+        phase = .failed
+        notify()   // 先恢复面板里的更新按钮，再模态弹窗
         let alert = NSAlert(); alert.messageText = "更新失败"; alert.informativeText = detail
+        if let dir = directory { alert.informativeText += "\n\n日志：\(dir.appendingPathComponent("log").path)" }
         alert.addButton(withTitle: "好"); alert.runModal()
-        if let dir = directory { try? FileManager.default.removeItem(at: dir) }; directory = nil
+        directory = nil
+    }
+
+    /// 视觉预览专用：不启动子进程，仅呈现进行中的进度行。
+    func simulateForPreview(phase previewPhase: Phase, fraction previewFraction: Double) {
+        phase = previewPhase
+        fraction = previewFraction
+    }
+}
+
+/// 下拉面板内的更新进度行：原位替换「新版本可用」按钮。
+/// 自身订阅进度通知刷新文本与进度条，避免每 0.25s 重建整个面板；
+/// 面板关闭后重开，buildPanel 会新建本行并同步到当前进度。
+final class UpdateProgressRowView: NSView {
+    private let status = NSTextField(wrappingLabelWithString: "")
+    private let detail = NSTextField(wrappingLabelWithString: "")
+    private let bar = NSProgressIndicator()
+    private var observer: NSObjectProtocol?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        status.font = .systemFont(ofSize: 12, weight: .semibold)
+        status.maximumNumberOfLines = 1
+        status.alignment = .left
+        detail.font = .systemFont(ofSize: 10)
+        detail.textColor = .secondaryLabelColor
+        detail.alignment = .left
+        bar.style = .bar
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for view in [status, bar, detail] {
+            stack.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        observer = NotificationCenter.default.addObserver(
+            forName: UpdateProgressController.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.sync() }
+        sync()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        if let observer = observer { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    private func sync() {
+        let controller = UpdateProgressController.shared
+        status.stringValue = controller.statusLine
+        detail.stringValue = controller.detailLine ?? ""
+        detail.isHidden = controller.detailLine == nil
+        if controller.phase == .downloading {
+            if bar.isIndeterminate { bar.stopAnimation(nil) }
+            bar.isIndeterminate = false
+            bar.minValue = 0; bar.maxValue = 100
+            bar.doubleValue = controller.fraction
+        } else {
+            if !bar.isIndeterminate { bar.isIndeterminate = true }
+            bar.startAnimation(nil)
+        }
     }
 }
 
@@ -1264,6 +1374,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var mcpExpanded = true
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
+    private var updateProgressObserver: NSObjectProtocol?
+    private var updateProgressWasActive = false
     private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
@@ -1341,6 +1453,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         rebuildMenu()
         renderBar()
+        // 面板内更新进度：状态翻转时重建面板（按钮↔进度行），进度百分比由进度行自刷；
+        // 菜单栏 toolTip 同步更新状态，面板关闭时更新也在后台继续
+        updateProgressObserver = NotificationCenter.default.addObserver(
+            forName: UpdateProgressController.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.updateProgressDidChange() }
         // 状态栏底色变化（全屏进出/深浅模式切换）时立即按新外观重画两行余量，不再等下一次数据刷新；
         // 仅在明暗主题实际变化时执行（setImage 会再次触发 KVO，不去重会形成重画循环）
         attachBarAppearanceObserver()
@@ -1626,6 +1743,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；峰谷/过期 emoji 作为 badge 向左突出，正文列保持对齐
     // （⚠️ 放在峰谷 emoji 之后，不影响 Peak 判定；token 组无菜单栏行，仅在下拉菜单标注）
+    /// 进度行自己刷新文本与百分比；这里只在「进行中」状态翻转时重建面板（按钮↔进度行），
+    /// 并刷新菜单栏 toolTip。失败时面板若开着，额外给一条可重试的提示。
+    private func updateProgressDidChange() {
+        let active = UpdateProgressController.shared.isActive
+        if active != updateProgressWasActive {
+            updateProgressWasActive = active
+            rebuildMenu()
+            if !active, UpdateProgressController.shared.phase == .failed {
+                setUpdateMessage("更新失败，请检查网络后重试", dismissAfter: 8)
+            }
+        }
+        renderBar()
+    }
+
     private func renderBar() {
         let peak = Peak.evaluate()
         let fiveRemaining = usage.fiveHour?.usedRemainingRatio
@@ -1647,6 +1778,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             + " · 7天Token最后成功 \(Fmt.lastOK(tokens7dLastOK))"
             + " · 30天Token最后成功 \(Fmt.lastOK(tokens30dLastOK))"
             + " · MCP最后成功 \(Fmt.lastOK(toolsLastOK))"
+        if UpdateProgressController.shared.isActive {
+            statusItem.button?.toolTip = (statusItem.button?.toolTip ?? "")
+                + " · \(UpdateProgressController.shared.statusLine)"
+        }
         writeStatus(line1: (marks1.isEmpty ? "" : marks1.joined() + " ") + "\(line1.label) \(line1.value)",
                     line2: (marks2.isEmpty ? "" : marks2.joined() + " ") + "\(line2.label) \(line2.value)",
                     peakLine: peak.line)
@@ -2057,6 +2192,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             expandedModelWindows.insert(0)
             usage.tokensToday = ModelUsage(totalTokens: 9000000, totalCalls: 500, byModel: (1...30).map { ("glm-very-long-model-name-\($0)", Double($0 * 10000)) })
         }
+        // 更新进度行预览：updating 为下载中 62%；updating-install 为安装重启阶段（含重启预告）
+        if CommandLine.arguments.contains("--preview-updating-install") {
+            UpdateProgressController.shared.simulateForPreview(phase: .installing, fraction: 100)
+        } else if CommandLine.arguments.contains("--preview-updating") {
+            UpdateProgressController.shared.simulateForPreview(phase: .downloading, fraction: 62)
+        }
     }
 
     private func buildPanel(_ menu: NSMenu) {
@@ -2120,7 +2261,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             if let warning = warning { add(label("部分数据异常：\(warning)", color: .systemOrange)) }
             if error == nil && stale { add(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
         }
-        if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
+        // 更新进行中：原按钮位置换成进度行（重开面板也在此恢复）；空闲时才显示更新按钮
+        if UpdateProgressController.shared.isActive { add(UpdateProgressRowView()) }
+        else if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
         let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor); resetHeading.alignment = .right; add(resetHeading)
         quota(usage.fiveHour, "5 小时", usage.fiveHourError, usage.fiveHourWarning, fiveHourLastOK, fiveHourStale)
         quota(usage.week, "7 天", usage.weekError, usage.weekWarning, weekLastOK, weekStale)
