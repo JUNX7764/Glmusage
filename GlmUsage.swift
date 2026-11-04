@@ -1727,12 +1727,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
     }
 
+    private func isDark(_ appearance: NSAppearance) -> Bool {
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
     /// 外观不一致既可能是按钮粘滞，也可能是深色壁纸或双屏的正常状态。
     /// 因此只重建不缓存的动态颜色图片，让实际菜单栏绘制上下文决定颜色。
     private func reconcileBarAppearance() {
         guard let button = statusItem?.button else { return }
-        let appDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let buttonDark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let appDark = isDark(NSApp.effectiveAppearance)
+        let buttonDark = isDark(button.effectiveAppearance)
         if buttonDark != appDark {
             renderBar()
         } else {
@@ -1743,7 +1747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     /// 仅当按钮解析出的明暗主题与上次渲染快照不同时才重画（防止 setImage↔KVO 循环）。
     private func renderBarIfThemeChanged() {
         guard let button = statusItem?.button else { return }
-        let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let dark = isDark(button.effectiveAppearance)
         guard dark != barThemeDark else { return }
         renderBar()
     }
@@ -1775,7 +1779,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let line2 = StackImage.Line(badge: marks2.joined(), label: "7D",
                                     value: Fmt.pct(weekRemaining), remaining: weekRemaining)
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
-        barThemeDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        barThemeDark = isDark(appearance)
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
