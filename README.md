@@ -19,7 +19,7 @@ macOS 菜单栏常驻，一瞥即知智谱 GLM Coding Plan（即 ZCode 使用的
 
 需要 macOS 13+。安装：到 [Releases](https://github.com/JUNX7764/Glmusage/releases) 下载最新 `GlmUsage.dmg`，打开后把 GlmUsage 拖进 Applications（或 `~/Applications`）双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
 
-**更新**：发布新 Release 后（每 30 分钟检查一次，打开菜单也会触发一次节流检查），菜单最上方出现「⬆ 新版本可用，点击更新」，点击即自动下载替换并重启（zip 经 SHA256 校验后才替换）。日常代码提交不会触发更新提示——只有正式发版才会。打开下拉菜单即触发一轮全量刷新；菜单打开期间不重建菜单，数据在关闭后更新、下次打开即最新。
+**更新**：发布新 Release 后（每 30 分钟检查一次，打开菜单也会触发一次节流检查），菜单最上方出现「⬆ 新版本可用，点击更新」，点击即自动下载替换并重启（zip 经 SHA256 校验后才替换）。更新检查和下载只认 `GlmUsage.zip` 与 `.sha256` 附件齐全的 Release；最新 Release 缺附件时自动选择最近的可安装版本，不会再对空 Release 发起必然 404 的下载。日常代码提交不会触发更新提示——只有正式发版才会。打开下拉菜单即触发一轮全量刷新；菜单打开期间不重建菜单，数据在关闭后更新、下次打开即最新。
 
 从源码构建（开发者，需要 Xcode Command Line Tools，未装先执行 `xcode-select --install`）：
 
@@ -27,7 +27,7 @@ macOS 菜单栏常驻，一瞥即知智谱 GLM Coding Plan（即 ZCode 使用的
 ./build.sh
 ```
 
-发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——创建本地 tag → 构建与离线自测（含 Peak）→ 签名及 DMG/zip 校验 → 推送 tag → 创建 GitHub Release。验证失败不会推送远端 tag。
+发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——创建本地 tag → 构建与离线自测（含 Peak）→ 签名及 DMG/zip 校验 → 推送 tag → 创建 GitHub Release。若同名 Release 已存在（人工创建或上次上传中断），会补传/替换完整附件。验证失败不会推送远端 tag。
 
 ## 原理
 
