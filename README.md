@@ -1,78 +1,48 @@
-# GlmUsage — GLM Coding Plan 余量菜单栏小工具
+# GlmUsage
 
-macOS 菜单栏常驻，一瞥即知智谱 GLM Coding Plan（即 ZCode 使用的订阅）的额度余量。原生 Swift 单文件实现，纯本地运行。
+**GLM Coding Plan 的剩余额度和使用情况，抬眼就能看到。**
 
-与 [KimiUsage](https://github.com/JUNX7764/kimi-usage-menubar)、[CodexUsage](https://github.com/JUNX7764/Codexusage) 是同族三件套，分别盯 Kimi / GLM / Codex 的订阅余量。
+不用反复打开网页，在 Mac 菜单栏查看还剩多少、什么时候恢复，用量面板一点即开。
 
-## 功能
+**[下载 GlmUsage](https://github.com/JUNX7764/Glmusage/releases/latest)** · macOS 13 或更高版本 · Apple Silicon
 
-- **菜单栏**：两行常驻，5H / 7D 剩余百分比
-- **额度窗口**：5 小时 / 7 天剩余比例、剩余 credits、重置时间、套餐等级
-- **Token 统计**：今天 / 近 7 天 / 近 30 天消耗与调用次数，按模型明细（服务端统计，无需扫描本地日志）
-- **MCP 工具**：近 30 天网络搜索 / 网页读取次数
-- **刷新机制**
-  - 额度每 30 秒；token / MCP / 重置卡 / 套餐每 5 分钟（源码 `tokenEveryCycles` 可调）；定时器容差 6 秒
-  - 额度窗口、各 token 时间窗、MCP、两类重置卡和套餐分别记录成功时间；字段缺失或非法时保留旧值并显示错误/过期状态
-  - 并行请求合并经串行保护；同一时间最多一轮刷新，重叠手动刷新最多再补一轮完整刷新，定时刷新重叠丢弃
 
-## 安装与更新
+**本地运行，直接查询智谱用量。**
 
-需要 macOS 13+。安装：到 [Releases](https://github.com/JUNX7764/Glmusage/releases) 下载最新 `GlmUsage.dmg`，打开后把 GlmUsage 拖进 Applications（或 `~/Applications`）双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
+<img src="docs/images/glm-usage-preview.png" alt="GlmUsage 用量面板，展示剩余额度、重置时间、重置卡和用量统计" width="370">
 
-**更新**：发布新 Release 后（每 30 分钟检查一次，打开菜单也会触发一次节流检查），菜单最上方出现「⬆ 新版本可用，点击更新」，点击后在应用内显示下载进度与安装状态，完成后自动重启（zip 经 SHA256 校验后才替换）。更新检查和下载只认 `GlmUsage.zip` 与 `.sha256` 附件齐全的 Release；最新 Release 缺附件时自动选择最近的可安装版本，不会再对空 Release 发起必然 404 的下载。日常代码提交不会触发更新提示——只有正式发版才会。打开下拉菜单即触发一轮全量刷新；菜单打开期间不重建菜单，数据在关闭后更新、下次打开即最新。
+<sub>界面展示使用示例数据。</sub>
 
-从源码构建（开发者，需要 Xcode Command Line Tools，未装先执行 `xcode-select --install`）：
+## 能做什么
 
-```bash
-./build.sh
-```
+- **看剩余额度**：菜单栏显示 5 小时和 7 天的剩余比例；点开查看剩余积分和重置时间。
+- **看使用情况**：查看今天、近 7 天和近 30 天的 Token 用量及调用次数，并可展开模型明细。
+- **看重置卡**：查看可用的 5 小时卡和周卡及其到期时间，不会自动使用。
+- **看工具和时段**：查看网络搜索、网页读取次数，以及当前峰谷时段提示。
+- **留意数据是否过期**：刷新失败时保留上次结果，并在界面提示错误或数据过期。
 
-发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——创建本地 tag → 构建与离线自测（含 Peak）→ 签名及 DMG/zip 校验 → 推送 tag → 创建 GitHub Release。若同名 Release 已存在（人工创建或上次上传中断），会补传/替换完整附件。验证失败不会推送远端 tag。
+Token 与工具用量来自服务端统计。重置卡信息需要有效的 ZCode 登录状态。
 
-## 原理
+## 安装
 
-- **凭据**：只读 ZCode 本地加密凭证库 `~/.zcode/v2/credentials.json`（AES-256-GCM，密钥派生与 ZCode 客户端一致：环境变量 `ZCODE_CREDENTIAL_SECRET` 或 `zcode-credential-fallback:darwin:<homedir>:<username>`），内存中解出订阅 api-key，不落盘、不写入本仓库
-- **接口**：智谱开放平台监控接口（与官方 glm-plan-usage 插件同源）
-  - `GET https://open.bigmodel.cn/api/monitor/usage/quota/limit`
-  - `GET https://open.bigmodel.cn/api/monitor/usage/model-usage?startTime=&endTime=`
-  - `GET https://open.bigmodel.cn/api/monitor/usage/tool-usage?startTime=&endTime=`
+1. 建议先在 Mac 上安装并登录 ZCode，确保账号有 GLM Coding Plan；也可使用 API key，详见开发者说明。
+2. 前往 [下载页面](https://github.com/JUNX7764/Glmusage/releases/latest)，下载 `GlmUsage.dmg`。
+3. 打开安装包，将 GlmUsage 拖入「应用程序」文件夹，再打开应用。图标会出现在屏幕顶部菜单栏。
 
-## 隐私与安全
+如果首次打开时 macOS 显示安全提示，可在 Finder 中右键点击 GlmUsage，选择「打开」并按提示操作。应用目前使用 ad-hoc 签名。
 
-- 纯本地运行，凭据不离开本机
-- 凭据只读解出 api-key，不落盘、不写入本仓库
+## 更新
 
-## 调试与自检
+有新版本时，菜单中会出现更新提示。点击后可在应用内查看更新进度，完成后自动重启。**从旧版首次升级到支持进度窗口的版本时，仍会出现终端窗口。**
 
-```bash
-# 离线自检：只用临时目录和离线假数据，不读 ZCode 凭据、不联网
-./GlmUsage.app/Contents/MacOS/GlmUsage --self-test
-./GlmUsage.app/Contents/MacOS/GlmUsage --peak-test
+## 数据与隐私
 
-# 脚本回归：PATH mock 故障注入，不操作真实 app、LaunchAgent 或 GitHub
-python3 -m unittest discover -s tests -p '*_test.py'
+**应用在 Mac 本地运行，不会把用量数据上传到开发者服务器。**
 
-# 真实自检：读取本机凭据、联网拉一次数据后退出
-./GlmUsage.app/Contents/MacOS/GlmUsage --once
+额度和用量由智谱或 ZCode 服务提供，查询时会发送必要的认证信息；检查更新会连接 GitHub。应用只读取 ZCode 凭据，不修改凭据文件。
 
-# 无 ZCode 凭证库时可用环境变量提供 key
-GLM_API_KEY=xxx ./GlmUsage.app/Contents/MacOS/GlmUsage --once
-```
+## 其他工具
 
-运行状态自诊断写入 `~/Library/Application Support/GlmUsage/status.json`。
+[CodexUsage](https://github.com/JUNX7764/Codexusage) · [KimiUsage](https://github.com/JUNX7764/kimi-usage-menubar)
 
-## 文件说明
-
-| 文件 | 说明 |
-|---|---|
-| `GlmUsage.swift` | 全部源码（单文件 AppKit 菜单栏应用） |
-| `build.sh` | 编译 + 打包 + ad-hoc 签名脚本 |
-| `Info.plist` | App Bundle 配置（LSUIElement = 菜单栏常驻） |
-| `scripts/icon_gen.swift` | 图标生成脚本（缺 icns 时 build.sh 自动调用） |
-| `scripts/update.sh` | 就地更新脚本（从 Release 下载替换；build.sh 随包内置进 .app Resources） |
-| `scripts/release.sh` | 发布脚本（本地 tag → 构建与测试 → 资产校验 → 推 tag → GitHub Release） |
-| `tests/script_test.py` | 更新、发布、签名故障的离线回归测试 |
-
-## License
-
-MIT
+[开发者说明](docs/DEVELOPMENT.md) · [MIT License](LICENSE)
