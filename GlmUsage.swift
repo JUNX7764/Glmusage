@@ -1435,8 +1435,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             }
             if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                    self?.togglePanel()
-                    if CommandLine.arguments.contains("--preview-popover-test") { self?.testPreviewPopover() }
+                    guard let self = self else { return }
+                    self.togglePanel()
+                    if CommandLine.arguments.contains("--preview-popover-test") {
+                        // 等初始 Popover 布局稳定后再量高，避免把打开时的尺寸校正算成展开明细。
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.testPreviewPopover() }
+                    }
                 }
             }
             if let i = CommandLine.arguments.firstIndex(of: "--preview-screenshot"), CommandLine.arguments.count > i + 1 {
@@ -2446,10 +2450,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let maxHeight = (statusItem.button?.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
         let height = min(maxHeight * 0.82, max(250, root.fittingSize.height + footer.fittingSize.height + 78))
         let desiredSize = NSSize(width: width, height: height)
-        // A visible popover keeps a fixed frame. Additional content scrolls until the next open.
-        if !popover.isShown {
-            panelController.preferredContentSize = desiredSize
-            if !preview || previewPopover { popover.contentSize = desiredSize }
+        // 展开/收起明细时也更新已打开的 Popover；超过最大高度后仍由 scroll view 承接。
+        panelController.preferredContentSize = desiredSize
+        if !preview || previewPopover {
+            popover.contentSize = desiredSize
+            panelController.view.layoutSubtreeIfNeeded()
         }
         DispatchQueue.main.async {
             scroll.layoutSubtreeIfNeeded()
@@ -2473,8 +2478,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         guard previewPopover && CommandLine.arguments.contains("--preview-trace") else { return }
         for delay in [0.0, 0.05, 0.2] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self = self, self.popover.isShown, let frame = self.panelController.view.window?.frame else { return }
-                print("GLM_POPOVER_TRACE \(reason) +\(delay) x=\(frame.minX) y=\(frame.minY) w=\(frame.width) h=\(frame.height)")
+                guard let self = self, self.popover.isShown, let window = self.panelController.view.window else { return }
+                let frame = window.frame
+                print("GLM_POPOVER_TRACE \(reason) +\(delay) id=\(window.windowNumber) x=\(frame.minX) y=\(frame.minY) w=\(frame.width) h=\(frame.height)")
                 fflush(stdout)
             }
         }
@@ -2486,17 +2492,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             fputs("GLM popover test: FAIL opening\n", stderr); exit(1)
         }
         let initial = window.frame
+        let initialTop = initial.maxY
+        var previousHeight = initial.height
+        var clickOffset = NSPoint.zero
         let originalController = popover.contentViewController
         let originalDocument = panelScroll.documentView
+        enum HeightChange { case increase, decrease, same }
         func buttons(_ view: NSView) -> [NSButton] {
             ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap { buttons($0) }
         }
         func fail(_ message: String) { fputs("GLM popover test: FAIL \(message)\n", stderr); exit(1) }
-        func verify(_ step: String) {
-            guard popover.isShown, panelController.view.window === window, window.frame.equalTo(initial),
+        func verify(_ step: String, _ change: HeightChange) {
+            guard popover.isShown, panelController.view.window === window,
                   popover.contentViewController === originalController, panelScroll.documentView === originalDocument else {
-                fail("frame or view identity changed at \(step)"); return
+                fail("popover closed or view identity changed at \(step)"); return
             }
+            guard abs(window.frame.maxY - initialTop) < 1 else {
+                fail("popover anchor moved at \(step)"); return
+            }
+            let delta = window.frame.height - previousHeight
+            let heightIsCorrect: Bool
+            switch change {
+            case .increase: heightIsCorrect = delta > 0.5
+            case .decrease: heightIsCorrect = delta < -0.5
+            case .same: heightIsCorrect = abs(delta) <= 0.5
+            }
+            guard heightIsCorrect else {
+                fail("unexpected height change \(delta) at \(step)"); return
+            }
+            previousHeight = window.frame.height
             print("GLM_POPOVER_TEST \(step): \(NSStringFromRect(window.frame))")
             fflush(stdout)
         }
@@ -2506,6 +2530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             }
             _ = button.scrollToVisible(button.bounds)
             panelController.view.layoutSubtreeIfNeeded()
+            clickOffset = panelScroll.contentView.bounds.origin
             let location = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
             for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
                 guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
@@ -2516,21 +2541,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 NSApp.sendEvent(event)
             }
         }
-        let steps: [() -> Void] = [
-            { click(#selector(self.toggleModels(_:)), tag: 0) },
-            { click(#selector(self.toggleModels(_:)), tag: 1) },
-            { click(#selector(self.toggleModels(_:)), tag: 2) },
-            { click(#selector(self.toggleModels(_:)), tag: 1) },
-            { click(#selector(self.toggleToken)) },
-            { click(#selector(self.toggleToken)) },
-            { click(#selector(self.toggleMCP)) },
-            { click(#selector(self.toggleMCP)) },
-            { click(#selector(self.onRefresh)) }
+        let steps: [(HeightChange, () -> Void)] = [
+            (.increase, { click(#selector(self.toggleModels(_:)), tag: 0) }),
+            (.increase, { click(#selector(self.toggleModels(_:)), tag: 1) }),
+            (.increase, { click(#selector(self.toggleModels(_:)), tag: 2) }),
+            (.decrease, { click(#selector(self.toggleModels(_:)), tag: 1) }),
+            (.decrease, { click(#selector(self.toggleToken)) }),
+            (.increase, { click(#selector(self.toggleToken)) }),
+            (.decrease, { click(#selector(self.toggleMCP)) }),
+            (.increase, { click(#selector(self.toggleMCP)) }),
+            (.increase, { click(#selector(self.onRefresh)) })
         ]
         func run(_ index: Int) {
             if index == steps.count {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    verify("async-refresh")
+                    verify("async-refresh", .same)
                     guard self.expandedModelWindows == [0, 2] else { fail("model expansion state lost"); return }
                     self.popover.performClose(nil)
                     guard !self.popover.isShown else { fail("close"); return }
@@ -2550,13 +2575,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                         print("GLM_POPOVER_TEST edge: \(NSStringFromRect(frame))")
                         self.popover.performClose(nil); host.orderOut(nil)
                     }
-                    print("GLM popover test: PASS (actual popover, controls, async refresh, close/reopen, left/right edges)")
+                    print("GLM popover test: PASS (live resize, stable anchor, scroll restoration, controls, async refresh, close/reopen, left/right edges)")
                     exit(0)
                 }
                 return
             }
-            steps[index]()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { verify("step-\(index)"); run(index + 1) }
+            steps[index].1()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                verify("step-\(index)", steps[index].0)
+                self.panelScroll.layoutSubtreeIfNeeded()
+                let clip = self.panelScroll.contentView
+                let documentHeight = self.panelScroll.documentView?.frame.height ?? clip.bounds.height
+                let maxY = max(0, documentHeight - clip.bounds.height)
+                let expectedY = min(maxY, max(0, clickOffset.y))
+                guard abs(clip.bounds.origin.y - expectedY) < 1 else {
+                    fail("scroll offset changed at step-\(index)"); return
+                }
+                run(index + 1)
+            }
         }
         run(0)
     }
