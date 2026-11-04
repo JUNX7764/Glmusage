@@ -2032,7 +2032,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 NSLayoutConstraint.activate([cells.leadingAnchor.constraint(equalTo: item.leadingAnchor), cells.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
                 if !models.isEmpty {
                     let arrow = NSImageView(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil) ?? NSImage())
-                    arrow.contentTintColor = .secondaryLabelColor; arrow.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+                    arrow.contentTintColor = .secondaryLabelColor.withAlphaComponent(0.45); arrow.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 6, weight: .light)
                     arrow.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(arrow)
                     NSLayoutConstraint.activate([arrow.trailingAnchor.constraint(equalTo: item.trailingAnchor, constant: -3), arrow.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
                 }
