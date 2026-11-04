@@ -161,6 +161,8 @@ struct UsageData {
     var tokensError: String?
     var fiveHourError: String?
     var weekError: String?
+    var fiveHourWarning: String?
+    var weekWarning: String?
     var tokensTodayError: String?
     var tokens7dError: String?
     var tokens30dError: String?
@@ -445,11 +447,11 @@ enum Fetcher {
                                    remaining: remaining, usedRatio: percentage / 100, reset: reset)
             if isFive, result.fiveHour == nil {
                 result.fiveHour = entry
-                result.fiveHourError = resetError
+                result.fiveHourWarning = resetError
             }
             if isWeek, result.week == nil {
                 result.week = entry
-                result.weekError = resetError
+                result.weekWarning = resetError
             }
         }
         if result.fiveHour == nil && !sawFive { result.fiveHourError = "missing 5H quota" }
@@ -1301,6 +1303,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     private func refreshQuota(manual: Bool) {
         guard quotaGate.begin(manual: manual) else { return }
+        performQuotaRefresh()
+    }
+
+    private func performQuotaRefresh() {
+        lastAttemptAt = Date()
         guard let key = CredStore.loadApiKey() else {
             var failed = UsageData()
             failed.fiveHourError = "未找到 ZCode 凭证"; failed.weekError = failed.fiveHourError
@@ -1317,22 +1324,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let now = Date()
         let five = GLMFreshness.apply(fresh: fresh.fiveHour, failure: fresh.fiveHourError,
             old: usage.fiveHour, oldLastOK: fiveHourLastOK, oldError: usage.fiveHourError, now: now)
-        usage.fiveHour = five.value; fiveHourLastOK = five.lastOK; usage.fiveHourError = fresh.fiveHour != nil ? fresh.fiveHourError : five.error
+        usage.fiveHour = five.value; fiveHourLastOK = five.lastOK; usage.fiveHourError = five.error
+        if fresh.fiveHour != nil { usage.fiveHourWarning = fresh.fiveHourWarning }
         let week = GLMFreshness.apply(fresh: fresh.week, failure: fresh.weekError,
             old: usage.week, oldLastOK: weekLastOK, oldError: usage.weekError, now: now)
-        usage.week = week.value; weekLastOK = week.lastOK; usage.weekError = fresh.week != nil ? fresh.weekError : week.error
+        usage.week = week.value; weekLastOK = week.lastOK; usage.weekError = week.error
+        if fresh.week != nil { usage.weekWarning = fresh.weekWarning }
         if fresh.fiveHour != nil || fresh.week != nil { usage.quotaError = nil }
         else if let error = fresh.quotaError { usage.quotaError = error }
         usage.level = fresh.level ?? usage.level
         updateUI()
-        if quotaGate.finish() {
-            _ = quotaGate.finish()
-            refreshQuota(manual: false)
-        }
+        if quotaGate.finish() { performQuotaRefresh() }
     }
 
     private func performRefresh(tokens: Bool) {
-        lastAttemptAt = Date()
         guard let key = CredStore.loadApiKey() else {
             var failed = UsageData()
             let error = "未找到 ZCode 凭证（~/.zcode/v2/credentials.json）"
@@ -1622,6 +1627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             "lastSuccess": lastSuccess,
             "stale": stale,
             "errors": errors,
+            "warnings": ["fiveHour": usage.fiveHourWarning ?? "", "week": usage.weekWarning ?? ""],
             "fiveHourRemaining": usage.fiveHour?.usedRemainingRatio ?? -1,
             "weekRemaining": usage.week?.usedRemainingRatio ?? -1,
             "level": usage.level ?? "",
@@ -1658,7 +1664,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         menu.addItem(info("GLM 余额" + (usage.level.map { "（\($0) 套餐）" } ?? "")))
         menu.addItem(.separator())
 
-        func limitLine(_ e: LimitEntry?, label: String, lastOK: Date?, stale: Bool, error: String?) -> String {
+        func limitLine(_ e: LimitEntry?, label: String, lastOK: Date?, stale: Bool, error: String?, warning: String?) -> String {
             var s = "\(label)："
             if let e = e {
                 s += "剩余 \(Fmt.pctLong(e.usedRemainingRatio))"
@@ -1667,13 +1673,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             } else { s += "暂无数据" }
             if stale { s += " · ⚠️ 数据已过期" }
             if let error = error { s += " · 刷新失败：\(error)" }
+            if let warning = warning { s += " · 部分数据异常：\(warning)" }
             if lastOK != nil, stale || error != nil { s += " · 最后成功 \(Fmt.lastOK(lastOK))" }
             return s
         }
         menu.addItem(info(limitLine(usage.fiveHour, label: "5 小时窗口", lastOK: fiveHourLastOK,
-                                  stale: fiveHourStale, error: usage.fiveHourError)))
+                                  stale: fiveHourStale, error: usage.fiveHourError, warning: usage.fiveHourWarning)))
         menu.addItem(info(limitLine(usage.week, label: "7 天额度", lastOK: weekLastOK,
-                                  stale: weekStale, error: usage.weekError)))
+                                  stale: weekStale, error: usage.weekError, warning: usage.weekWarning)))
 
         menu.addItem(.separator())
 
@@ -1924,7 +1931,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             item.heightAnchor.constraint(equalToConstant: 26).isActive = true
             return item
         }
-        func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ last: Date?, _ stale: Bool) {
+        func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool) {
             let r = row()
             let title = label(name, size: 11, bold: true); title.widthAnchor.constraint(equalToConstant: 36).isActive = true; r.addArrangedSubview(title)
             let ratio = entry?.usedRemainingRatio
@@ -1939,13 +1946,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             reset.setContentCompressionResistancePriority(.required, for: .horizontal); r.addArrangedSubview(reset); add(r)
             if let e = entry { add(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
             else { add(label("暂无数据", color: .secondaryLabelColor)) }
-            if let e = error { add(label("\(entry == nil ? "刷新失败" : "部分数据异常")：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
-            else if stale { add(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
+            if let e = error { add(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
+            if let warning = warning { add(label("部分数据异常：\(warning)", color: .systemOrange)) }
+            if error == nil && stale { add(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
         }
         if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
         let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor); resetHeading.alignment = .right; add(resetHeading)
-        quota(usage.fiveHour, "5 小时", usage.fiveHourError, fiveHourLastOK, fiveHourStale)
-        quota(usage.week, "7 天", usage.weekError, weekLastOK, weekStale)
+        quota(usage.fiveHour, "5 小时", usage.fiveHourError, usage.fiveHourWarning, fiveHourLastOK, fiveHourStale)
+        quota(usage.week, "7 天", usage.weekError, usage.weekWarning, weekLastOK, weekStale)
         if let sub = usage.subscription {
             let expiry = sub.expireDate.map { "套餐到期：\(Fmt.fullTime.string(from: $0))" } ?? "套餐到期：暂无数据"
             add(label(expiry, color: .secondaryLabelColor))
@@ -2307,6 +2315,7 @@ func onceMode() {
             current.fiveHour = r.fiveHour; current.week = r.week
             current.level = r.level; current.quotaError = r.quotaError
             current.fiveHourError = r.fiveHourError; current.weekError = r.weekError
+            current.fiveHourWarning = r.fiveHourWarning; current.weekWarning = r.weekWarning
         }
         group.leave()
     }
@@ -2409,6 +2418,8 @@ func onceMode() {
     if let e = data.subscriptionError { print("subscription error: \(e)") }
     if let e = data.fiveHourError { print("5h quota: \(e)") }
     if let e = data.weekError { print("7d quota: \(e)") }
+    if let w = data.fiveHourWarning { print("5h quota warning: \(w)") }
+    if let w = data.weekWarning { print("7d quota warning: \(w)") }
     if let e = data.quotaError { print("quota error: \(e)") }
     print("lastOK: quota=\(Fmt.lastOK(quotaOK)) tokens=\(Fmt.lastOK(tokensOK))")
     exit(0)
@@ -2461,8 +2472,12 @@ enum GLMOfflineRegression {
                  "currentValue": 100, "remaining": 300, "percentage": 25]
             ]], error: nil, now: now)
             try expect(badReset.fiveHour?.remaining == 80 && badReset.fiveHour?.reset == nil
-                       && (badReset.fiveHourError?.contains("nextResetTime") ?? false)
-                       && badReset.weekError == nil, "bad reset suppressed quota or contaminated other window")
+                       && (badReset.fiveHourWarning?.contains("nextResetTime") ?? false)
+                       && badReset.fiveHourError == nil && badReset.weekError == nil && badReset.weekWarning == nil, "bad reset suppressed quota or contaminated other window")
+            let warningFresh = GLMFreshness.apply(fresh: badReset.fiveHour, failure: badReset.fiveHourError,
+                old: nil, oldLastOK: nil, oldError: "previous failure", now: now)
+            try expect(warningFresh.value != nil && warningFresh.lastOK == now && warningFresh.error == nil,
+                       "valid quota with reset warning was treated as a failed refresh")
             for (remaining, percentage, rejected) in [(80.0, 20.0, false), (79.0, 20.4, false),
                                                         (10.0, 20.0, true), (80.0, 80.0, true)] {
                 let value = Fetcher.parseQuota(["limits": [["type": "CREDIT_LIMIT", "unit": 3, "number": 5,
