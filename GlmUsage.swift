@@ -1203,8 +1203,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var menuOpen = false
     private var pendingMenuRebuild = false
     private let launchAgentLabel = "com.local.glm-usage"
-    // token 统计每 N 个刷新周期拉一次（主循环 30s × 10 = 5 分钟；额度窗口每轮都刷）
-    private let tokenEveryCycles = 10
+    // token 统计每 N 个刷新周期拉一次（主循环 10s × 30 = 5 分钟；额度窗口每轮都刷）
+    private let tokenEveryCycles = 30
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
     private let quotaStaleAfter: TimeInterval = 600
     private let tokensStaleAfter: TimeInterval = 1800
@@ -1276,14 +1276,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         appearancePollTimer?.tolerance = 1
         refresh(tokens: true)
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.cycle += 1
             self.refresh(tokens: GLMRefreshSchedule.slowItemsDue(cycle: self.cycle,
                 every: self.tokenEveryCycles, manual: false))
         }
-        // 显式容差让系统合并定时器唤醒（Apple 节能指南建议 ≥间隔 10%；30s → 6s）
-        timer?.tolerance = 6
+        // 显式容差让系统合并定时器唤醒（Apple 节能指南建议 ≥间隔 10%；10s → 3s）
+        timer?.tolerance = 3
         // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 30 分钟；
         // 打开菜单也会触发一次（同一 interval 节流，不增加请求频率）
         updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateCheck.interval, repeats: true) { [weak self] _ in
@@ -2283,7 +2283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         refresh(tokens: true, manual: true)
     }
 
-    // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
+    // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤10s 也会兜底重建）
     private func checkForUpdate() {
         UpdateChecker.shared.check { [weak self] in self?.updateUI() }
     }
