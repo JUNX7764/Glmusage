@@ -614,38 +614,37 @@ enum StackImage {
         return (textX, badge1X, badge2X, width)
     }
 
-    private static func attributed(_ line: Line, font: NSFont,
-                                   appearance: NSAppearance) -> NSAttributedString {
+    private static func attributed(_ line: Line, font: NSFont) -> NSAttributedString {
         let result = NSMutableAttributedString(string: line.label + " ", attributes: [
             .font: font,
             .foregroundColor: NSColor.labelColor
         ])
         result.append(NSAttributedString(string: line.value, attributes: [
             .font: font,
-            .foregroundColor: GLMRemainingColor.color(line.remaining, appearance: appearance)
+            .foregroundColor: GLMRemainingColor.color(line.remaining)
         ]))
         return result
     }
 
-    static func make(line1: Line, line2: Line, appearance: NSAppearance) -> NSImage {
+    static func make(line1: Line, line2: Line) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
-        let s1 = attributed(line1, font: font, appearance: appearance)
-        let s2 = attributed(line2, font: font, appearance: appearance)
+        let s1 = attributed(line1, font: font)
+        let s2 = attributed(line2, font: font)
         let badgeAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
         let b1 = line1.badge.isEmpty ? nil : NSAttributedString(string: line1.badge, attributes: badgeAttrs)
         let b2 = line2.badge.isEmpty ? nil : NSAttributedString(string: line2.badge, attributes: badgeAttrs)
         let g = geometry(badge1Width: b1?.size().width ?? 0, badge2Width: b2?.size().width ?? 0,
                          text1Width: s1.size().width, text2Width: s2.size().width)
+        // 不钉死绘制外观：全部使用动态颜色（labelColor / GLMRemainingColor 动态包装），
+        // 由系统在每条菜单栏上绘制时按该栏外观解析——双屏两条栏底色不同也能各自正确
         let img = NSImage(size: NSSize(width: ceil(g.width), height: 21), flipped: false) { _ in
-            appearance.performAsCurrentDrawingAppearance {
-                if let x = g.badge1X { b1?.draw(at: NSPoint(x: x, y: 10.5)) }
-                if let x = g.badge2X { b2?.draw(at: NSPoint(x: x, y: 0.5)) }
-                s1.draw(at: NSPoint(x: g.textX, y: 10.5))
-                s2.draw(at: NSPoint(x: g.textX, y: 0.5))
-            }
+            if let x = g.badge1X { b1?.draw(at: NSPoint(x: x, y: 10.5)) }
+            if let x = g.badge2X { b2?.draw(at: NSPoint(x: x, y: 0.5)) }
+            s1.draw(at: NSPoint(x: g.textX, y: 10.5))
+            s2.draw(at: NSPoint(x: g.textX, y: 0.5))
             return true
         }
-        img.isTemplate = false   // 保留百分比余量颜色；标签仍随外观使用系统文本色
+        img.isTemplate = false   // 保留百分比余量颜色；动态色由系统按各屏菜单栏外观解析
         return img
     }
 }
@@ -1016,6 +1015,15 @@ final class GLMQuotaBar: NSView {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
+    // 状态栏底色随全屏进出/深浅模式翻转时，KVO 触发按新外观重画（否则浅色栏上残留白色余量文字）；
+    // setImage 也会再次触发 KVO 通知，用明暗主题快照去重防止 renderBar↔KVO 反馈循环
+    private var statusItemAppearanceObs: NSKeyValueObservation?
+    private var barThemeDark: Bool?
+    // NSStatusBarButton.effectiveAppearance 在深→浅方向有数十秒粘滞（退出全屏后按钮仍报深色，
+    // 正是"白字要点击才恢复"的根因）：每 5s 对账按钮主题 vs 系统主题，不一致时 isVisible 轻推
+    // 强制重解析；轻推限流 30s 防止闪烁。KVO 负责即时响应，对账负责兜底粘滞。
+    private var appearancePollTimer: Timer?
+    private var lastBarNudge: Date?
     private let popover = NSPopover()
     private let panelController = NSViewController()
     private let panelRoot = GLMPanelStack()
@@ -1110,6 +1118,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         rebuildMenu()
         renderBar()
+        // 状态栏底色变化（全屏进出/深浅模式切换）时立即按新外观重画两行余量，不再等下一次数据刷新；
+        // 仅在明暗主题实际变化时执行（setImage 会再次触发 KVO，不去重会形成重画循环）
+        attachBarAppearanceObserver()
+        appearancePollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.reconcileBarAppearance()
+        }
+        appearancePollTimer?.tolerance = 1
         refresh(tokens: true)
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -1340,6 +1355,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         isStale(subscriptionLastOK, hasData: usage.subscription != nil, after: 900)
     }
 
+    private func attachBarAppearanceObserver() {
+        statusItemAppearanceObs = statusItem.button?.observe(\.effectiveAppearance) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.renderBarIfThemeChanged() }
+        }
+    }
+
+    /// 按钮/系统主题对账：粘滞（按钮仍报旧主题）时轻推状态栏项强制重解析，再按需重画
+    private func reconcileBarAppearance() {
+        guard let button = statusItem?.button else { return }
+        let appDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let buttonDark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if buttonDark != appDark,
+           lastBarNudge.map({ Date().timeIntervalSince($0) >= 30 }) ?? true {
+            lastBarNudge = Date()
+            statusItem.isVisible = false
+            statusItem.isVisible = true
+            // isVisible 切换可能重建按钮实例，重新挂 KVO
+            attachBarAppearanceObserver()
+        }
+        renderBarIfThemeChanged()
+    }
+
+    /// 仅当按钮解析出的明暗主题与上次渲染快照不同时才重画（防止 setImage↔KVO 循环）
+    private func renderBarIfThemeChanged() {
+        guard let button = statusItem?.button else { return }
+        let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        guard dark != barThemeDark else { return }
+        renderBar()
+    }
+
     // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；峰谷/过期 emoji 作为 badge 向左突出，正文列保持对齐
     // （⚠️ 放在峰谷 emoji 之后，不影响 Peak 判定；token 组无菜单栏行，仅在下拉菜单标注）
     private func renderBar() {
@@ -1353,7 +1398,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let line2 = StackImage.Line(badge: marks2.joined(), label: "7D",
                                     value: Fmt.pct(weekRemaining), remaining: weekRemaining)
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
-        statusItem.button?.image = StackImage.make(line1: line1, line2: line2, appearance: appearance)
+        barThemeDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = "GLM 余额 · 5H最后成功 \(Fmt.lastOK(fiveHourLastOK))"
@@ -2447,7 +2493,7 @@ enum GLMOfflineRegression {
                 try expect(green.map { $0.greenComponent > $0.redComponent
                                       && $0.greenComponent > $0.blueComponent } == true,
                            "99% remaining did not resolve to green for \(name.rawValue)")
-                let image = StackImage.make(line1: previewLine, line2: previewLine, appearance: appearance)
+                let image = StackImage.make(line1: previewLine, line2: previewLine)
                 try expect(!image.isTemplate && image.size.width > 0 && image.tiffRepresentation != nil,
                            "menu bar color image did not render for \(name.rawValue)")
             }
