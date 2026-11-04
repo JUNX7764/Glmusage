@@ -1033,6 +1033,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var expandedModelWindows: Set<Int> = []
     private var mcpExpanded = true
     private var updateMessage: String?
+    private var updateMessageDismissal: DispatchWorkItem?
     private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
@@ -1620,13 +1621,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         rebuildMenu()
     }
     @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildMenu() }
+    // 版本点击等临时状态行；dismissAfter 到点后自动清除（与 CodexUsage 一致）
+    private func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
+        updateMessageDismissal?.cancel()
+        updateMessageDismissal = nil
+        updateMessage = message
+        rebuildMenu()
+        if message != nil, let delay = dismissAfter {
+            let dismissal = DispatchWorkItem { [weak self] in self?.setUpdateMessage(nil) }
+            updateMessageDismissal = dismissal
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: dismissal)
+        }
+    }
+
     @objc private func manualUpdate() {
-        if preview { updateMessage = "预览：当前已是最新版本"; rebuildMenu(); return }
-        updateMessage = "正在检查更新…"; rebuildMenu()
+        if preview { setUpdateMessage("预览：当前已是最新版本", dismissAfter: 3); return }
+        setUpdateMessage("正在检查更新…")
         UpdateChecker.shared.check(force: true) { [weak self] in
             guard let self = self else { return }
-            self.updateMessage = UpdateChecker.shared.lastError ?? (UpdateChecker.shared.available ? "发现新版本" : "当前已是最新版本")
-            self.rebuildMenu()
+            let message = UpdateChecker.shared.lastError ?? (UpdateChecker.shared.available ? "发现新版本" : "当前已是最新版本")
+            self.setUpdateMessage(message, dismissAfter: 3)
         }
     }
 
@@ -2015,7 +2029,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     }
 
     @objc private func onToggleLogin() {
-        if preview { updateMessage = "预览模式不会修改开机自启"; rebuildMenu(); return }
+        if preview { setUpdateMessage("预览模式不会修改开机自启"); return }
         if isLoginItemEnabled() {
             try? FileManager.default.removeItem(atPath: launchAgentPath)
         } else {
@@ -2043,12 +2057,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     @objc private func onRefresh() {
         if preview {
             if previewPopover {
-                updateMessage = "正在刷新预览…"; rebuildMenu()
+                setUpdateMessage("正在刷新预览…")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self = self else { return }
-                    self.updateMessage = "预览数据已刷新"; self.rebuildMenu()
+                    self.setUpdateMessage("预览数据已刷新")
                 }
-            } else { updateMessage = "预览数据已刷新"; rebuildMenu() }
+            } else { setUpdateMessage("预览数据已刷新") }
             return
         }
         refresh(tokens: true, manual: true)
