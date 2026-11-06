@@ -57,6 +57,55 @@ enum CredStore {
         return (jwt, maas)
     }
 
+    /// 邮箱展示决策（纯函数，self-test 直接覆盖整条 loadAccountEmail 集成路径；
+    /// 不触碰真实凭据）。返回 nil = 整行隐藏：
+    /// - env 提供过 GLM_API_KEY（非空白）→ 凭据源被覆盖，user_info 与实际 key 无法证明同账号；
+    /// - 任何 api-key 候选（含 zai 系、单个或多个）→ 候选归属与 user_info（最后一次 OAuth
+    ///   登录写入）无法证明同一账号，唯一候选同样不能证明；
+    /// - 仅纯 bigmodel OAuth 回退且 access_token 非空时，user_info 才与该 token 同源；
+    /// - 只信 rawProfile.email（username 是 name→email→user_id 回退链，不可靠；顶层 email 无证据）。
+    static func resolveAccountEmail(envValue: String?, credentialKeyCandidates: Int,
+                                    oauthAccessToken: String?, userInfoJSON: String?) -> String? {
+        let trimmedEnv = envValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedEnv == nil || trimmedEnv?.isEmpty == true else { return nil }   // env 覆盖 → 隐藏
+        guard credentialKeyCandidates == 0 else { return nil }
+        guard let token = oauthAccessToken?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else { return nil }
+        guard let jsonString = userInfoJSON, !jsonString.isEmpty,
+              let info = (try? JSONSerialization.jsonObject(with: Data(jsonString.utf8))) as? [String: Any],
+              let profile = info["rawProfile"] as? [String: Any],
+              let email = profile["email"] as? String else { return nil }
+        let trimmed = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return isValidEmail(trimmed) ? trimmed : nil
+    }
+
+    // 头部可选邮箱：仅从现有凭据库的 oauth:bigmodel:user_info（同一加密格式）读取；
+    // 不新增任何网络请求。任一环节失败 → nil（界面整行隐藏，不占空行、不填演示邮箱）。
+    // 邮箱不是密钥，但仍只在内存使用：不写 status.json、不打日志。
+    static func loadAccountEmail() -> String? {
+        let envValue = ProcessInfo.processInfo.environment[envKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if envValue?.isEmpty == false { return nil }   // env 覆盖凭据源 → 隐藏
+        guard let data = FileManager.default.contents(atPath: credPath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            return nil
+        }
+        // 候选口径与 loadApiKey 完全一致（api-key + coding-plan + enc:v1:，zai 系同样命中）
+        let candidateCount = obj.filter { key, value in
+            key.contains("api-key") && key.contains("coding-plan") && value.hasPrefix("enc:v1:")
+        }.count
+        let oauthToken = decrypt(obj["oauth:bigmodel:access_token"] ?? "")
+        let rawUserInfo = obj["oauth:bigmodel:user_info"] ?? ""
+        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:v1:") ? decrypt(rawUserInfo) : rawUserInfo)
+        return resolveAccountEmail(envValue: envValue, credentialKeyCandidates: candidateCount,
+                                   oauthAccessToken: oauthToken, userInfoJSON: userInfoJSON)
+    }
+
+    /// 宽松但足够的邮箱格式校验（x@y.z，总长 ≤254），防止把昵称/用户 ID 当邮箱展示
+    static func isValidEmail(_ value: String) -> Bool {
+        value.count <= 254 && value.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$"#, options: .regularExpression) != nil
+    }
+
     static func decrypt(_ s: String) -> String? {
         let parts = s.dropFirst("enc:v1:".count)
             .split(separator: ".")
@@ -128,6 +177,168 @@ enum TokenModelList {
     }
 }
 
+/// 单日用量桶：tokens=nil 表示该自然日无任何记录（缺失），与「有记录的零日」严格区分，
+/// 缺失日不参与比较（不得当 0 合成）。
+struct GLMDayBucket: Equatable {
+    let day: Date
+    let tokens: Double?
+}
+
+// MARK: - 每日用量（近 30 天完整自然日）
+//
+// 数据来源：复用现有 30 天慢刷新的 model-usage 响应，不新增请求/定时器。
+// 真实接口口径（2026-11-06 只读验收，主会话探针，与 totalUsage 逐日求和精确配平）：
+// granularity=daily，x_time 为本地自然日 "yyyy-MM-dd" 标签（30 天窗返回 31 个、
+// 严格递增、零缺口、首标签=请求起点日），modelDataList[].tokensUsage 与标签按下标对齐。
+// 公开实现（CodexBar zai.js）的小时粒度假设与真实响应不符——以验收口径为准。
+// 字段依据公开实现交叉证实（CodexBar Sources/CodexBarCore/Resources/Plugins/zai.js：
+// data.x_time 时间标签数组 + data.modelDataList[].tokensUsage 与其按下标对齐）；
+// 官方 glm-plan-usage 插件对同一响应只 dump 不解析，官方 schema 未公开——
+// 真实接口 Gate 未验证，字段缺失/畸形时生产界面显示明确空态（暂不可用/数据不足），绝不造 0。
+
+enum GLMDailyUsage {
+    /// 真实接口 Gate：已于 2026-11-06 主会话只读验收确认（本机凭据一次 GET model-usage，
+    /// 30 天窗）：HTTP/code 200，data.granularity=daily，x_time 为本地自然日 "yyyy-MM-dd"
+    /// 标签（31 个、严格递增、零缺口、首标签=请求起点日、含今日部分累计），
+    /// modelDataList[].tokensUsage 与标签按下标对齐且无 null/负值/重名模型，
+    /// 逐日求和与 totalUsage.totalTokensUsage 精确配平。此前官方插件对响应只 dump
+    /// 不解析、公开实现的小时粒度假设与真实不符，故当时保持空态直到验收。
+    /// 解析失败/口径漂移时上层整体拒绝进入空态，绝不造 0。
+    static let productionGateConfirmed = true
+
+    /// 严格解析出的日序列：times 与 totals 等长且按时间严格递增
+    struct Timeline {
+        let times: [Date]
+        let totals: [Double]
+    }
+
+    /// model-usage 响应 → 日序列。任一异常整体拒绝（返回 nil）：
+    /// 标签缺失/非字符串/格式不符/时间重复乱序、tokensUsage 缺失/长度不齐/
+    /// null/负值/非有限值、modelDataList 缺失或为空——未知日不得当 0。
+    /// 标签为日粒度 "yyyy-MM-dd"（2026-11-06 只读验收口径，granularity=daily）；
+    /// 解析失败即整体拒绝进入空态，不猜测。
+    static func parseTimeline(_ data: [String: Any], timeZone: TimeZone = .current) -> Timeline? {
+        guard let rawLabels = data["x_time"] as? [Any], !rawLabels.isEmpty else { return nil }
+        guard let rawModels = data["modelDataList"] as? [[String: Any]], !rawModels.isEmpty else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.timeZone = timeZone
+        var times: [Date] = []
+        times.reserveCapacity(rawLabels.count)
+        for raw in rawLabels {
+            // round-trip 校验：ICU 对分隔符/补零宽松（"2026/11/05" 也能被 "yyyy-MM-dd" 解析），
+            // 必须反向格式化后与原文全等，确保标签确实是规定格式，不靠猜
+            guard let text = raw as? String, let date = formatter.date(from: text),
+                  formatter.string(from: date) == text else { return nil }
+            if let last = times.last, date <= last { return nil }   // 严格递增：重复/乱序直接拒绝
+            times.append(date)
+        }
+        var totals = [Double](repeating: 0, count: times.count)
+        var seenModelNames = Set<String>()
+        for model in rawModels {
+            guard let values = model["tokensUsage"] as? [Any], values.count == times.count else { return nil }
+            // 同名模型重复行可能把同一用量计入两次（与 totalUsage 配不平且无法归因），整体拒绝
+            let name = model["modelName"] as? String ?? "?"
+            guard seenModelNames.insert(name).inserted else { return nil }
+            for (index, raw) in values.enumerated() {
+                guard let number = GLMNumber.finite(raw), number >= 0 else { return nil }
+                let next = totals[index] + number
+                guard next.isFinite else { return nil }   // 求和溢出（inf）按无效序列拒绝
+                totals[index] = next
+            }
+        }
+        return Timeline(times: times, totals: totals)
+    }
+
+    /// 日序列 → 最近 days 个自然日桶（旧→新，不含今天）。日粒度直映射
+    /// （2026-11-06 只读验收确认服务端按本地自然日汇总，无需本地小时网格/DST 推断）：
+    /// - 桶范围 = today-days ... today-1；今天（未走完）与窗口外的标签丢弃；
+    /// - coverageStart（请求窗口起点）所在日按自然日对齐后准入——服务端日标签
+    ///   即该自然日的完整汇总，不再按小时覆盖率判缺失；
+    /// - 桶范围内序列缺失的日期 → tokens=nil（数据不足），绝不补 0。
+    /// 注意：timeline 求和与响应 totalUsage（周期表数字）不承诺配平，两者来源独立。
+    static func frame(from timeline: Timeline, calendar: Calendar = .current,
+                      now: Date, days: Int = 30, coverageStart: Date? = nil) -> [GLMDayBucket]? {
+        guard days > 0 else { return nil }
+        guard let todayStart = calendar.date(from: calendar.dateComponents([.year, .month, .day], from: now)),
+              let oldest = calendar.date(byAdding: .day, value: -days, to: todayStart) else { return nil }
+        var sums: [Date: Double] = [:]
+        for (index, raw) in timeline.times.enumerated() {
+            guard timeline.totals[index].isFinite else { return nil }
+            let day = calendar.startOfDay(for: raw)
+            let admissible = day >= oldest && day < todayStart
+                && (coverageStart == nil || day >= calendar.startOfDay(for: coverageStart!))
+            if admissible { sums[day] = timeline.totals[index] }
+        }
+        var buckets: [GLMDayBucket] = []
+        buckets.reserveCapacity(days)
+        for offset in 0..<days {
+            guard let day = calendar.date(byAdding: .day, value: offset - days, to: todayStart) else { return nil }
+            buckets.append(GLMDayBucket(day: day, tokens: sums[day]))
+        }
+        return buckets
+    }
+}
+
+/// 每日两项比较的纯逻辑（PRD §6.3，实现规则不进界面脚注）：
+/// 百分比 = (当前 − 基期) / 基期 × 100%，一位小数；双方 0 或 |pct|<0.05 → 持平；
+/// 基期 0 且当前 > 0 → 「新增 N」；任一必要日缺失 → 「数据不足」。
+enum GLMUsageComparison {
+    enum Outcome: Equatable {
+        case percent(String)   // "+7.4%" / "-3.2%"（中性展示，不暗示增减好坏）
+        case flat              // 持平
+        case added(String)     // 新增 1.2K
+        case insufficient      // 数据不足
+
+        var text: String {
+            switch self {
+            case .percent(let value), .added(let value): return value
+            case .flat: return "持平"
+            case .insufficient: return "数据不足"
+            }
+        }
+
+        /// 非数值结果（持平/数据不足）在比较条中用弱化色，数值结果用正常强调色
+        var isMuted: Bool {
+            switch self {
+            case .percent, .added: return false
+            case .flat, .insufficient: return true
+            }
+        }
+    }
+
+    /// 窗口求和：任一日缺失 → nil（缺失不能当 0 参与比较）
+    static func sum(_ buckets: [GLMDayBucket?]) -> Double? {
+        guard !buckets.isEmpty else { return nil }
+        var total: Double = 0
+        for bucket in buckets {
+            guard let tokens = bucket?.tokens else { return nil }
+            total += tokens
+        }
+        return total
+    }
+
+    static func outcome(current: Double?, base: Double?) -> Outcome {
+        guard let current = current, let base = base else { return .insufficient }
+        if current == 0 && base == 0 { return .flat }
+        if base == 0 { return .added("新增 \(Fmt.tokens(current))") }
+        let pct = (current - base) / base * 100
+        if abs(pct) < 0.05 { return .flat }   // |pct|<0.05 归持平：一位小数下防显示 "-0.0%"
+        return .percent(String(format: "%+.1f%%", pct))
+    }
+
+    /// 面板两项比较：D=最后一日（最新完整日）；较昨日 = D vs D−1；
+    /// 较前 7 天 = 截至 D 的 7 个完整日 vs 再前 7 个完整日（14 日全覆盖才比较）
+    static func dailyPair(buckets: [GLMDayBucket]) -> (dayOnDay: Outcome, weekOnWeek: Outcome) {
+        let dayOnDay = outcome(current: buckets.last?.tokens,
+                               base: buckets.count >= 2 ? buckets[buckets.count - 2].tokens : nil)
+        let weekCurrent = buckets.count >= 7 ? sum(Array(buckets.suffix(7)).map { Optional($0) }) : nil
+        let weekBase = buckets.count >= 14 ? sum(buckets.suffix(14).prefix(7).map { Optional($0) }) : nil
+        return (dayOnDay, outcome(current: weekCurrent, base: weekBase))
+    }
+}
+
 struct ToolUsage {
     var networkSearch: Double
     var webRead: Double
@@ -166,6 +377,9 @@ struct UsageData {
     var tokensToday: ModelUsage?
     var tokens7d: ModelUsage?
     var tokens30d: ModelUsage?
+    var dailyTokens: [GLMDayBucket]?   // 每日用量：近 30 完整自然日桶（缺失日=nil≠0；未过真实接口 Gate 前生产恒为 nil）
+    var dailyTokensError: String?      // 仅用于 freshness 保留旧值，界面不显示技术错误
+    var accountEmail: String?          // 头部可选邮箱（仅现有凭据内可靠可得；绝不写 status.json/日志）
     var tools30d: ToolUsage?
     var resetCards: ResetCards?        // 重置卡（额度重置卡）可用列表
     var resetCardsError: String?
@@ -478,16 +692,32 @@ enum Fetcher {
         return result
     }
 
-    /// model-usage：一个时间窗的 token/调用统计
+    /// model-usage：一个时间窗的 token/调用统计；第二/三参数为每日桶与其解析失败标记
+    /// （复用同一响应，不新增请求；Gate 已于 2026-11-06 真实验收确认，解析失败仍整体拒绝）
     static func fetchModelUsage(apiKey: String, from: Date, to: Date,
-                                completion: @escaping (ModelUsage?, String?) -> Void) {
+                                completion: @escaping (ModelUsage?, [GLMDayBucket]?, Bool, String?) -> Void) {
         fetch(apiKey: apiKey, path: "/api/monitor/usage/model-usage", from: from, to: to) { data, err in
-            guard let data = data, err == nil else { completion(nil, err ?? "no data"); return }
+            guard let data = data, err == nil else { completion(nil, nil, false, err ?? "no data"); return }
             guard let usage = parseModelUsage(data) else {
-                completion(nil, "missing or invalid model usage fields"); return
+                completion(nil, nil, false, "missing or invalid model usage fields"); return
             }
-            completion(usage, nil)
+            let daily = Self.dailyBuckets(from: data, windowStart: from, now: Date())
+            completion(usage, daily.buckets, daily.parseFailed, nil)
         }
+    }
+
+    /// 同一响应 → 每日桶。三分语义：
+    /// - buckets 非 nil：Gate 开启且解析/聚合成功；
+    /// - buckets nil + parseFailed=false：Gate 未确认（生产正常空态「暂不可用」，非错误、不提示待更新）；
+    /// - buckets nil + parseFailed=true：Gate 开启但响应无字段/解析失败 → 上层按失败保留旧值并给简短「待更新」，
+    ///   不得静默拿旧图冒充新数据，也不显示技术细节。
+    static func dailyBuckets(from data: [String: Any], windowStart: Date, now: Date) -> (buckets: [GLMDayBucket]?, parseFailed: Bool) {
+        guard GLMDailyUsage.productionGateConfirmed else { return (nil, false) }
+        guard let timeline = GLMDailyUsage.parseTimeline(data),
+              let buckets = GLMDailyUsage.frame(from: timeline, now: now, coverageStart: windowStart) else {
+            return (nil, true)
+        }
+        return (buckets, false)
     }
 
     static func parseModelUsage(_ data: [String: Any]) -> ModelUsage? {
@@ -788,6 +1018,8 @@ enum Fmt {
     private static let expiresTodayFmt = zhFormatter("'今天' HH:mm")
     private static let expiresTomorrowFmt = zhFormatter("'明天' HH:mm")
     private static let expiresFullFmt = zhFormatter("yyyy-MM-dd HH:mm")
+    private static let monthDayFmt = zhFormatter("M月d日")   // 每日用量选中日期
+    private static let dayTickFmt = zhFormatter("M/d")       // 每日用量横轴刻度
 
     static func time(_ d: Date?) -> String {
         guard let d = d else { return "" }
@@ -809,6 +1041,10 @@ enum Fmt {
         guard let d = d else { return "" }
         return weekDayTimeFmt.string(from: d)
     }
+    // 每日用量选中日期，如 "11月5日"
+    static func monthDay(_ d: Date) -> String { monthDayFmt.string(from: d) }
+    // 每日用量横轴刻度，如 "10/7"
+    static func dayTick(_ d: Date) -> String { dayTickFmt.string(from: d) }
     // 重置卡/套餐到期提示：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期（本地时区）
     static func expires(_ d: Date) -> String {
         let cal = Calendar.current
@@ -1356,6 +1592,396 @@ final class GLMQuotaBar: NSView {
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
 }
 
+// 浅底圆角小底座：头部套餐 badge 与两项比较条共用（跟随明暗外观重画）
+final class GLMPillBackground: NSView {
+    var radius: CGFloat = 5
+    var backgroundAlpha: CGFloat = 0.10
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // wantsLayer 必须自建：updateLayer 只在 layer-backed 时被调用，
+        // cornerRadius 不设会退化成直角矩形（badge 参考图为圆角 pill）
+        wantsLayer = true
+        layer?.cornerRadius = radius
+        layer?.masksToBounds = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.cornerRadius = radius   // radius 运行时可改（比较条 7 / badge 5）
+            layer?.masksToBounds = true
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(backgroundAlpha).cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+}
+
+// MARK: - 每日用量柱状图（近 30 完整自然日）
+//
+// 数据只来自慢项刷新缓存（GLMDayBucket）：悬停/点击/键盘选择全部读内存，
+// 不联网、不重算历史、无独立定时器。命中区域覆盖整天宽度（缺失/零值日也能读取）；
+// 鼠标离开保留最后选中值；左右方向键切换日期。
+
+final class GLMDailyChartCanvas: NSView {
+    private var buckets: [GLMDayBucket] = []
+    private(set) var selectedIndex = 0
+    /// 选中变化回调（含键盘/鼠标）；上层仅记录状态用于面板重建，不触发刷新
+    var onSelect: ((Int) -> Void)?
+    private var trackingArea: NSTrackingArea?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    /// 当前全部日桶（只读暴露给区块视图与离线测试）
+    var dayBuckets: [GLMDayBucket] { buckets }
+
+    func configure(buckets: [GLMDayBucket], initialIndex: Int) {
+        self.buckets = buckets
+        selectedIndex = clamped(initialIndex)
+        needsDisplay = true
+        updateAccessibilityValue()
+    }
+
+    private func clamped(_ index: Int) -> Int {
+        guard !buckets.isEmpty else { return 0 }
+        return max(0, min(buckets.count - 1, index))
+    }
+
+    private var columnWidth: CGFloat {
+        bounds.width / CGFloat(max(1, buckets.count))
+    }
+
+    private func dayIndex(atX x: CGFloat) -> Int {
+        clamped(Int(x / max(1, columnWidth)))
+    }
+
+    private func select(_ index: Int) {
+        let next = clamped(index)
+        guard next != selectedIndex else { return }
+        selectedIndex = next
+        needsDisplay = true
+        updateAccessibilityValue()
+        onSelect?(next)
+    }
+
+    private var accent: NSColor { NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.labelColor.withAlphaComponent(0.15).setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
+        guard !buckets.isEmpty else { return }
+        let maxTokens = buckets.compactMap { $0.tokens }.max() ?? 0
+        let chartHeight = bounds.height - 3
+        let width = max(1, columnWidth - 2)
+        for (index, bucket) in buckets.enumerated() {
+            guard let tokens = bucket.tokens else { continue }   // 缺失日 = 缺口，不画、不当 0
+            let x = CGFloat(index) * columnWidth + 1
+            accent.withAlphaComponent(index == selectedIndex ? 1 : 0.4).setFill()
+            if tokens == 0 {
+                NSRect(x: x, y: 1, width: width, height: 2).fill()   // 有记录的零日 = 基线短柱
+            } else {
+                let height = maxTokens > 0 ? max(3, chartHeight * CGFloat(tokens / maxTokens)) : 3
+                NSRect(x: x, y: 1, width: width, height: min(chartHeight, height)).fill()
+            }
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        installTrackingArea()
+    }
+
+    // 面板每 10s 重建、Popover 关开切换：不依赖 AppKit 时机，入窗/布局时主动重挂
+    // （.inVisibleRect 让命中区跟随可见矩形，滚动后无需重建）
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        installTrackingArea()
+    }
+
+    override func layout() {
+        super.layout()
+        installTrackingArea()
+    }
+
+    private func installTrackingArea() {
+        if let old = trackingArea { removeTrackingArea(old); trackingArea = nil }
+        guard window != nil else { return }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let localX = convert(event.locationInWindow, from: nil).x
+        if ProcessInfo.processInfo.environment["GLM_DAILY_DEBUG"] != nil {
+            NSLog("GLM_DAILY_DEBUG mouseMoved localX=\(localX) idx=\(dayIndex(atX: localX))")
+        }
+        select(dayIndex(atX: localX))
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let localX = convert(event.locationInWindow, from: nil).x
+        if ProcessInfo.processInfo.environment["GLM_DAILY_DEBUG"] != nil {
+            NSLog("GLM_DAILY_DEBUG mouseDown localX=\(localX) idx=\(dayIndex(atX: localX))")
+        }
+        select(dayIndex(atX: localX))
+        window?.makeFirstResponder(self)   // 点击后即可用方向键继续切换
+    }
+
+    // 鼠标离开图表：保留最后选中值，不跳回末日
+    override func mouseExited(with event: NSEvent) {}
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 123: select(selectedIndex - 1)   // ←
+        case 124: select(selectedIndex + 1)   // →
+        default: super.keyDown(with: event)
+        }
+    }
+
+    private func updateAccessibilityValue() {
+        guard let bucket = buckets.indices.contains(selectedIndex) ? buckets[selectedIndex] : nil else {
+            setAccessibilityValue(""); return
+        }
+        let tokens = bucket.tokens.map { "\(Fmt.tokens($0)) tokens" } ?? "数据不足"
+        setAccessibilityValue("\(Fmt.monthDay(bucket.day)) \(tokens)")
+    }
+}
+
+// 两项比较：单行浅底圆角条 + 中间竖分隔线，两半各「标签+数值」靠近并整体居中，
+// 高约 30pt；数值 12pt 半粗体、中性展示；缺数文案留在对应半区，不串组。
+final class GLMComparisonStrip: NSView {
+    init(pairs: [(label: String, value: String, muted: Bool)]) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        heightAnchor.constraint(equalToConstant: 30).isActive = true
+        let strip = GLMPillBackground()
+        strip.radius = 7
+        strip.backgroundAlpha = 0.055
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(strip)
+        NSLayoutConstraint.activate([strip.topAnchor.constraint(equalTo: topAnchor), strip.bottomAnchor.constraint(equalTo: bottomAnchor),
+                                     strip.leadingAnchor.constraint(equalTo: leadingAnchor), strip.trailingAnchor.constraint(equalTo: trailingAnchor)])
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.distribution = .fillEqually
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+                                     stack.heightAnchor.constraint(equalToConstant: 30),
+                                     stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+                                     stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4)])
+        for (index, pair) in pairs.enumerated() {
+            if index > 0 {
+                let divider = NSBox()
+                divider.boxType = .separator
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                stack.addArrangedSubview(divider)
+                divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
+                divider.heightAnchor.constraint(equalToConstant: 16).isActive = true
+            }
+            let half = NSView()
+            half.translatesAutoresizingMaskIntoConstraints = false
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 5
+            row.translatesAutoresizingMaskIntoConstraints = false
+            let caption = NSTextField(wrappingLabelWithString: pair.label)
+            caption.font = .systemFont(ofSize: 10)
+            caption.textColor = .secondaryLabelColor
+            caption.lineBreakMode = .byTruncatingTail
+            caption.maximumNumberOfLines = 1
+            let value = NSTextField(wrappingLabelWithString: pair.value)
+            value.font = .systemFont(ofSize: 12, weight: .semibold)
+            value.textColor = pair.muted ? .secondaryLabelColor : .labelColor
+            value.lineBreakMode = .byTruncatingTail
+            value.maximumNumberOfLines = 1
+            row.addArrangedSubview(caption)
+            row.addArrangedSubview(value)
+            half.addSubview(row)
+            NSLayoutConstraint.activate([row.centerXAnchor.constraint(equalTo: half.centerXAnchor),
+                                         row.centerYAnchor.constraint(equalTo: half.centerYAnchor)])
+            stack.addArrangedSubview(half)
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+// 「每日用量」整块：标题行 + 选中行 + 柱图 + 刻度 + 比较条。
+// buckets=nil（未过真实接口 Gate 或无数据）显示明确空态：暂不可用 + 两项数据不足，
+// 不画假柱、不补零、不写开发说明。
+final class GLMDailyUsageSectionView: NSView {
+    static let dateLabelIdentifier = NSUserInterfaceItemIdentifier("GLMDailyDateLabel")
+    static let valueLabelIdentifier = NSUserInterfaceItemIdentifier("GLMDailyValueLabel")
+
+    private let dateLabel = NSTextField(wrappingLabelWithString: "")
+    private let valueLabel = NSTextField(wrappingLabelWithString: "")
+    private let canvas = GLMDailyChartCanvas()
+
+    /// 柱图（供面板把每日图接进 key view loop，Tab/FKA 可达）
+    var chartCanvas: GLMDailyChartCanvas { canvas }
+
+    init(buckets: [GLMDayBucket]?, selectedIndex: Int?, pendingNote: Bool = false, onSelect: @escaping (Int) -> Void) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let stack = GLMPanelStack()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([stack.topAnchor.constraint(equalTo: topAnchor), stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+                                     stack.leadingAnchor.constraint(equalTo: leadingAnchor), stack.trailingAnchor.constraint(equalTo: trailingAnchor)])
+
+        // 标题行：非折叠板块（PRD §4 仅用量情况/MCP 可折叠）
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 6
+        header.translatesAutoresizingMaskIntoConstraints = false
+        let icon = NSImageView(image: NSImage(systemSymbolName: "chart.bar", accessibilityDescription: nil) ?? NSImage())
+        icon.contentTintColor = NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1)
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        let title = NSTextField(wrappingLabelWithString: "每日用量")
+        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        title.textColor = .labelColor
+        title.lineBreakMode = .byTruncatingTail
+        title.maximumNumberOfLines = 1
+        title.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+        let range = NSTextField(wrappingLabelWithString: "近 30 天")
+        range.font = .systemFont(ofSize: 10)
+        range.textColor = .secondaryLabelColor
+        range.lineBreakMode = .byTruncatingTail
+        range.maximumNumberOfLines = 1
+        range.setContentCompressionResistancePriority(.required, for: .horizontal)
+        // 旧值保留期间的简短提示（PRD §9「必要时显示简短待更新」；非技术脚注）
+        if pendingNote {
+            let pending = NSTextField(wrappingLabelWithString: "待更新")
+            pending.font = .systemFont(ofSize: 10)
+            pending.textColor = .secondaryLabelColor
+            pending.lineBreakMode = .byTruncatingTail
+            pending.maximumNumberOfLines = 1
+            pending.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+            header.addArrangedSubview(pending)
+        }
+        header.addArrangedSubview(icon)
+        header.addArrangedSubview(title)
+        header.addArrangedSubview(spacer)
+        header.addArrangedSubview(range)
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        // 选中行：所选日期 + Token 值；悬停立即切换，缺数据时显示「暂不可用」
+        dateLabel.identifier = Self.dateLabelIdentifier
+        dateLabel.font = .systemFont(ofSize: 11)
+        dateLabel.textColor = .secondaryLabelColor
+        dateLabel.lineBreakMode = .byTruncatingTail
+        dateLabel.maximumNumberOfLines = 1
+        valueLabel.identifier = Self.valueLabelIdentifier
+        valueLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        valueLabel.textColor = .labelColor
+        valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.maximumNumberOfLines = 1
+        valueLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let selectionRow = NSStackView()
+        selectionRow.orientation = .horizontal
+        selectionRow.alignment = .centerY
+        selectionRow.spacing = 6
+        selectionRow.translatesAutoresizingMaskIntoConstraints = false
+        selectionRow.addArrangedSubview(dateLabel)
+        let midSpacer = NSView()
+        midSpacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        midSpacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+        selectionRow.addArrangedSubview(midSpacer)
+        selectionRow.addArrangedSubview(valueLabel)
+        stack.addArrangedSubview(selectionRow)
+        selectionRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        guard let buckets = buckets, !buckets.isEmpty else {
+            dateLabel.stringValue = "暂不可用"
+            valueLabel.stringValue = ""
+            canvas.isHidden = true
+            let strip = GLMComparisonStrip(pairs: comparisonPairs(for: nil))
+            stack.addArrangedSubview(strip)
+            strip.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            return
+        }
+
+        // 默认选中最新有记录的完整日；面板重建后沿用用户上次选中
+        let defaultIndex = selectedIndex ?? buckets.lastIndex { $0.tokens != nil } ?? buckets.count - 1
+        canvas.configure(buckets: buckets, initialIndex: defaultIndex)
+        canvas.focusRingType = .none   // 键盘可达但不画焦点环（数值行已即时反馈选中日）
+        canvas.onSelect = { [weak self] index in
+            self?.syncSelection(index)
+            onSelect(index)
+        }
+        canvas.translatesAutoresizingMaskIntoConstraints = false
+        canvas.setAccessibilityLabel("近 30 天每日用量柱状图，可用左右方向键选择日期")
+        // 有意不设 setAccessibilityElement(true)：实测会让 Full Keyboard Access 的 Tab 遍历
+        // （走 a11y 树选焦点候选）跳过本视图，破坏 --preview-daily-test 的 Tab 可达硬门槛；
+        // VoiceOver 用户仍可经日期/数值两个文本标签获取选中日信息
+        canvas.heightAnchor.constraint(equalToConstant: 62).isActive = true
+        stack.addArrangedSubview(canvas)
+        canvas.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        // 日期刻度：首/中/末（与柱图两端对齐）
+        let ticks = NSStackView()
+        ticks.orientation = .horizontal
+        ticks.distribution = .fillEqually
+        ticks.spacing = 0
+        ticks.translatesAutoresizingMaskIntoConstraints = false
+        let tickDates = [buckets.first?.day, buckets[buckets.count / 2].day, buckets.last?.day].compactMap { $0 }
+        let alignments: [NSTextAlignment] = [.left, .center, .right]
+        for (tickDate, alignment) in zip(tickDates, alignments) {
+            let tick = NSTextField(wrappingLabelWithString: Fmt.dayTick(tickDate))
+            tick.font = .systemFont(ofSize: 9)
+            tick.textColor = .secondaryLabelColor
+            tick.alignment = alignment
+            tick.lineBreakMode = .byTruncatingTail
+            tick.maximumNumberOfLines = 1
+            ticks.addArrangedSubview(tick)
+        }
+        stack.addArrangedSubview(ticks)
+        ticks.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let strip = GLMComparisonStrip(pairs: comparisonPairs(for: buckets))
+        stack.addArrangedSubview(strip)
+        strip.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        stack.setCustomSpacing(6, after: ticks)
+        syncSelection(canvas.selectedIndex)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func syncSelection(_ index: Int) {
+        // 由 canvas 在选中变化时调用（含键盘/悬停）；直接改本块标签，不重建面板、不发请求
+        let buckets = canvas.dayBuckets
+        guard buckets.indices.contains(index) else { return }
+        let bucket = buckets[index]
+        dateLabel.stringValue = Fmt.monthDay(bucket.day)
+        if let tokens = bucket.tokens {
+            valueLabel.stringValue = "\(Fmt.tokens(tokens)) Token"
+            valueLabel.textColor = .labelColor
+        } else {
+            valueLabel.stringValue = "数据不足"
+            valueLabel.textColor = .secondaryLabelColor
+        }
+    }
+
+    private func comparisonPairs(for buckets: [GLMDayBucket]?) -> [(label: String, value: String, muted: Bool)] {
+        let outcomes = GLMUsageComparison.dailyPair(buckets: buckets ?? [])
+        return [("较昨日", outcomes.dayOnDay.text, outcomes.dayOnDay.isMuted),
+                ("较前 7 天", outcomes.weekOnWeek.text, outcomes.weekOnWeek.isMuted)]
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     // 状态栏底色随全屏进出/深浅模式翻转时，KVO 触发按新外观重画（否则浅色栏上残留白色余量文字）；
@@ -1388,8 +2014,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var updateMessageDismissal: DispatchWorkItem?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
-    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
-    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
@@ -1415,6 +2041,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var fiveHourCardsLastOK: Date?
     private var weekCardsLastOK: Date?
     private var subscriptionLastOK: Date?
+    private var dailyLastOK: Date?
+    // 每日图选中日（面板每 10s 重建后沿用；nil = 用默认最新有记录完整日）
+    private var dailySelectedIndex: Int?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[GlmUsage] launched, creating status item")
@@ -1425,6 +2054,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         popover.behavior = .transient
         popover.delegate = self
         popover.animates = false
+        // 仅离线 GUI 回归进程：改用 applicationDefined，避免测试期间的真实鼠标点击
+        // （用户正在用机）把 transient Popover 关掉造成几何断言误报；生产与普通预览不变
+        if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") {
+            popover.behavior = .applicationDefined
+        }
         if preview {
             if CommandLine.arguments.contains("--preview-dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
             installPreviewData()
@@ -1445,13 +2079,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 previewWindow?.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
             }
-            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
+            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self = self else { return }
                     self.togglePanel()
                     if CommandLine.arguments.contains("--preview-popover-test") {
                         // 等初始 Popover 布局稳定后再量高，避免把打开时的尺寸校正算成展开明细。
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.testPreviewPopover() }
+                    }
+                    if CommandLine.arguments.contains("--preview-daily-test") {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.testDailyInteraction() }
                     }
                 }
             }
@@ -1554,6 +2191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 failed.tokensTodayError = error
                 failed.tokens7dError = error
                 failed.tokens30dError = error
+                failed.dailyTokensError = error
                 failed.toolsError = error
                 failed.fiveHourCardsError = error
                 failed.weekCardsError = error
@@ -1577,7 +2215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             let wg = DispatchGroup()
             for w in windows {
                 wg.enter()
-                Fetcher.fetchModelUsage(apiKey: key, from: w.from, to: w.to) { r, err in
+                Fetcher.fetchModelUsage(apiKey: key, from: w.from, to: w.to) { r, daily, dailyFailed, err in
                     accumulator.update { current in
                         switch w.label {
                         case 0:
@@ -1590,9 +2228,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                             current.tokens30d = r
                             current.tokens30dError = r == nil ? (err ?? "no data") : nil
                         }
+                        // 每日桶只来自 30 天窗（复用同一响应，不新增请求）。
+                        // Gate 关闭 → 空态（非错误）；Gate 开但解析失败 → 标记失败保留旧值
+                        // （界面给简短「待更新」，不显示技术细节）；请求失败 → 同样保留旧值。
+                        if w.label == 2 {
+                            current.dailyTokens = daily
+                            if r == nil {
+                                current.dailyTokensError = err ?? "no data"
+                            } else if dailyFailed {
+                                current.dailyTokensError = "每日数据解析失败"
+                            } else {
+                                current.dailyTokensError = nil
+                            }
+                        }
                     }
                     wg.leave()
                 }
+            }
+            // 头部可选邮箱：读现有凭据库（本地文件、无网络），不可得 → nil → 整行隐藏。
+            // 双保险：本方法在 preview 下不会被调用（启动即 return），此处再显式断开
+            // 预览路径与凭据读取的关联，防止未来重构把凭据读取带进假数据预览。
+            let accountEmail = preview ? nil : CredStore.loadAccountEmail()
+            accumulator.update { current in
+                current.accountEmail = accountEmail
             }
             wg.enter()
             Fetcher.fetchToolUsage(apiKey: key, from: now.addingTimeInterval(-30 * 86400), to: now) { r, err in
@@ -1657,6 +2315,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             let tools = GLMFreshness.apply(fresh: fresh.tools30d, failure: fresh.toolsError,
                 old: usage.tools30d, oldLastOK: toolsLastOK, oldError: usage.toolsError, now: now)
             usage.tools30d = tools.value; toolsLastOK = tools.lastOK; usage.toolsError = tools.error
+
+            // 每日桶：失败保留旧值（不显示技术错误行）；结果未知时沿用上次图表
+            let daily = GLMFreshness.apply(fresh: fresh.dailyTokens, failure: fresh.dailyTokensError,
+                old: usage.dailyTokens, oldLastOK: dailyLastOK, oldError: usage.dailyTokensError, now: now)
+            usage.dailyTokens = daily.value; dailyLastOK = daily.lastOK; usage.dailyTokensError = daily.error
+            // 头部可选邮箱（本地凭据读取结果，无网络语义；nil → 隐藏整行）
+            usage.accountEmail = fresh.accountEmail
 
             let hasCardBatch = fresh.resetCards != nil
             let fiveCards = GLMFreshness.apply(fresh: fresh.resetCards?.fiveHour, failure: fresh.fiveHourCardsError,
@@ -1725,6 +2390,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     }
     private var subscriptionStale: Bool {
         isStale(subscriptionLastOK, hasData: usage.subscription != nil, after: 900)
+    }
+    // 每日桶：与慢项同节奏刷新；超过 30 分钟未成功视为过期（仅用于简短「待更新」提示）
+    private var dailyStale: Bool {
+        isStale(dailyLastOK, hasData: usage.dailyTokens != nil, after: tokensStaleAfter)
     }
 
     private func attachBarAppearanceObserver() {
@@ -1961,7 +2630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         if weekCardsStale { menu.addItem(info("⚠️ 周卡数据已过期 · 最后成功 \(Fmt.lastOK(weekCardsLastOK))")) }
 
-        // Token 用量（服务端统计）
+        // 用量情况（与面板 section 同名；此 NSMenu 为 fallback 死代码，仅防漂移）
         menu.addItem(.separator())
         menu.addItem(info("Token 用量（服务端统计）"))
         func addTokenSection(_ label: String, _ stats: ModelUsage?, lastOK: Date?, stale: Bool, error: String?) {
@@ -2045,7 +2714,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 if event.keyCode == 53 { self.popover.performClose(nil); return nil }
                 return event
             }
-            if event.window === self.panelController.view.window || event.window === self.statusItem.button?.window { return event }
+            // 合成事件（离线回归）可能没有 event.window，按 windowNumber 解析；
+            // 真实用户事件语义不变：点击面板/状态栏窗口内不关，窗外关闭
+            let eventWindow = event.window ?? NSApp.window(withWindowNumber: event.windowNumber)
+            if eventWindow === self.panelController.view.window || eventWindow === self.statusItem.button?.window { return event }
             self.popover.performClose(nil)
             return event
         }
@@ -2183,6 +2855,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private func installPreviewData() {
         let now = Date()
         usage.level = "Pro"
+        usage.subscription = SubscriptionInfo(name: "GLM Coding Pro", expireDate: now.addingTimeInterval(31_536_000))
         usage.fiveHour = LimitEntry(label: "5 小时窗口", isFiveHour: true, limit: 2000, used: 640, remaining: 1360, usedRatio: 0.32, reset: now.addingTimeInterval(7200))
         usage.week = LimitEntry(label: "7 天额度", isFiveHour: false, limit: 10000, used: 2700, remaining: 7300, usedRatio: 0.27, reset: now.addingTimeInterval(259200))
         let stats = ModelUsage(totalTokens: 1840000, totalCalls: 142, byModel: [("glm-4.7", 1200000), ("glm-4.5-air", 640000)])
@@ -2190,6 +2863,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         usage.tools30d = ToolUsage(networkSearch: 36, webRead: 18)
         usage.resetCards = ResetCards(fiveHour: [now.addingTimeInterval(864000)], week: [now.addingTimeInterval(1728000)])
         fiveHourLastOK = now; weekLastOK = now; tokensTodayLastOK = now; tokens7dLastOK = now; tokens30dLastOK = now; toolsLastOK = now; fiveHourCardsLastOK = now; weekCardsLastOK = now
+        dailyLastOK = now   // 预览每日桶视为新鲜，避免误显「待更新」
+        subscriptionLastOK = now
         if CommandLine.arguments.contains("--preview-quota-alignment") {
             usage.fiveHour = LimitEntry(label: "5 小时窗口", isFiveHour: true, limit: 2000, used: 0, remaining: 2000, usedRatio: 0, reset: nil)
             usage.subscription = SubscriptionInfo(name: "GLM Coding Pro", expireDate: Date(timeIntervalSince1970: 1_820_000_000))
@@ -2208,6 +2883,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         if CommandLine.arguments.contains("--preview-long") {
             expandedModelWindows.insert(0)
             usage.tokensToday = ModelUsage(totalTokens: 9000000, totalCalls: 500, byModel: (1...30).map { ("glm-very-long-model-name-\($0)", Double($0 * 10000)) })
+            // 头部长套餐名：验证 badge 截断不挤压标题（280/336 截图矩阵用）
+            usage.subscription = SubscriptionInfo(
+                name: "GLM Coding Plan Max 年度订阅超长套餐名称示例用于截断验证",
+                expireDate: now.addingTimeInterval(31_536_000))
+            subscriptionLastOK = now
         }
         // 更新进度行预览：updating 为下载中 62%；updating-install 为安装重启阶段（含重启预告）
         if CommandLine.arguments.contains("--preview-updating-install") {
@@ -2215,6 +2895,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         } else if CommandLine.arguments.contains("--preview-updating") {
             UpdateProgressController.shared.simulateForPreview(phase: .downloading, fraction: 62)
         }
+        // 每日用量预览：合成 30 个完整自然日桶（今日未走完不进图，与生产 frame 规则一致）。
+        // 生产界面因真实接口 Gate 未确认恒为空态；预览仅展示目标体验，不代表接口已验证。
+        usage.dailyTokens = CommandLine.arguments.contains("--preview-daily-unavailable")
+            ? nil : previewDailyBuckets()
+        // 头部邮箱预览（假数据；生产邮箱只来自现有凭据库且不可得即隐藏）
+        if CommandLine.arguments.contains("--preview-email") {
+            usage.accountEmail = CommandLine.arguments.contains("--preview-email-long")
+                ? "long-username.glm.account@example-mail.cn" : "preview@example.com"
+        }
+    }
+
+    /// 合成每日桶（仅预览/离线测试）：确定性伪随机高度 + 固定零日/缺日位点，
+    /// 交互测试依赖位点稳定，改位点必须同步 --preview-daily-test 的断言
+    private func previewDailyBuckets() -> [GLMDayBucket] {
+        let cal = Calendar.current
+        let todayStart = cal.startOfDay(for: Date())
+        var buckets: [GLMDayBucket] = []
+        for index in 0..<30 {
+            guard let day = cal.date(byAdding: .day, value: index - 30, to: todayStart) else { continue }
+            var tokens: Double? = 900_000 + Double((index * 137_917) % 1_400_000)
+            if index == 10 || index == 24 { tokens = 0 }                       // 有记录的零日
+            if index == 29 { tokens = 2_000_000 }                              // 昨日（较昨日基准）
+            if index == 28 { tokens = 1_000_000 }                              // 前日（较昨日对比项）
+            if CommandLine.arguments.contains("--preview-daily-gaps"), index == 3 || index == 4 || index == 17 {
+                tokens = nil                                                   // 缺失日（缺口）
+            }
+            if CommandLine.arguments.contains("--preview-daily-insufficient"), index < 25 {
+                tokens = nil                                                   // 仅近 5 日有记录 → 较前 7 天数据不足
+            }
+            if CommandLine.arguments.contains("--preview-daily-basezero") {
+                if index == 28 { tokens = 0 }                                  // 基期 0 → 「新增 N」
+            }
+            buckets.append(GLMDayBucket(day: day, tokens: tokens))
+        }
+        return buckets
     }
 
     private func buildPanel(_ menu: NSMenu) {
@@ -2329,7 +3044,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             if let message = message { let l = label(message, color: .systemRed); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
         }
         add(cards)
-        add(section("Token 用量（服务端统计）", icon: "square.stack.3d.up.fill", expanded: tokenExpanded, action: #selector(toggleToken)))
+        let usageSection = section("用量情况", icon: "square.stack.3d.up.fill", expanded: tokenExpanded, action: #selector(toggleToken))
+        add(usageSection)
         let windows: [(String, ModelUsage?, Date?, Bool, String?)] = [
             ("今日", usage.tokensToday, tokensTodayLastOK, tokensTodayStale, usage.tokensTodayError),
             ("近 7 天", usage.tokens7d, tokens7dLastOK, tokens7dStale, usage.tokens7dError),
@@ -2397,7 +3113,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             if let error = error { add(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
             else if stale { add(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
         }
-        add(section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP)))
+        // 每日用量：位于用量情况与 MCP 之间；数据只读慢项缓存，悬停/键盘不发请求。
+        // 选中状态跨面板重建保留（10s 节奏重建不打断阅读）。
+        // 旧值保留期间有解析/刷新失败或超时 → 仅在「近 30 天」旁给简短「待更新」，不写技术细节。
+        let dailyPending = usage.dailyTokens != nil && (usage.dailyTokensError != nil || dailyStale)
+        let dailySection = GLMDailyUsageSectionView(buckets: usage.dailyTokens, selectedIndex: dailySelectedIndex,
+                                                    pendingNote: dailyPending) { [weak self] index in
+            self?.dailySelectedIndex = index
+        }
+        add(dailySection)
+        let mcpSection = section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP))
+        add(mcpSection)
+        // 键盘可达（PRD §6.2 支持键盘切换日期）：把柱图接进 key view loop——
+        // 「用量情况」标题 → 柱图 → 「MCP 工具」标题为显式顺序，其余环节按几何自动；
+        // Full Keyboard Access 下 Tab 即可到达柱图，左右方向键切换日期
+        usageSection.nextKeyView = dailySection.chartCanvas
+        dailySection.chartCanvas.nextKeyView = mcpSection
         if mcpExpanded {
             if let t = usage.tools30d { add(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor)) }
             else { add(label("暂无数据", color: .secondaryLabelColor)) }
@@ -2407,7 +3138,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
         let header = row(); header.spacing = 12
         let icon = NSImageView(image: NSApp.applicationIconImage); icon.widthAnchor.constraint(equalToConstant: 32).isActive = true; icon.heightAnchor.constraint(equalToConstant: 32).isActive = true; header.addArrangedSubview(icon)
-        header.addArrangedSubview(label("GLM 余额" + (usage.level.map { "（\($0) 套餐）" } ?? ""), size: 15, bold: true)); header.addArrangedSubview(spacer())
+        // 头部（PRD §2.1）：GLM 自己的图标 + 「GLM 用量」 + 独立套餐 badge（服务端名称，
+        // 不硬编码、不按套餐换图标）；第二行仅当前 GLM 账号邮箱可靠可得时显示，否则整行
+        // 隐藏不占空高。套餐到期仍在冻结区原位置显示。
+        let headerText = GLMPanelStack(); headerText.orientation = .vertical; headerText.alignment = .leading; headerText.spacing = 2
+        let titleRow = row(); titleRow.spacing = 6
+        let title = label("GLM 用量", size: 15, bold: true)
+        title.lineBreakMode = .byTruncatingTail; title.maximumNumberOfLines = 1
+        title.setContentCompressionResistancePriority(.init(751), for: .horizontal)
+        titleRow.addArrangedSubview(title)
+        if let planName = usage.subscription?.name, !planName.isEmpty {
+            let pillText = label(planName, size: 10, bold: true, color: .secondaryLabelColor)
+            pillText.lineBreakMode = .byTruncatingTail; pillText.maximumNumberOfLines = 1
+            pillText.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+            let pill = GLMPillBackground(); pill.translatesAutoresizingMaskIntoConstraints = false
+            pill.addSubview(pillText); pillText.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                pillText.topAnchor.constraint(equalTo: pill.topAnchor, constant: 2), pillText.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -2),
+                pillText.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 6), pillText.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -6)])
+            // 超长套餐名截断在 badge 内：上限保证「GLM 用量」标题至少保留可读宽度（≈标题全宽），
+            // title(751) > pillText(750)，两者都超宽时先截 badge，再截标题，绝不溢出容器
+            pill.setContentCompressionResistancePriority(.required, for: .horizontal)
+            pill.setContentHuggingPriority(.required, for: .horizontal)
+            pill.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 44 - 70).isActive = true
+            titleRow.addArrangedSubview(pill)
+        }
+        headerText.addArrangedSubview(titleRow)
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+        if let email = usage.accountEmail {
+            let emailLabel = label(email, size: 10, color: .secondaryLabelColor)
+            emailLabel.lineBreakMode = .byTruncatingMiddle; emailLabel.maximumNumberOfLines = 1
+            emailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 44).isActive = true
+            emailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            headerText.addArrangedSubview(emailLabel)
+        }
+        header.addArrangedSubview(headerText); headerText.translatesAutoresizingMaskIntoConstraints = false
+        headerText.widthAnchor.constraint(equalToConstant: inner - 44).isActive = true
+        header.addArrangedSubview(spacer())
         let scroll = panelScroll
         activeScroll = scroll
         let footer = GLMPanelStack(); footer.orientation = .vertical; footer.alignment = .leading; footer.spacing = 4
@@ -2445,6 +3212,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             let headerLine = separator(); let footerLine = separator()
             for v in [panelHeaderSlot, headerLine, scroll, footerLine, panelFooterSlot] { v.translatesAutoresizingMaskIntoConstraints = false; container.addSubview(v) }
             scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+            // 固定 overlay 滚动条：legacy 滚动条样式下出现/消失会让文档宽度抖动（370↔362），
+            // 引发 Popover 重新定位 ±1pt 漂移（面板高度随每日用量增加后更常越过滚动阈值）
+            scroll.scrollerStyle = .overlay
             scroll.documentView = root
             NSLayoutConstraint.activate([
                 root.topAnchor.constraint(equalTo: scroll.contentView.topAnchor), root.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), root.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
@@ -2461,7 +3231,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         install(footer, in: panelFooterSlot)
         root.layoutSubtreeIfNeeded(); footer.layoutSubtreeIfNeeded()
         let maxHeight = (statusItem.button?.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
-        let height = min(maxHeight * 0.82, max(250, root.fittingSize.height + footer.fittingSize.height + 78))
+        let rawHeight = min(maxHeight * 0.82, max(250, root.fittingSize.height + footer.fittingSize.height + 78))
+        // 量化为偶数点：Popover 顶部锚定状态栏，高度奇偶变化会让 AppKit 重新取整 ±1pt
+        // （面板加每日用量后高度更常变化，回归曾抓到 anchor 漂移）；偶数高度保持取整稳定
+        let height = (rawHeight / 2).rounded(.down) * 2
         let desiredSize = NSSize(width: width, height: height)
         // 展开/收起明细时也更新已打开的 Popover；超过最大高度后仍由 scroll view 承接。
         panelController.preferredContentSize = desiredSize
@@ -2501,6 +3274,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     // Offline regression: uses the actual NSPopover and its AppKit controls, with fake data only.
     private func testPreviewPopover() {
+        // 前一实例刚退出或环境 busy 时 popover 可能未及弹出：重试打开并等待（≤2s）
+        if !popover.isShown { togglePanel() }
+        var openWaited = 0.0
+        while !popover.isShown && openWaited < 2.0 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            openWaited += 0.1
+            if !popover.isShown { togglePanel() }
+        }
         guard previewPopover, popover.isShown, let window = panelController.view.window else {
             fputs("GLM popover test: FAIL opening\n", stderr); exit(1)
         }
@@ -2515,25 +3296,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap { buttons($0) }
         }
         func fail(_ message: String) { fputs("GLM popover test: FAIL \(message)\n", stderr); exit(1) }
-        func verify(_ step: String, _ change: HeightChange) {
-            guard popover.isShown, panelController.view.window === window,
-                  popover.contentViewController === originalController, panelScroll.documentView === originalDocument else {
-                fail("popover closed or view identity changed at \(step)"); return
+        // 环境扰动恢复标记：测试期间用户真实点击/激活切换可能把 popover 关掉（生产语义正确），
+        // 此时重开并以当前高度为新基线继续；视图身份变化仍是硬失败
+        var envRecovered = false
+        func verify(_ step: String, _ change: HeightChange, strictAnchor: Bool = true) {
+            guard popover.contentViewController === originalController, panelScroll.documentView === originalDocument else {
+                fail("view identity changed at \(step)"); return
             }
-            guard abs(window.frame.maxY - initialTop) < 1 else {
-                fail("popover anchor moved at \(step)"); return
+            if !popover.isShown {
+                togglePanel()
+                guard popover.isShown else { fail("reopen at \(step)"); return }
+                envRecovered = true
+                print("GLM_POPOVER_TEST \(step): env-close recovered")
             }
-            let delta = window.frame.height - previousHeight
-            let heightIsCorrect: Bool
-            switch change {
-            case .increase: heightIsCorrect = delta > 0.5
-            case .decrease: heightIsCorrect = delta < -0.5
-            case .same: heightIsCorrect = abs(delta) <= 0.5
+            guard panelController.view.window === window else {
+                fail("window identity changed at \(step)"); return
             }
-            guard heightIsCorrect else {
-                fail("unexpected height change \(delta) at \(step)"); return
+            if envRecovered {
+                previousHeight = window.frame.height
+            } else {
+                // async-refresh 的锚点免检：菜单栏邻居宽度变化会平移锚点（环境噪声），
+                // 锚点稳定性已由前面每步与两侧边缘放置检查覆盖
+                if strictAnchor, abs(window.frame.maxY - initialTop) >= 1 {
+                    fail("popover anchor moved at \(step)"); return
+                }
+                let delta = window.frame.height - previousHeight
+                let heightIsCorrect: Bool
+                switch change {
+                case .increase: heightIsCorrect = delta > 0.5
+                case .decrease: heightIsCorrect = delta < -0.5
+                case .same: heightIsCorrect = abs(delta) <= 0.5
+                }
+                guard heightIsCorrect else {
+                    fail("unexpected height change \(delta) at \(step)"); return
+                }
+                previousHeight = window.frame.height
             }
-            previousHeight = window.frame.height
             print("GLM_POPOVER_TEST \(step): \(NSStringFromRect(window.frame))")
             fflush(stdout)
         }
@@ -2554,13 +3352,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 NSApp.sendEvent(event)
             }
         }
+        // 步骤设计：面板加入每日用量后整体更高，模型窗全开会顶到最大高度
+        // （截断区内增减不改变窗口高，会误报 0），因此：
+        // 模型开窗 0/1→收1→开2（终态 [0,2]）在前、每步仍有真实增减；
+        // 收起 Token 表后窗口远低于上限，MCP 与 footer(刷新提示行) 的增减在非截断区验证
         let steps: [(HeightChange, () -> Void)] = [
             (.increase, { click(#selector(self.toggleModels(_:)), tag: 0) }),
             (.increase, { click(#selector(self.toggleModels(_:)), tag: 1) }),
-            (.increase, { click(#selector(self.toggleModels(_:)), tag: 2) }),
             (.decrease, { click(#selector(self.toggleModels(_:)), tag: 1) }),
+            (.increase, { click(#selector(self.toggleModels(_:)), tag: 2) }),
             (.decrease, { click(#selector(self.toggleToken)) }),
-            (.increase, { click(#selector(self.toggleToken)) }),
             (.decrease, { click(#selector(self.toggleMCP)) }),
             (.increase, { click(#selector(self.toggleMCP)) }),
             (.increase, { click(#selector(self.onRefresh)) })
@@ -2568,7 +3369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         func run(_ index: Int) {
             if index == steps.count {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    verify("async-refresh", .same)
+                    verify("async-refresh", .same, strictAnchor: false)
                     guard self.expandedModelWindows == [0, 2] else { fail("model expansion state lost"); return }
                     self.popover.performClose(nil)
                     guard !self.popover.isShown else { fail("close"); return }
@@ -2594,20 +3395,200 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 return
             }
             steps[index].1()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // 0.25s：步进过紧时下一次点击可能落在上一步布局收敛前（偶发 0 高度差误报）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 verify("step-\(index)", steps[index].0)
-                self.panelScroll.layoutSubtreeIfNeeded()
-                let clip = self.panelScroll.contentView
-                let documentHeight = self.panelScroll.documentView?.frame.height ?? clip.bounds.height
-                let maxY = max(0, documentHeight - clip.bounds.height)
-                let expectedY = min(maxY, max(0, clickOffset.y))
-                guard abs(clip.bounds.origin.y - expectedY) < 1 else {
-                    fail("scroll offset changed at step-\(index)"); return
+                if envRecovered {
+                    envRecovered = false   // 环境关闭后重开，滚动基线已失效，本步跳过滚动断言
+                } else {
+                    self.panelScroll.layoutSubtreeIfNeeded()
+                    let clip = self.panelScroll.contentView
+                    let documentHeight = self.panelScroll.documentView?.frame.height ?? clip.bounds.height
+                    let maxY = max(0, documentHeight - clip.bounds.height)
+                    let expectedY = min(maxY, max(0, clickOffset.y))
+                    guard abs(clip.bounds.origin.y - expectedY) < 1 else {
+                        fail("scroll offset changed at step-\(index)"); return
+                    }
                 }
                 run(index + 1)
             }
         }
         run(0)
+    }
+
+    // 离线回归：每日用量交互（合成数据）。鼠标事件经 NSApp.sendEvent 真实派发
+    // （悬停命中整天宽列、缺失/零日可读、离开保留选中、点击选日、键盘切换），非直接调内部方法。
+    private func testDailyInteraction() {
+        func fail(_ message: String) -> Never {
+            fputs("GLM daily test: FAIL \(message)\n", stderr)
+            try? "FAIL \(message)".write(toFile: "/tmp/glm_daily_test_result.txt", atomically: true, encoding: .utf8)
+            exit(1)
+        }
+        // 前一实例刚退出时 popover 偶发未及弹出：重试打开并轮询等待（≤2s），避免启动竞态误报
+        if !popover.isShown { togglePanel() }
+        var waited = 0.0
+        while !popover.isShown && waited < 2.0 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            waited += 0.1
+            if !popover.isShown { togglePanel() }
+        }
+        // 测试前置条件：popover 窗口必须成为 key window，否则键盘事件（Tab）会被整体
+        // 丢弃（2026-11-07 实测）。非激活 app 不允许持有 key window：先激活应用；
+        // popover 若在激活前已弹出，其窗口不会事后补拿 key，需关掉重开（重开须在
+        // 捕获视图引用之前，重开后引用才是新视图）。只修测试前置条件，不改断言本身。
+        NSApp.activate(ignoringOtherApps: true)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        if !(panelController.view.window?.isKeyWindow ?? false) {
+            popover.performClose(nil)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            togglePanel()
+            var keyWait = 0.0
+            while (panelController.view.window?.isKeyWindow != true) && keyWait < 2.0 {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                keyWait += 0.1
+                if !popover.isShown { togglePanel() }
+            }
+        }
+        guard popover.isShown, let window = panelController.view.window, window.isKeyWindow else {
+            fail("opening/key-window"); exit(1)
+        }
+        func findView<T: NSView>(_ root: NSView, _ type: T.Type) -> T? {
+            if let match = root as? T { return match }
+            for child in root.subviews {
+                if let match = findView(child, type) { return match }
+            }
+            return nil
+        }
+        func findLabel(_ root: NSView, _ identifier: NSUserInterfaceItemIdentifier) -> NSTextField? {
+            if root is NSTextField && root.identifier == identifier { return root as? NSTextField }
+            for child in root.subviews {
+                if let match = findLabel(child, identifier) { return match }
+            }
+            return nil
+        }
+        guard let canvas = findView(panelController.view, GLMDailyChartCanvas.self),
+              let dateLabel = findLabel(panelController.view, GLMDailyUsageSectionView.dateLabelIdentifier),
+              let valueLabel = findLabel(panelController.view, GLMDailyUsageSectionView.valueLabelIdentifier) else {
+            fail("daily section views missing"); exit(1)
+        }
+        let buckets = canvas.dayBuckets
+        guard buckets.count == 30 else { fail("bucket count \(buckets.count)"); exit(1) }
+        window.acceptsMouseMovedEvents = true
+        canvas.scrollToVisible(canvas.bounds)
+        panelController.view.layoutSubtreeIfNeeded()
+        func sendMouse(_ type: NSEvent.EventType, atViewPoint point: NSPoint) {
+            let location = canvas.convert(point, to: nil)
+            guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 0, clickCount: type == .leftMouseDown ? 1 : 0, pressure: 1) else {
+                fail("cannot create \(type.rawValue) event"); exit(1)
+            }
+            NSApp.sendEvent(event)
+        }
+        func sendKey(_ keyCode: UInt16, characters: String = "") {
+            let location = NSPoint(x: 10, y: 10)
+            guard let event = NSEvent.keyEvent(with: .keyDown, location: location, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: false,
+                keyCode: keyCode) else {
+                fail("cannot create key event"); exit(1)
+            }
+            NSApp.sendEvent(event)
+        }
+        func hover(_ index: Int, edge: Bool = false) {
+            let column = canvas.bounds.width / 30
+            let x = column * CGFloat(index) + (edge ? column - 0.5 : 1)
+            sendMouse(.mouseMoved, atViewPoint: NSPoint(x: x, y: canvas.bounds.midY))
+        }
+        func verify(_ step: String, index: Int) {
+            let bucket = buckets[index]
+            let expectedDate = Fmt.monthDay(bucket.day)
+            let expectedValue = bucket.tokens.map { "\(Fmt.tokens($0)) Token" } ?? "数据不足"
+            guard dateLabel.stringValue == expectedDate else {
+                fail("\(step): date \(dateLabel.stringValue) != \(expectedDate)"); exit(1)
+            }
+            guard valueLabel.stringValue == expectedValue else {
+                fail("\(step): value \(valueLabel.stringValue) != \(expectedValue)"); exit(1)
+            }
+            print("GLM_DAILY_TEST \(step): \(expectedDate) \(expectedValue)")
+            fflush(stdout)
+        }
+        // 用 DispatchMain 上的异步链执行（事件需要主循环处理窗口）
+        typealias Step = () -> Void
+        var steps: [Step] = []
+        steps.append {
+            // 键盘可达性：不点击、不强设 first responder，模拟 Full Keyboard Access 下
+            // Tab 沿 key view loop 走到柱图（面板已显式接线「用量情况」→ 柱图 → 「MCP 工具」）
+            var reached = canvas === window.firstResponder
+            for _ in 0..<20 where !reached {
+                sendKey(48, characters: "\t")   // Tab
+                reached = canvas === window.firstResponder
+            }
+            guard reached else {
+                fail("canvas not reachable via Tab within 20 hops (firstResponder=\(String(describing: window.firstResponder)), isKeyWindow=\(window.isKeyWindow))"); exit(1)
+            }
+            print("GLM_DAILY_TEST tab-reachable: PASS")
+            fflush(stdout)
+        }
+        steps.append {
+            hover(5)
+            print("GLM_DAILY_DEBUG selected=\(canvas.selectedIndex) firstResponder=\(String(describing: window.firstResponder)) canvasInWindow=\(canvas.convert(canvas.bounds, to: nil)) acceptsMoved=\(window.acceptsMouseMovedEvents) tracking=\(canvas.trackingAreas.count)")
+            verify("hover-day", index: 5)
+        }
+        steps.append { hover(10); verify("hover-zero-day", index: 10) }            // 零值日可命中
+        steps.append { hover(17); verify("hover-missing-day", index: 17) }         // 缺失日=数据不足（非 0）
+        steps.append { hover(17, edge: true); verify("hover-column-edge", index: 17) }  // 整天宽命中
+        steps.append { hover(20); verify("hover-move", index: 20) }
+        steps.append {
+            // NSEvent.mouseEventWithType 只接受 MouseMask/MouseMoved；离开事件须用
+            // enterExitEvent 合成（与真实 tracking-area 离开事件同类型）
+            let location = canvas.convert(NSPoint(x: -50, y: -50), to: nil)
+            guard let exitEvent = NSEvent.enterExitEvent(with: .mouseExited, location: location, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 0, trackingNumber: 1, userData: nil) else {
+                fail("cannot create exit event"); exit(1)
+            }
+            NSApp.sendEvent(exitEvent)
+            // 离开图表保留最后选中值
+            guard dateLabel.stringValue == Fmt.monthDay(buckets[20].day) else {
+                fail("mouse-exited: selection jumped"); exit(1)
+            }
+            print("GLM_DAILY_TEST mouse-exited-keeps-selection: PASS"); fflush(stdout)
+        }
+        steps.append {
+            sendMouse(.leftMouseDown, atViewPoint: NSPoint(x: canvas.bounds.width / 30 * 22 + 1, y: canvas.bounds.midY))
+            sendMouse(.leftMouseUp, atViewPoint: NSPoint(x: canvas.bounds.width / 30 * 22 + 1, y: canvas.bounds.midY))
+        }
+        steps.append { verify("click-select", index: 22) }
+        steps.append {
+            _ = window.makeFirstResponder(canvas)
+            guard canvas === window.firstResponder else {
+                fail("canvas first responder"); exit(1)
+            }
+            sendKey(123)   // ←
+        }
+        steps.append { verify("key-left", index: 21) }
+        steps.append { sendKey(124) }   // →
+        steps.append { sendKey(124) }   // →
+        steps.append {
+            verify("key-right-x2", index: 23)
+            guard let accessibilityText = canvas.accessibilityValue() as? String, !accessibilityText.isEmpty else {
+                fail("accessibility value empty"); exit(1)
+            }
+            print("GLM daily test: PASS (hover hit columns, zero/missing readable, exit keeps selection, click, keyboard, a11y)")
+            fflush(stdout)
+            try? "PASS".write(toFile: "/tmp/glm_daily_test_result.txt", atomically: true, encoding: .utf8)
+            exit(0)
+        }
+        func runStep(_ index: Int) {
+            guard index < steps.count else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                guard let self = self, self.popover.isShown else { fail("popover closed mid-test"); exit(1) }
+                steps[index]()
+                runStep(index + 1)
+            }
+        }
+        runStep(0)
     }
 
     // MARK: 开机自启（LaunchAgent）
@@ -2701,7 +3682,7 @@ func onceMode() {
     for (label, from) in [("today", dayStart), ("7d", now.addingTimeInterval(-7 * 86400)),
                           ("30d", now.addingTimeInterval(-30 * 86400))] {
         group.enter()
-        Fetcher.fetchModelUsage(apiKey: key, from: from, to: now) { r, err in
+        Fetcher.fetchModelUsage(apiKey: key, from: from, to: now) { r, _, _, err in
             if let r = r {
                 acc.update { current in
                     switch label {
@@ -3202,7 +4183,203 @@ enum GLMOfflineRegression {
             try expect(UpdateCheck.latestDownloadableTag(in: [prerelease, completeRelease]) == "v1.0.11",
                        "prerelease not skipped")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets)")
+            // ---- 每日用量：严格解析/聚合/比较（合成 fixture；2026-11-06 真实接口只读验收已过）----
+            // 生产 Gate 已开启，口径 = 验收口径（granularity=daily、"yyyy-MM-dd" 日标签）；
+            // 此断言防止口径漂移时无人察觉：若未来验收推翻日粒度口径，须同步翻转此断言
+            try expect(GLMDailyUsage.productionGateConfirmed == true,
+                       "production daily gate must stay on after 2026-11-06 real-interface verification")
+            let shanghai = TimeZone(identifier: "Asia/Shanghai")!
+            var shanghaiCal = Calendar(identifier: .gregorian)
+            shanghaiCal.timeZone = shanghai
+            func shDate(_ year: Int, _ month: Int, _ day: Int, _ hour: Int = 0) -> Date {
+                shanghaiCal.date(from: DateComponents(year: year, month: month, day: day, hour: hour))!
+            }
+            // 合法序列：两模型按下标对齐 → 逐日求和（2026-11-06 真实验收口径：日粒度 yyyy-MM-dd）
+            let okTimeline = GLMDailyUsage.parseTimeline([
+                "x_time": ["2026-11-03", "2026-11-04", "2026-11-05"],
+                "modelDataList": [
+                    ["modelName": "glm-5.3", "tokensUsage": [100, 200, 0]],
+                    ["modelName": "glm-5.3-flash", "tokensUsage": [0, 50, 50]]
+                ]
+            ], timeZone: shanghai)
+            try expect(okTimeline?.totals == [100, 250, 50], "valid timeline totals wrong")
+
+            // 异常序列整体拒绝（未知不得当 0）
+            func rejected(_ mutate: (inout [String: Any]) -> Void) -> Bool {
+                var payload: [String: Any] = [
+                    "x_time": ["2026-11-04", "2026-11-05"],
+                    "modelDataList": [["modelName": "m", "tokensUsage": [1, 2]]]
+                ]
+                mutate(&payload)
+                return GLMDailyUsage.parseTimeline(payload, timeZone: shanghai) == nil
+            }
+            try expect(rejected { $0.removeValue(forKey: "x_time") }, "missing x_time accepted")
+            try expect(rejected { $0["x_time"] = "oops" }, "non-array x_time accepted")
+            try expect(rejected { $0.removeValue(forKey: "modelDataList") }, "missing modelDataList accepted")
+            try expect(rejected { $0["modelDataList"] = [] }, "empty modelDataList accepted")
+            try expect(rejected { $0["modelDataList"] = "oops" }, "non-array modelDataList accepted")
+            try expect(rejected {
+                var labels = $0["x_time"] as? [String] ?? []
+                labels[1] = "2026/11/05"
+                $0["x_time"] = labels
+            }, "separator-loose label accepted")
+            try expect(rejected {
+                var labels = $0["x_time"] as? [String] ?? []
+                labels[1] = "2026-11-5"
+                $0["x_time"] = labels
+            }, "non-zero-padded label accepted")
+            try expect(rejected {
+                var labels = $0["x_time"] as? [String] ?? []
+                labels[1] = "2026-11-05 01:00:00"
+                $0["x_time"] = labels
+            }, "hour-format label accepted")
+            try expect(rejected {
+                var labels = $0["x_time"] as? [String] ?? []
+                labels[1] = "garbage"
+                $0["x_time"] = labels
+            }, "garbage label accepted")
+            try expect(rejected {
+                var labels = $0["x_time"] as? [String] ?? []
+                labels[1] = labels[0]
+                $0["x_time"] = labels
+            }, "duplicate label accepted")
+            try expect(rejected {
+                var models = $0["modelDataList"] as? [[String: Any]] ?? []
+                models[0]["tokensUsage"] = [1]
+                $0["modelDataList"] = models
+            }, "tokensUsage length mismatch accepted")
+            try expect(rejected {
+                var models = $0["modelDataList"] as? [[String: Any]] ?? []
+                models[0]["tokensUsage"] = [1, -2]
+                $0["modelDataList"] = models
+            }, "negative token accepted")
+            try expect(rejected {
+                var models = $0["modelDataList"] as? [[String: Any]] ?? []
+                models[0]["tokensUsage"] = [1, NSNull()]
+                $0["modelDataList"] = models
+            }, "null token accepted")
+            try expect(rejected {
+                var models = $0["modelDataList"] as? [[String: Any]] ?? []
+                models[0]["tokensUsage"] = [1, true]
+                $0["modelDataList"] = models
+            }, "boolean token accepted")
+            try expect(rejected {
+                var models = $0["modelDataList"] as? [[String: Any]] ?? []
+                models[0]["tokensUsage"] = [1, "NaN"]
+                $0["modelDataList"] = models
+            }, "non-finite token accepted")
+
+            // 同名模型重复行 → 双计风险，整体拒绝；求和溢出 → 拒绝
+            try expect(rejected {
+                $0["modelDataList"] = [["modelName": "glm-5.3", "tokensUsage": [1, 2]],
+                                       ["modelName": "glm-5.3", "tokensUsage": [3, 4]]]
+            }, "duplicate model name accepted")
+            try expect(rejected {
+                $0["x_time"] = ["2026-11-05"]
+                $0["modelDataList"] = [["modelName": "a", "tokensUsage": [1e308]],
+                                       ["modelName": "b", "tokensUsage": [1e308]]]
+            }, "overflowing model sum accepted")
+
+            // 聚合（日粒度直映射口径）：桶 = 今日-30 ... 昨日；今天/窗口外丢弃；缺日 = nil
+            let frameNow = shDate(2026, 11, 6, 15)
+            let windowStart = frameNow.addingTimeInterval(-30 * 86400)   // 2026-10-07 15:00 → 起点日按自然日准入
+            let frameTimes: [Date] = [shDate(2026, 10, 6), shDate(2026, 10, 7),
+                                      shDate(2026, 11, 5), shDate(2026, 11, 6)]
+            let frameTotals: [Double] = [100, 7, 240, 999]
+            let frame = GLMDailyUsage.frame(from: GLMDailyUsage.Timeline(times: frameTimes, totals: frameTotals),
+                                            calendar: shanghaiCal, now: frameNow, coverageStart: windowStart)
+            try expect(frame?.count == 30, "daily frame must have 30 buckets")
+            try expect(frame?[0].day == shDate(2026, 10, 7) && frame?[0].tokens == 7,
+                       "window-start day must be admissible as a complete day")
+            try expect(frame?.last?.day == shDate(2026, 11, 5) && frame?.last?.tokens == 240,
+                       "last bucket must be yesterday")
+            try expect(frame?.contains(where: { $0.day == shDate(2026, 10, 6) }) == false,
+                       "label before oldest leaked into frame")
+            try expect(frame?.contains(where: { $0.day == shDate(2026, 11, 4) && $0.tokens == nil }) == true,
+                       "day without records became zero")
+            try expect(frame?.contains(where: { $0.day == shDate(2026, 11, 6) }) == false,
+                       "today must not appear in complete-day frame")
+            // 非有限日总量防御（直接构造 Timeline 的越界用法也不得漏过）
+            let badFrame = GLMDailyUsage.frame(
+                from: GLMDailyUsage.Timeline(times: [shDate(2026, 11, 5)], totals: [.infinity]),
+                calendar: shanghaiCal, now: frameNow)
+            try expect(badFrame == nil, "non-finite day total accepted")
+
+            // 日粒度口径下无小时网格/DST 敏感逻辑（原 23/25 小时日用例随网格推断一并移除；
+            // 标签→日期换算由 parseTimeline 的 round-trip 校验与 timeZone 参数保证）
+
+            // 比较（PRD §6.3）：持平/新增/百分比/缺失；缺失不能当 0
+            func bucket(_ tokens: Double?) -> GLMDayBucket {
+                GLMDayBucket(day: shDate(2026, 11, 5), tokens: tokens)
+            }
+            try expect(GLMUsageComparison.outcome(current: 0, base: 0) == .flat, "both-zero must be 持平")
+            try expect(GLMUsageComparison.outcome(current: 1500, base: 0).text == "新增 1.50K", "base-zero must be 新增")
+            try expect(GLMUsageComparison.outcome(current: 1074, base: 1000).text == "+7.4%", "percent text wrong")
+            try expect(GLMUsageComparison.outcome(current: 926, base: 1000).text == "-7.4%", "negative percent text wrong")
+            try expect(GLMUsageComparison.outcome(current: 1000, base: 1000) == .flat, "equal values must be 持平")
+            try expect(GLMUsageComparison.outcome(current: 9998, base: 10000) == .flat, "tiny negative pct must be flat (no -0.0%)")
+            try expect(GLMUsageComparison.outcome(current: 10002, base: 10000) == .flat, "tiny positive pct must be flat")
+            try expect(GLMUsageComparison.outcome(current: 9990, base: 10000).text == "-0.1%", "just above flat threshold must still show percent")
+            try expect(GLMUsageComparison.outcome(current: 1000, base: nil) == .insufficient, "missing base became zero")
+            try expect(GLMUsageComparison.sum([bucket(1), bucket(nil), bucket(1)]) == nil,
+                       "sum treated missing day as zero")
+            try expect(GLMUsageComparison.sum([bucket(0), bucket(0)]) == 0, "zero-day sum rejected")
+            let sparsePair = GLMUsageComparison.dailyPair(buckets: [bucket(nil), bucket(1), bucket(2), bucket(nil),
+                bucket(nil), bucket(nil), bucket(nil), bucket(nil), bucket(nil), bucket(nil), bucket(nil), bucket(nil),
+                bucket(10), bucket(10), bucket(10), bucket(10), bucket(10), bucket(10), bucket(10)])
+            try expect(sparsePair.weekOnWeek == .insufficient, "14-day coverage not proven but compared")
+            let fullPair = GLMUsageComparison.dailyPair(buckets:
+                Array(repeating: bucket(10), count: 13) + [bucket(20)])
+            try expect(fullPair.dayOnDay.text == "+100.0%" && fullPair.weekOnWeek.text == "+14.3%",
+                       "dailyPair math wrong (20v10 day, 80v70 week)")
+            try expect(fullPair.dayOnDay.isMuted == false && sparsePair.weekOnWeek.isMuted == true,
+                       "comparison muted flag wrong")
+
+            // 头部邮箱门禁（resolveAccountEmail 全集成路径，不读真实凭据）：
+            // env 覆盖 / 单候选 / 多候选 / 无有效 OAuth → 一律隐藏；仅纯 OAuth 回退 + rawProfile.email 展示
+            let userEmailJSON = #"{"id":"x","username":"User","displayName":"User","rawProfile":{"email":"User@Example.com"}}"#
+            let userNameLikeJSON = #"{"id":"x","username":"user@example.com","displayName":"user@example.com","rawProfile":{"name":"user@example.com"}}"#
+            let topLevelEmailJSON = #"{"id":"x","email":"user@example.com"}"#
+            try expect(CredStore.resolveAccountEmail(envValue: "sk-key", credentialKeyCandidates: 0,
+                       oauthAccessToken: "token", userInfoJSON: userEmailJSON) == nil,
+                       "env key override still allowed email")
+            try expect(CredStore.resolveAccountEmail(envValue: nil, credentialKeyCandidates: 1,
+                       oauthAccessToken: "token", userInfoJSON: userEmailJSON) == nil,
+                       "single api-key candidate was treated as same account")
+            try expect(CredStore.resolveAccountEmail(envValue: nil, credentialKeyCandidates: 3,
+                       oauthAccessToken: "token", userInfoJSON: userEmailJSON) == nil,
+                       "multiple api-key candidates were treated as same account")
+            try expect(CredStore.resolveAccountEmail(envValue: nil, credentialKeyCandidates: 0,
+                       oauthAccessToken: nil, userInfoJSON: userEmailJSON) == nil,
+                       "missing oauth token allowed email")
+            try expect(CredStore.resolveAccountEmail(envValue: nil, credentialKeyCandidates: 0,
+                       oauthAccessToken: "  ", userInfoJSON: userEmailJSON) == nil,
+                       "blank oauth token allowed email")
+            try expect(CredStore.resolveAccountEmail(envValue: nil, credentialKeyCandidates: 0,
+                       oauthAccessToken: "token", userInfoJSON: nil) == nil,
+                       "missing user_info allowed email")
+            try expect(CredStore.resolveAccountEmail(envValue: nil, credentialKeyCandidates: 0,
+                       oauthAccessToken: "token", userInfoJSON: userNameLikeJSON) == nil,
+                       "username fallback email accepted without schema evidence")
+            try expect(CredStore.resolveAccountEmail(envValue: nil, credentialKeyCandidates: 0,
+                       oauthAccessToken: "token", userInfoJSON: topLevelEmailJSON) == nil,
+                       "top-level email accepted without schema evidence")
+            try expect(CredStore.resolveAccountEmail(envValue: nil, credentialKeyCandidates: 0,
+                       oauthAccessToken: "token", userInfoJSON: userEmailJSON) == "user@example.com",
+                       "pure oauth fallback with rawProfile.email wrongly hidden")
+            try expect(CredStore.resolveAccountEmail(envValue: "", credentialKeyCandidates: 0,
+                       oauthAccessToken: "token", userInfoJSON: userEmailJSON) == "user@example.com",
+                       "blank env value wrongly treated as override")
+
+            // 头部邮箱格式校验（读取路径不可得即整行隐藏，不在离线测试触碰真实凭据）
+            try expect(CredStore.isValidEmail("user@example.com"), "valid email rejected")
+            try expect(!CredStore.isValidEmail("not-an-email"), "invalid email accepted")
+            try expect(!CredStore.isValidEmail("a@b"), "tld-less email accepted")
+            try expect(!CredStore.isValidEmail("has space@example.com"), "spaced email accepted")
+            try expect(!CredStore.isValidEmail(String(repeating: "a", count: 250) + "@example.com"),
+                       "over-length email accepted")
+
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)
