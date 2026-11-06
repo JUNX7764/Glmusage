@@ -55,6 +55,9 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 # 原生 Popover 假数据交互回归
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-popover-test
 
+# 每日用量交互回归（悬停/键盘/Tab 可达/零日缺失读取；与上一条错开 ≥5s 逐个跑）
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-test --preview-daily-gaps
+
 # 真实自检：读取本机凭据并联网，不属于离线测试
 ./GlmUsage.app/Contents/MacOS/GlmUsage --once
 ```

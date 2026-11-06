@@ -1,0 +1,157 @@
+<div id="glm-v02" aria-label="GLMUsage 原型 v0.2">
+  <div class="g2-caption">GLMUsage · 演示数据</div>
+  <div class="g2-stage viz-dotted-background">
+    <section class="g2-window" aria-label="GLM 余额面板">
+      <header class="g2-header"><span class="g2-appicon" aria-hidden="true">G<span></span></span><strong>GLM 余额（Pro 套餐）</strong></header>
+      <div class="g2-content">
+        <section class="g2-frozen" aria-label="保持现状的额度、峰谷状态和重置卡">
+          <div class="g2-reset-heading">重置时间</div>
+          <div class="g2-quota-row"><strong>5 小时</strong><strong class="g2-pct g2-green">94%</strong><div class="g2-track" role="progressbar" aria-label="5 小时剩余额度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="94"><span style="width:94%;background:var(--g2-green)"></span></div><strong class="g2-reset">11-07 周六 02:17</strong></div>
+          <div class="g2-credit">剩余 1,887 / 2,000 credits</div>
+          <div class="g2-quota-row"><strong>7 天</strong><strong class="g2-pct">62%</strong><div class="g2-track" role="progressbar" aria-label="7 天剩余额度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="62"><span style="width:62%"></span></div><strong class="g2-reset">11-10 周二 20:48</strong></div>
+          <div class="g2-credit">剩余 6,243 / 10,000 credits</div>
+          <div class="g2-expiry">套餐到期：2027-09-26 10:00</div>
+          <div class="g2-existing-card g2-peak"><div class="g2-card-heading"><i data-lucide="clock-3" aria-hidden="true"></i><strong>峰谷状态</strong></div><div>⚡ 非高峰 · 积分 5 折（下个高峰 11-09 14:00）</div></div>
+          <div class="g2-existing-card g2-reset-card"><div class="g2-card-heading"><i data-lucide="calendar-days" aria-hidden="true"></i><strong>重置卡</strong><button type="button" class="g2-existing-action cursor-interaction" aria-label="使用重置卡，原型不执行"><i data-lucide="ticket" aria-hidden="true"></i>使用重置卡</button></div><div class="g2-card-list"><div>5 小时卡 · 暂无可用</div><div>周卡 · 2026-12-22 23:59 过期</div><div>周卡 · 2026-12-22 23:59 过期</div><div>周卡 · 2026-12-22 23:59 过期</div></div></div>
+        </section>
+        <section class="g2-usage" aria-label="用量情况">
+          <button type="button" id="g2-usage-toggle" class="g2-section-toggle cursor-interaction" aria-expanded="true" aria-controls="g2-usage-content"><span><i data-lucide="layers" aria-hidden="true"></i><strong>用量情况</strong></span><i data-lucide="chevron-up" aria-hidden="true"></i></button>
+          <div id="g2-usage-content"><div class="g2-table-head"><span>周期</span><span>Token</span><span>调用次数</span><span></span></div>
+            <button type="button" id="g2-today" class="g2-period cursor-interaction" aria-expanded="false" aria-controls="g2-today-models"><span>今日</span><strong>1.84M</strong><strong>142</strong><i data-lucide="chevron-down" aria-hidden="true"></i></button><div id="g2-today-models" class="g2-models" hidden><div><span>GLM-5</span><span>1.40M</span></div><div><span>GLM-5-Flash</span><span>440K</span></div></div>
+            <button type="button" id="g2-week" class="g2-period cursor-interaction" aria-expanded="false" aria-controls="g2-week-models"><span>近 7 天</span><strong>11.12M</strong><strong>958</strong><i data-lucide="chevron-down" aria-hidden="true"></i></button><div id="g2-week-models" class="g2-models" hidden><div><span>GLM-5</span><span>8.70M</span></div><div><span>GLM-5-Flash</span><span>2.42M</span></div></div>
+            <button type="button" id="g2-month" class="g2-period cursor-interaction" aria-expanded="false" aria-controls="g2-month-models"><span>近 30 天</span><strong>42.80M</strong><strong>3,682</strong><i data-lucide="chevron-down" aria-hidden="true"></i></button><div id="g2-month-models" class="g2-models" hidden><div><span>GLM-5</span><span>33.60M</span></div><div><span>GLM-5-Flash</span><span>9.20M</span></div></div>
+          </div>
+        </section>
+        <section class="g2-daily" aria-label="每日用量">
+          <div class="g2-daily-heading"><span><i data-lucide="chart-no-axes-column" aria-hidden="true"></i><strong>每日用量</strong></span><span>近 30 天</span></div>
+          <div class="g2-selected" id="g2-selected" role="status" aria-live="polite">11 月 5 日 <strong>1.60M Token</strong></div>
+          <div class="g2-chart" id="g2-chart" role="group" aria-label="近 30 天每日 Token 用量"></div>
+          <div class="g2-chart-dates"><span>10/7</span><span>10/21</span><span>11/5</span></div>
+          <div class="g2-comparisons"><div><span>较昨日</span><strong id="g2-day-compare">+7.4%</strong></div><div><span>较前 7 天</span><strong id="g2-week-compare">+25.2%</strong></div></div>
+        </section>
+        <section class="g2-mcp" aria-label="MCP 工具">
+          <button type="button" id="g2-mcp-toggle" class="g2-section-toggle cursor-interaction" aria-expanded="false" aria-controls="g2-mcp-content"><span><i data-lucide="layers-2" aria-hidden="true"></i><strong>MCP 工具（近 30 天）</strong></span><i data-lucide="chevron-down" aria-hidden="true"></i></button><div id="g2-mcp-content" hidden>网络搜索 36 次 · 网页读取 18 次</div>
+        </section>
+      </div>
+      <footer class="g2-footer"><div class="g2-footer-meta"><span id="g2-refresh-time" role="status">最近尝试刷新 21:18</span><button type="button" class="g2-version cursor-interaction" aria-label="版本 v1.0.23，原型不联网检查">版本 v1.0.23</button></div><div class="g2-footer-actions"><button id="g2-refresh" type="button" class="g2-refresh cursor-interaction">立即刷新</button><label><input type="checkbox" checked>开机自启</label><button class="g2-quit cursor-interaction" type="button" aria-label="退出，原型不退出实际应用">退出</button></div></footer>
+    </section>
+  </div>
+</div>
+<style>
+#glm-v02{--g2-bg:light-dark(#fafbfc,#292c2c);--g2-text:light-dark(#1e2221,#f0f2f1);--g2-muted:light-dark(#7a7c7c,#b4b8b7);--g2-frozen-text:light-dark(#505252,#d1d5d3);--g2-green:light-dark(#3c8b67,#80bd9e);--g2-line:light-dark(#dcdede,#464c49);--g2-card:light-dark(#f4f4f5,#323635);--g2-track:light-dark(#dcdcdc,#474d4a);--g2-bar:light-dark(#444,#d0d8d3);--g2-primary:light-dark(#00664b,#8fc7aa);--g2-on-primary:light-dark(#fff,#193329);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;font-size:12px;line-height:1.45;color:var(--g2-text)}
+#glm-v02 *{box-sizing:border-box}
+#glm-v02 [hidden]{display:none!important}
+#glm-v02 button,#glm-v02 input{font:inherit;color:inherit}
+#glm-v02 button{border:0;background:none;padding:0}
+#glm-v02 strong{font-weight:600}
+#glm-v02 .g2-caption{font-size:12px;color:var(--g2-muted);margin-bottom:8px}
+#glm-v02 .g2-stage{display:flex;justify-content:center;padding:20px 8px 24px}
+#glm-v02 .g2-window{width:336px;max-width:100%;background:var(--g2-bg);border:1px solid var(--g2-line);border-radius:16px;box-shadow:0 10px 26px light-dark(#17271b18,#00000040);overflow:hidden}
+#glm-v02 .g2-header{display:flex;align-items:center;gap:15px;padding:15px 16px;border-bottom:1px solid var(--g2-line);font-size:15px;min-height:65px}
+#glm-v02 .g2-appicon{display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0;width:27px;height:27px;border-radius:7px;background:light-dark(#123d33,#a1cbb8);color:light-dark(#fff,#18392b);font-size:22px;font-weight:600;line-height:1;position:relative}
+#glm-v02 .g2-appicon>span{width:11px;height:1px;background:var(--g2-green);position:absolute;bottom:5px}
+#glm-v02 .g2-content{padding:0 15px 10px}
+#glm-v02 .g2-frozen{color:var(--g2-frozen-text);padding-top:9px}
+#glm-v02 .g2-reset-heading{text-align:right;color:var(--g2-muted);font-size:10px;font-weight:500;margin-bottom:8px}
+#glm-v02 .g2-quota-row{display:grid;grid-template-columns:36px 34px minmax(20px,1fr) 110px;gap:4px;align-items:center;min-height:19px;font-size:11px;white-space:nowrap}
+#glm-v02 .g2-pct{font-size:12px}
+#glm-v02 .g2-green{color:var(--g2-green)}
+#glm-v02 .g2-track{height:8px;border-radius:5px;background:var(--g2-track);overflow:hidden}
+#glm-v02 .g2-track>span{display:block;height:100%;background:var(--g2-bar);border-radius:inherit}
+#glm-v02 .g2-reset{text-align:right;font-size:10px;font-variant-numeric:tabular-nums;letter-spacing:.15px}
+#glm-v02 .g2-credit{font-size:11px;font-weight:500;color:var(--g2-muted);margin:7px 0 8px;font-variant-numeric:tabular-nums}
+#glm-v02 .g2-expiry{color:var(--g2-muted);font-size:11px;font-weight:500;margin:8px 0}
+#glm-v02 .g2-existing-card{border:1px solid var(--g2-line);border-radius:12px;background:var(--g2-card);padding:7px 8px 8px;margin-top:8px}
+#glm-v02 .g2-card-heading{display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:4px;min-height:17px}
+#glm-v02 .g2-card-heading>svg{width:14px;height:14px;color:var(--g2-green);flex-shrink:0}
+#glm-v02 .g2-peak>div:last-child{font-size:11px;font-weight:500;white-space:nowrap}
+#glm-v02 .g2-existing-action{display:inline-flex;align-items:center;gap:5px;color:var(--g2-muted);font-size:11px;font-weight:500}
+#glm-v02 .g2-existing-action>svg{width:14px;height:14px}
+#glm-v02 .g2-card-list{font-size:11px;font-weight:500;color:var(--g2-muted);display:grid;gap:3px;font-variant-numeric:tabular-nums}
+#glm-v02 .g2-usage{margin-top:12px}
+#glm-v02 .g2-section-toggle{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:27px;text-align:left}
+#glm-v02 .g2-section-toggle>span,#glm-v02 .g2-daily-heading>span:first-child{display:flex;align-items:center;gap:8px;font-size:12px}
+#glm-v02 .g2-section-toggle>span>svg,#glm-v02 .g2-daily-heading>span>svg{color:var(--g2-green);width:16px;height:16px;flex-shrink:0}
+#glm-v02 .g2-section-toggle>svg{width:12px;height:12px;color:var(--g2-muted)}
+#glm-v02 .g2-table-head,#glm-v02 .g2-period{display:grid;grid-template-columns:minmax(90px,1.4fr) minmax(70px,1fr) minmax(65px,.9fr) 12px;gap:5px;align-items:center;text-align:right;width:100%;font-variant-numeric:tabular-nums}
+#glm-v02 .g2-table-head>span:first-child,#glm-v02 .g2-period>span:first-child{text-align:left}
+#glm-v02 .g2-table-head{font-size:10px;color:var(--g2-muted);padding:7px 0 5px}
+#glm-v02 .g2-period{font-size:11px;min-height:29px}
+#glm-v02 .g2-period>strong:first-of-type{color:var(--g2-green)}
+#glm-v02 .g2-period>svg{width:9px;height:9px;color:var(--g2-muted);justify-self:end}
+#glm-v02 .g2-period[aria-expanded="true"]>svg{transform:rotate(180deg)}
+#glm-v02 .g2-models{padding:3px 0 7px 12px;display:grid;gap:5px;color:var(--g2-muted);font-size:11px}
+#glm-v02 .g2-models>div{display:grid;grid-template-columns:minmax(90px,1.4fr) minmax(70px,1fr) minmax(65px,.9fr) 12px;gap:5px}
+#glm-v02 .g2-models>div>span:nth-child(2){text-align:right;font-variant-numeric:tabular-nums}
+#glm-v02 .g2-daily{padding-top:12px;margin-top:8px;border-top:1px solid var(--g2-line)}
+#glm-v02 .g2-daily-heading{display:flex;justify-content:space-between;align-items:center;gap:10px}
+#glm-v02 .g2-daily-heading>span:last-child{font-size:10px;color:var(--g2-muted)}
+#glm-v02 .g2-selected{display:flex;justify-content:space-between;gap:8px;font-size:10px;color:var(--g2-muted);min-height:17px;margin:10px 0 7px;font-variant-numeric:tabular-nums}
+#glm-v02 .g2-selected>strong{color:var(--g2-text);font-weight:500}
+#glm-v02 .g2-chart{height:62px;display:flex;align-items:stretch;gap:3px;border-bottom:1px solid var(--g2-line)}
+#glm-v02 .g2-chart>button{display:flex;align-items:flex-end;flex:1;min-width:0;min-height:44px;position:relative}
+#glm-v02 .g2-chart>button>span{display:block;width:100%;height:var(--day-height);background:var(--g2-green);border-radius:2px 2px 0 0;opacity:.48}
+#glm-v02 .g2-chart>button:hover>span,#glm-v02 .g2-chart>button:focus-visible>span,#glm-v02 .g2-chart>button[aria-pressed="true"]>span{opacity:1}
+#glm-v02 .g2-chart-dates{display:flex;justify-content:space-between;font-size:10px;color:var(--g2-muted);margin-top:4px}
+#glm-v02 .g2-comparisons{display:grid;grid-template-columns:1fr 1fr;gap:0;margin-top:8px;padding:5px 0;font-size:11px;background:var(--g2-card);border-radius:9px}
+#glm-v02 .g2-comparisons>div{display:flex;justify-content:center;gap:5px;align-items:center;min-height:20px;white-space:nowrap}
+#glm-v02 .g2-comparisons>div+div{border-left:1px solid var(--g2-line)}
+#glm-v02 .g2-comparisons>div>span{color:var(--g2-frozen-text)}
+#glm-v02 .g2-comparisons strong{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+#glm-v02 .g2-mcp{margin-top:10px}
+#glm-v02 #g2-mcp-content{font-size:11px;color:var(--g2-muted);padding:8px 0 4px}
+#glm-v02 .g2-footer{border-top:1px solid var(--g2-line);padding:12px 15px 11px}
+#glm-v02 .g2-footer-meta,#glm-v02 .g2-footer-actions{display:flex;justify-content:space-between;align-items:center;gap:8px}
+#glm-v02 .g2-footer-meta{font-size:11px;color:var(--g2-muted);margin-bottom:9px}
+#glm-v02 .g2-version{font-size:11px;color:var(--g2-text)}
+#glm-v02 .g2-refresh{background:var(--g2-primary);color:var(--g2-on-primary);border-radius:6px;min-height:30px;padding:5px 11px;font-size:12px;font-weight:600}
+#glm-v02 .g2-footer-actions>label{display:flex;align-items:center;gap:5px;font-size:12px}
+#glm-v02 input{width:15px;height:15px;margin:0;accent-color:var(--g2-primary)}
+#glm-v02 .g2-quit{font-size:12px;padding:5px 2px}
+@media(max-width:370px){#glm-v02 .g2-stage{padding-inline:0}#glm-v02 .g2-content{padding-inline:12px}#glm-v02 .g2-header{padding-inline:12px;gap:10px}#glm-v02 .g2-quota-row{grid-template-columns:34px 32px minmax(16px,1fr) 105px;gap:3px}#glm-v02 .g2-peak>div:last-child{white-space:normal}#glm-v02 .g2-table-head,#glm-v02 .g2-period,#glm-v02 .g2-models>div{grid-template-columns:minmax(75px,1.2fr) minmax(60px,1fr) minmax(60px,.9fr) 10px}#glm-v02 .g2-comparisons{gap:0}}
+</style>
+<script>
+(() => {
+  const root = document.getElementById('glm-v02');
+  const get = id => root.querySelector('#' + id);
+  const state = { expanded: {today:false,week:false,month:false}, usage:true, mcp:false, selected:29 };
+  const daily = [.63,.78,1.12,.44,.94,1.52,.73,0,.68,1.31,1.10,.86,.54,1.44,1.08,.90,.73,1.62,1.24,.58,.91,1.28,1.06,1.48,.77,1.37,1.02,1.56,1.49,1.60];
+  function restore(snapshot){
+    const p=snapshot?.privateContent;
+    if(!p||p.prototype!=='glm-v02') return;
+    if(p.expanded) ['today','week','month'].forEach(k=>{if(typeof p.expanded[k]==='boolean') state.expanded[k]=p.expanded[k];});
+    ['usage','mcp'].forEach(k=>{if(typeof p[k]==='boolean') state[k]=p[k];});
+    if(Number.isInteger(p.selected)&&p.selected>=0&&p.selected<daily.length)state.selected=p.selected;
+  }
+  function save(){if(window.zcode?.setWidgetState)window.zcode.setWidgetState({modelContent:{product:'GLMUsage',prototype:'v0.2',expanded:state.expanded},privateContent:{prototype:'glm-v02',...state}}).catch(()=>{});}
+  const chart=get('g2-chart');
+  daily.forEach((n,i)=>{
+    const day=new Date(Date.UTC(2026,9,7+i));
+    const label=(day.getUTCMonth()+1)+' 月 '+day.getUTCDate()+' 日';
+    const b=document.createElement('button');b.type='button';b.className='cursor-interaction';b.setAttribute('aria-label',label+'，'+n.toFixed(2)+'M Token');
+    const bar=document.createElement('span');bar.style.setProperty('--day-height',(n/1.8*100)+'%');b.append(bar);
+    function select(persist){state.selected=i;renderSelected();if(persist)save();}
+    b.addEventListener('mouseenter',()=>select(false));b.addEventListener('focus',()=>select(false));b.addEventListener('click',()=>select(true));
+    b.addEventListener('keydown',e=>{if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();state.selected=Math.min(daily.length-1,Math.max(0,state.selected+(e.key==='ArrowRight'?1:-1)));chart.children[state.selected].focus();save();}});
+    chart.append(b);
+  });
+  function renderSelected(){
+    const date=new Date(Date.UTC(2026,9,7+state.selected));
+    get('g2-selected').innerHTML='<span>'+(date.getUTCMonth()+1)+' 月 '+date.getUTCDate()+' 日</span><strong>'+daily[state.selected].toFixed(2)+'M Token</strong>';
+    Array.from(chart.children).forEach((b,i)=>b.setAttribute('aria-pressed',String(i===state.selected)));
+  }
+  function render(){
+    ['today','week','month'].forEach(k=>{get('g2-'+k+'-models').hidden=!state.expanded[k];get('g2-'+k).setAttribute('aria-expanded',String(state.expanded[k]));});
+    get('g2-usage-content').hidden=!state.usage;get('g2-usage-toggle').setAttribute('aria-expanded',String(state.usage));
+    get('g2-mcp-content').hidden=!state.mcp;get('g2-mcp-toggle').setAttribute('aria-expanded',String(state.mcp));
+    renderSelected();
+  }
+  ['today','week','month'].forEach(k=>get('g2-'+k).addEventListener('click',()=>{state.expanded[k]=!state.expanded[k];render();save();}));
+  get('g2-usage-toggle').addEventListener('click',()=>{state.usage=!state.usage;render();save();});
+  get('g2-mcp-toggle').addEventListener('click',()=>{state.mcp=!state.mcp;render();save();});
+  get('g2-refresh').addEventListener('click',()=>{get('g2-refresh-time').textContent='最近尝试刷新 '+new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false});});
+  restore(window.zcode?.widgetState);render();
+  window.addEventListener('zcode:set_globals',e=>{if(e.detail?.globals?.widgetState){restore(e.detail.globals.widgetState);render();}});
+  if(globalThis.Tweak){const t=new Tweak({container:root,onChange:()=>{render();save();}});t.addToggle(state,'usage',{label:'展开用量情况'});t.addToggle(state,'mcp',{label:'展开 MCP 工具'});}
+})();
+</script>
