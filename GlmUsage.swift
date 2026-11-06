@@ -784,6 +784,7 @@ enum Fmt {
     }
     private static let timeFmt = zhFormatter("HH:mm")
     private static let dayTimeFmt = zhFormatter("MM-dd HH:mm")
+    private static let weekDayTimeFmt = zhFormatter("MM-dd E HH:mm")
     private static let expiresTodayFmt = zhFormatter("'今天' HH:mm")
     private static let expiresTomorrowFmt = zhFormatter("'明天' HH:mm")
     private static let expiresFullFmt = zhFormatter("yyyy-MM-dd HH:mm")
@@ -802,6 +803,11 @@ enum Fmt {
     static func dayTime(_ d: Date?) -> String {
         guard let d = d else { return "" }
         return dayTimeFmt.string(from: d)
+    }
+    // 7 天窗口重置时间：带周几（重置必在 7 天内，年份无信息量），如 "12-06 周六 13:46"
+    static func weekDayTime(_ d: Date?) -> String {
+        guard let d = d else { return "" }
+        return weekDayTimeFmt.string(from: d)
     }
     // 重置卡/套餐到期提示：今天内 → "今天 HH:mm"；明天 → "明天 HH:mm"；否则完整日期（本地时区）
     static func expires(_ d: Date) -> String {
@@ -1888,7 +1894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             if let e = e {
                 s += "剩余 \(Fmt.pctLong(e.usedRemainingRatio))"
                 if e.limit > 0 { s += "（剩 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits）" }
-                if e.reset != nil { s += e.isFiveHour ? "（\(Fmt.time(e.reset)) 重置）" : "（\(Fmt.dayTime(e.reset)) 重置）" }
+                if e.reset != nil { s += e.isFiveHour ? "（\(Fmt.time(e.reset)) 重置）" : "（\(Fmt.weekDayTime(e.reset)) 重置）" }
             } else { s += "暂无数据" }
             if stale { s += " · ⚠️ 数据已过期" }
             if let error = error { s += " · 刷新失败：\(error)" }
@@ -2253,13 +2259,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             item.heightAnchor.constraint(equalToConstant: 26).isActive = true
             return item
         }
-        func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool) {
+        func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool, weekDay: Bool = false) {
             let r = row()
             let title = label(name, size: 11, bold: true); title.widthAnchor.constraint(equalToConstant: 36).isActive = true; r.addArrangedSubview(title)
             let ratio = entry?.usedRemainingRatio
             let pct = label(Fmt.pct(ratio), size: 12, bold: true, color: GLMRemainingColor.color(ratio)); pct.widthAnchor.constraint(equalToConstant: 34).isActive = true; r.addArrangedSubview(pct)
             let bar = GLMQuotaBar(ratio); bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true; r.addArrangedSubview(bar)
-            let reset = label(entry?.reset.map { Fmt.fullTime.string(from: $0) } ?? "时间未知", size: 10, bold: true)
+            let reset = label(entry?.reset.map { weekDay ? Fmt.weekDayTime($0) : Fmt.fullTime.string(from: $0) } ?? "时间未知", size: 10, bold: true)
             reset.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
             reset.alignment = .right
             reset.lineBreakMode = .byTruncatingTail
@@ -2277,7 +2283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         else if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
         let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor); resetHeading.alignment = .right; add(resetHeading)
         quota(usage.fiveHour, "5 小时", usage.fiveHourError, usage.fiveHourWarning, fiveHourLastOK, fiveHourStale)
-        quota(usage.week, "7 天", usage.weekError, usage.weekWarning, weekLastOK, weekStale)
+        quota(usage.week, "7 天", usage.weekError, usage.weekWarning, weekLastOK, weekStale, weekDay: true)
         if let sub = usage.subscription {
             let expiry = sub.expireDate.map { "套餐到期：\(Fmt.fullTime.string(from: $0))" } ?? "套餐到期：暂无数据"
             add(label(expiry, color: .secondaryLabelColor))
