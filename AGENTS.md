@@ -44,6 +44,7 @@ GLM Coding Plan 用量菜单栏工具（对标 `~/Documents/kimi/workspace/kimi-
 - 与用户（君晓）沟通用中文，保留英文技术术语。
 - 用户是非程序员（HRBP / PM / Investor），解释技术决策时避免底层细节堆砌，直接给结论和可选项。
 - 改代码后必须重新 `./build.sh` + `--self-test` + `--peak-test` 并报告结果。`--once` 属于真实凭据/网络验收，不作为离线回归步骤；敏感信息（API key 等）不得出现在代码、提交或日志输出中。
+- 用户说明以 `README.md` 为入口；当前构建、测试、发布和权限边界见 `docs/DEVELOPMENT.md`，架构、维护与发布约定见 `docs/project/`。判断当前行为须核对源码与测试，不使用空模板或历史记录代替当前规格。
 
 ## 修改本文件
 
