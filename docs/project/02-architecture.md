@@ -19,6 +19,7 @@ GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当前
 |---|---|
 | `CredStore` | 只读解密 ZCode 凭据，提供 API key 与 OAuth token |
 | `Fetcher` | 智谱额度、模型、工具、订阅和 ZCode 重置卡请求 |
+| `GLMStartPlanUsage` | 只读 ZCode 请求用量表，将赠送用量按周期、模型和自然日补入现有统计 |
 | `Peak` | 高峰、非高峰和限时活动的本地时段计算 |
 | `UpdateChecker` | 检查 GitHub Release 和更新资产 |
 | `UpdateProgressController` | 后台更新、进度恢复和错误展示 |
@@ -32,6 +33,8 @@ GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当前
 ### 额度、用量与订阅
 
 ZCode 本地加密凭据 → 内存 API key / OAuth token → 智谱与 ZCode 接口 → 新鲜度和错误合并 → Popover 与诊断状态。
+
+模型统计在同一刷新中合并本机 `model_usage` 的国内 Start Plan 请求。逐次请求的时间和 Token 总数用于周期汇总及日图，同名模型合并；服务端原始值加本次本机快照后进入新鲜度处理，重复刷新不会累加旧值。SQLite 只读，查询与网络回调在后台运行；无本机请求表时保留原统计，读取异常时沿用上次完整值。环境变量覆盖 API key 时只使用服务端统计。
 
 凭据文件保持只读。认证信息会发送给对应智谱／ZCode 服务，不发送到开发者自有服务器，也不得写入仓库、日志或状态文件。
 
