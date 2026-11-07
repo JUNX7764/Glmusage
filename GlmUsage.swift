@@ -2,6 +2,7 @@ import Cocoa
 import CryptoKit
 import Foundation
 import CoreFoundation
+import SQLite3
 
 // MARK: - 凭证读取（复用 ZCode 本地加密凭证库）
 //
@@ -184,9 +185,101 @@ struct GLMDayBucket: Equatable {
     let tokens: Double?
 }
 
+/// Start Plan 通过 ZCode 自有网关计量，未进入 Coding Plan 的 model-usage。
+/// balance 仅有额度桶累计值，周期统计必须使用本机逐次请求记录。
+enum GLMStartPlanUsage {
+    struct ReadFailure: Error {}
+
+    struct Record {
+        let startedAt: Date
+        let model: String
+        let tokens: Double
+    }
+
+    struct Snapshot {
+        let records: [Record]
+
+        func merging(_ usage: ModelUsage, from: Date, to: Date) -> ModelUsage {
+            let included = records.filter { $0.startedAt >= from && $0.startedAt <= to }
+            var models: [String: (name: String, tokens: Double)] = [:]
+            for model in usage.byModel {
+                let key = model.name.lowercased()
+                let old = models[key]
+                models[key] = (old?.name ?? model.name, (old?.tokens ?? 0) + model.tokens)
+            }
+            for record in included {
+                let key = record.model.lowercased()
+                let old = models[key]
+                models[key] = (old?.name ?? record.model, (old?.tokens ?? 0) + record.tokens)
+            }
+            return ModelUsage(totalTokens: usage.totalTokens + included.reduce(0) { $0 + $1.tokens },
+                              totalCalls: usage.totalCalls + Double(included.count),
+                              byModel: models.keys.sorted().compactMap { models[$0] })
+        }
+
+        func merging(_ buckets: [GLMDayBucket], calendar: Calendar = .current) -> [GLMDayBucket] {
+            var totals: [Date: Double] = [:]
+            for record in records {
+                totals[calendar.startOfDay(for: record.startedAt), default: 0] += record.tokens
+            }
+            // 官方缺失日仍为未知，不能用局部的赠送记录冒充完整日统计。
+            return buckets.map { bucket in
+                GLMDayBucket(day: bucket.day, tokens: bucket.tokens.map { $0 + (totals[bucket.day] ?? 0) })
+            }
+        }
+    }
+
+    static func load(from: Date, to: Date, databasePath: String = NSHomeDirectory()
+                     + "/.zcode/cli/db/db.sqlite", calendar: Calendar = .current) throws -> Snapshot {
+        guard FileManager.default.fileExists(atPath: databasePath) else { return Snapshot(records: []) }
+        var database: OpaquePointer?
+        let opened = sqlite3_open_v2(databasePath, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil)
+        defer { sqlite3_close(database) }
+        guard opened == SQLITE_OK else { throw ReadFailure() }
+        sqlite3_busy_timeout(database, 1_000)
+
+        // 每个主键对应一次实际请求尝试。重试产生的额外消耗保留，付费订阅不重复计入。
+        // provider_total_tokens 已包含缓存输入，不能再累加 cache_read_input_tokens。
+        let query = """
+            SELECT started_at, model_id, COALESCE(provider_total_tokens, computed_total_tokens)
+            FROM model_usage
+            WHERE provider_id IN ('account:bigmodel-start-plan', 'builtin:bigmodel-start-plan')
+              AND started_at >= ? AND started_at <= ? AND status != 'running'
+              AND COALESCE(provider_total_tokens, computed_total_tokens) > 0
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK else {
+            // 较早的 ZCode 尚未保存逐次请求表，保留原有服务端统计。
+            if String(cString: sqlite3_errmsg(database)) == "no such table: model_usage" {
+                return Snapshot(records: [])
+            }
+            throw ReadFailure()
+        }
+        // 日图的首日沿用官方自然日口径，周期总量再按精确的窗口起点筛选。
+        sqlite3_bind_double(statement, 1, calendar.startOfDay(for: from).timeIntervalSince1970 * 1_000)
+        sqlite3_bind_double(statement, 2, to.timeIntervalSince1970 * 1_000)
+        var records: [Record] = []
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
+            guard sqlite3_column_type(statement, 0) == SQLITE_INTEGER,
+                  let rawModel = sqlite3_column_text(statement, 1),
+                  sqlite3_column_type(statement, 2) == SQLITE_INTEGER else { throw ReadFailure() }
+            let tokens = sqlite3_column_double(statement, 2)
+            let model = String(cString: rawModel).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard tokens.isFinite, tokens > 0, !model.isEmpty else { throw ReadFailure() }
+            records.append(Record(startedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 0) / 1_000),
+                                  model: model, tokens: tokens))
+            step = sqlite3_step(statement)
+        }
+        guard step == SQLITE_DONE else { throw ReadFailure() }
+        return Snapshot(records: records)
+    }
+}
+
 // MARK: - 每日用量（近 30 天完整自然日）
 //
-// 数据来源：复用现有 30 天慢刷新的 model-usage 响应，不新增请求/定时器。
+// 数据来源：30 天慢刷新的 model-usage 响应 + 本机 Start Plan 逐次用量，不新增请求/定时器。
 // 真实接口口径（2026-11-06 只读验收，主会话探针，与 totalUsage 逐日求和精确配平）：
 // granularity=daily，x_time 为本地自然日 "yyyy-MM-dd" 标签（30 天窗返回 31 个、
 // 严格递增、零缺口、首标签=请求起点日），modelDataList[].tokensUsage 与标签按下标对齐。
@@ -711,13 +804,27 @@ enum Fetcher {
     /// （复用同一响应，不新增请求；Gate 已于 2026-11-06 真实验收确认，解析失败仍整体拒绝）
     static func fetchModelUsage(apiKey: String, from: Date, to: Date,
                                 completion: @escaping (ModelUsage?, [GLMDayBucket]?, Bool, String?) -> Void) {
+        // 环境变量可指向其他账号，其用量不能与当前 ZCode 的本机记录直接合并。
+        let externalKey = ProcessInfo.processInfo.environment[CredStore.envKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         fetch(apiKey: apiKey, path: "/api/monitor/usage/model-usage", from: from, to: to) { data, err in
             guard let data = data, err == nil else { completion(nil, nil, false, err ?? "no data"); return }
             guard let usage = parseModelUsage(data) else {
                 completion(nil, nil, false, "missing or invalid model usage fields"); return
             }
             let daily = Self.dailyBuckets(from: data, windowStart: from, now: Date())
-            completion(usage, daily.buckets, daily.parseFailed, nil)
+            guard externalKey?.isEmpty != false else {
+                completion(usage, daily.buckets, daily.parseFailed, nil)
+                return
+            }
+            do {
+                let startPlan = try GLMStartPlanUsage.load(from: from, to: to)
+                completion(startPlan.merging(usage, from: from, to: to),
+                           daily.buckets.map { startPlan.merging($0) }, daily.parseFailed, nil)
+            } catch {
+                // 整次合并失败，沿用现有 freshness 逻辑保留上次完整统计。
+                completion(nil, nil, false, "赠送用量暂不可用")
+            }
         }
     }
 
@@ -4050,6 +4157,74 @@ enum GLMOfflineRegression {
             try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 10,
                 "totalModelCallCount": 3]])?.totalCalls == 3,
                 "valid model call count changed")
+
+            // 临时 SQLite 覆盖真实读取 → 周期总量/模型合并 → 日图的整条补统计路径。
+            let startPlanPath = root.appendingPathComponent("zcode.sqlite").path
+            var fixtureDB: OpaquePointer?
+            try expect(sqlite3_open(startPlanPath, &fixtureDB) == SQLITE_OK, "cannot create usage fixture")
+            defer { sqlite3_close(fixtureDB) }
+            let calendar = Calendar.current
+            let todayStart = calendar.startOfDay(for: now)
+            let yesterdayStart = calendar.date(byAdding: .day, value: -1, to: todayStart)!
+            let sevenStart = now.addingTimeInterval(-7 * 86_400)
+            let thirtyStart = now.addingTimeInterval(-30 * 86_400)
+            func insertUsage(_ id: Int, _ date: Date, _ provider: String, _ model: String,
+                             _ status: String, _ reported: String, _ computed: Int) throws {
+                let sql = """
+                    INSERT INTO model_usage VALUES (\(id), \(Int64(date.timeIntervalSince1970 * 1_000)),
+                    '\(provider)', '\(model)', '\(status)', \(reported), \(computed));
+                    """
+                try expect(sqlite3_exec(fixtureDB, sql, nil, nil, nil) == SQLITE_OK, "cannot insert usage fixture")
+            }
+            try expect(sqlite3_exec(fixtureDB, """
+                CREATE TABLE model_usage (id INTEGER PRIMARY KEY, started_at INTEGER, provider_id TEXT,
+                    model_id TEXT, status TEXT, provider_total_tokens INTEGER, computed_total_tokens INTEGER);
+                """, nil, nil, nil) == SQLITE_OK, "cannot create usage table")
+            try insertUsage(1, todayStart, "account:bigmodel-start-plan", "glm-5.3-flash", "completed", "100", 900)
+            try insertUsage(2, now, "builtin:bigmodel-start-plan", "GLM-5.3-Flash", "error", "NULL", 40)
+            try insertUsage(3, yesterdayStart, "account:bigmodel-start-plan", "GLM-5.3-Flash", "completed", "200", 200)
+            try insertUsage(4, sevenStart.addingTimeInterval(-1), "account:bigmodel-start-plan", "GLM-5.3", "completed", "300", 300)
+            try insertUsage(5, thirtyStart.addingTimeInterval(-1), "account:bigmodel-start-plan", "GLM-5.3", "completed", "400", 400)
+            try insertUsage(6, now, "account:bigmodel-individual-coding-plan", "GLM-5.3-Flash", "completed", "9999", 9999)
+            try insertUsage(7, now, "account:zai-start-plan", "GLM-5.3-Flash", "completed", "9999", 9999)
+            try insertUsage(8, now, "account:bigmodel-start-plan", "GLM-5.3-Flash", "running", "9999", 9999)
+            try insertUsage(9, now, "account:bigmodel-start-plan", "GLM-5.3-Flash", "cancelled", "NULL", 0)
+            try insertUsage(10, now.addingTimeInterval(1), "account:bigmodel-start-plan", "GLM-5.3-Flash", "completed", "9999", 9999)
+            let startPlan = try GLMStartPlanUsage.load(from: thirtyStart, to: now, databasePath: startPlanPath)
+            let officialUsage = ModelUsage(totalTokens: 10, totalCalls: 1, byModel: [("GLM-5.3-Flash", 10)])
+            let mergedToday = startPlan.merging(officialUsage, from: todayStart, to: now)
+            try expect(mergedToday.totalTokens == 150 && mergedToday.totalCalls == 3
+                       && mergedToday.byModel.count == 1 && mergedToday.byModel[0].name == "GLM-5.3-Flash"
+                       && mergedToday.byModel[0].tokens == 150,
+                       "Start Plan today/provider filtering/cache accounting/model merge changed")
+            let mergedSeven = startPlan.merging(officialUsage, from: sevenStart, to: now)
+            let mergedThirty = startPlan.merging(officialUsage, from: thirtyStart, to: now)
+            try expect(mergedSeven.totalTokens == 350 && mergedSeven.totalCalls == 4
+                       && mergedThirty.totalTokens == 650 && mergedThirty.totalCalls == 5,
+                       "Start Plan rolling window boundaries changed")
+            try expect(startPlan.merging(officialUsage, from: todayStart, to: now).totalTokens == 150,
+                       "refresh counted Start Plan more than once")
+            let mergedDays = startPlan.merging([GLMDayBucket(day: yesterdayStart, tokens: 20),
+                                                GLMDayBucket(day: todayStart, tokens: nil)])
+            try expect(mergedDays[0].tokens == 220 && mergedDays[1].tokens == nil,
+                       "Start Plan daily merge lost a day or fabricated complete missing data")
+            let oldestDay = calendar.startOfDay(for: thirtyStart)
+            try expect(startPlan.merging([GLMDayBucket(day: oldestDay, tokens: 0)])[0].tokens == 400,
+                       "Start Plan day chart lost the partial rolling window's full natural day")
+            let missingStartPlan = try GLMStartPlanUsage.load(from: thirtyStart, to: now,
+                databasePath: root.appendingPathComponent("missing.sqlite").path)
+            try expect(missingStartPlan.records.isEmpty, "missing optional ZCode database was rejected")
+            try expect(sqlite3_exec(fixtureDB, "DROP TABLE model_usage", nil, nil, nil) == SQLITE_OK,
+                       "cannot prepare older ZCode fixture")
+            let olderStartPlan = try GLMStartPlanUsage.load(from: thirtyStart, to: now, databasePath: startPlanPath)
+            try expect(olderStartPlan.records.isEmpty, "older ZCode broke existing server usage")
+            try expect(sqlite3_exec(fixtureDB, "CREATE TABLE model_usage (unrecognized TEXT)", nil, nil, nil) == SQLITE_OK,
+                       "cannot prepare incompatible ZCode fixture")
+            var rejectedStartPlanSchema = false
+            do { _ = try GLMStartPlanUsage.load(from: thirtyStart, to: now, databasePath: startPlanPath) }
+            catch { rejectedStartPlanSchema = true }
+            try expect(rejectedStartPlanSchema, "unreadable Start Plan silently became zero")
+
             let visibleModels = TokenModelList.visible([
                 (name: "GLM-5.3", tokens: 13_980_000),
                 (name: "GLM-5.3-Flash", tokens: 39_830_000),
@@ -4527,7 +4702,7 @@ enum GLMOfflineRegression {
             try expect(!CredStore.isValidEmail(String(repeating: "a", count: 250) + "@example.com"),
                        "over-length email accepted")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures)")
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)
