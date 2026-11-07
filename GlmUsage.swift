@@ -285,6 +285,7 @@ enum GLMDailyUsage {
 /// 百分比 = (当前 − 基期) / 基期 × 100%，一位小数；双方 0 或 |pct|<0.05 → 持平；
 /// 基期 0 且当前 > 0 → 「新增 N」；任一必要日缺失 → 「数据不足」。
 enum GLMUsageComparison {
+    enum Direction { case increase, decrease, neutral }
     enum Outcome: Equatable {
         case percent(String)   // "+7.4%" / "-3.2%"（中性展示，不暗示增减好坏）
         case flat              // 持平
@@ -304,6 +305,14 @@ enum GLMUsageComparison {
             switch self {
             case .percent, .added: return false
             case .flat, .insufficient: return true
+            }
+        }
+
+        var direction: Direction {
+            switch self {
+            case .percent(let value): return value.hasPrefix("-") ? .decrease : .increase
+            case .added: return .increase
+            case .flat, .insufficient: return .neutral
             }
         }
     }
@@ -1591,16 +1600,18 @@ final class GLMPanelAction: NSButton {
 }
 
 final class GLMQuotaBar: NSView {
+    private static let barHeight: CGFloat = 6
     let remaining: Double?
-    init(_ remaining: Double?) { self.remaining = remaining; super.init(frame: .zero); translatesAutoresizingMaskIntoConstraints = false; heightAnchor.constraint(equalToConstant: 8).isActive = true }
+    init(_ remaining: Double?) { self.remaining = remaining; super.init(frame: .zero); translatesAutoresizingMaskIntoConstraints = false; heightAnchor.constraint(equalToConstant: Self.barHeight).isActive = true }
     required init?(coder: NSCoder) { fatalError() }
     override func draw(_ dirtyRect: NSRect) {
+        let radius = Self.barHeight / 2
         NSColor.labelColor.withAlphaComponent(0.12).setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: 4, yRadius: 4).fill()
+        NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius).fill()
         if let remaining = remaining {
             GLMRemainingColor.color(remaining).setFill()
             let fill = NSRect(x: 0, y: 0, width: bounds.width * CGFloat(max(0, min(1, remaining))), height: bounds.height)
-            NSBezierPath(roundedRect: fill, xRadius: 4, yRadius: 4).fill()
+            NSBezierPath(roundedRect: fill, xRadius: radius, yRadius: radius).fill()
         }
     }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
@@ -1697,10 +1708,11 @@ final class GLMDailyChartCanvas: NSView {
         guard !buckets.isEmpty else { return }
         let maxTokens = buckets.compactMap { $0.tokens }.max() ?? 0
         let chartHeight = bounds.height - 3
-        let width = max(1, columnWidth - 2)
+        let width = min(6, columnWidth)
+        let inset = (columnWidth - width) / 2
         for (index, bucket) in buckets.enumerated() {
             guard let tokens = bucket.tokens else { continue }   // 缺失日 = 缺口，不画、不当 0
-            let x = CGFloat(index) * columnWidth + 1
+            let x = CGFloat(index) * columnWidth + inset
             accent.withAlphaComponent(index == selectedIndex ? 1 : 0.4).setFill()
             if tokens == 0 {
                 NSRect(x: x, y: 1, width: width, height: 2).fill()   // 有记录的零日 = 基线短柱
@@ -1774,9 +1786,9 @@ final class GLMDailyChartCanvas: NSView {
 }
 
 // 两项比较：单行浅底圆角条 + 中间竖分隔线，两半各「标签+数值」靠近并整体居中，
-// 高约 30pt；数值 12pt 半粗体、中性展示；缺数文案留在对应半区，不串组。
+// 高约 30pt；数值按变化方向着色，缺数文案留在对应半区，不串组。
 final class GLMComparisonStrip: NSView {
-    init(pairs: [(label: String, value: String, muted: Bool)]) {
+    init(pairs: [(label: String, outcome: GLMUsageComparison.Outcome)]) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
@@ -1821,9 +1833,24 @@ final class GLMComparisonStrip: NSView {
             caption.textColor = .secondaryLabelColor
             caption.lineBreakMode = .byTruncatingTail
             caption.maximumNumberOfLines = 1
-            let value = NSTextField(wrappingLabelWithString: pair.value)
-            value.font = .systemFont(ofSize: 12, weight: .semibold)
-            value.textColor = pair.muted ? .secondaryLabelColor : .labelColor
+            let value = NSTextField(wrappingLabelWithString: pair.outcome.text)
+            value.font = .systemFont(ofSize: 11, weight: .semibold)
+            switch pair.outcome.direction {
+            case .increase:
+                value.textColor = NSColor(name: nil) { appearance in
+                    let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    return dark ? NSColor(srgbRed: 0.44, green: 0.78, blue: 0.61, alpha: 1)
+                                : NSColor(srgbRed: 0.13, green: 0.45, blue: 0.31, alpha: 1)
+                }
+            case .decrease:
+                value.textColor = NSColor(name: nil) { appearance in
+                    let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    return dark ? NSColor(srgbRed: 0.91, green: 0.64, blue: 0.37, alpha: 1)
+                                : NSColor(srgbRed: 0.64, green: 0.32, blue: 0.08, alpha: 1)
+                }
+            case .neutral:
+                value.textColor = .secondaryLabelColor
+            }
             value.lineBreakMode = .byTruncatingTail
             value.maximumNumberOfLines = 1
             row.addArrangedSubview(caption)
@@ -2019,10 +2046,9 @@ final class GLMDailyUsageSectionView: NSView {
         }
     }
 
-    private func comparisonPairs(for buckets: [GLMDayBucket]?) -> [(label: String, value: String, muted: Bool)] {
+    private func comparisonPairs(for buckets: [GLMDayBucket]?) -> [(label: String, outcome: GLMUsageComparison.Outcome)] {
         let outcomes = GLMUsageComparison.dailyPair(buckets: buckets ?? [])
-        return [("日环比", outcomes.dayOnDay.text, outcomes.dayOnDay.isMuted),
-                ("7日环比", outcomes.weekOnWeek.text, outcomes.weekOnWeek.isMuted)]
+        return [("日环比", outcomes.dayOnDay), ("7日环比", outcomes.weekOnWeek)]
     }
 }
 
@@ -4432,6 +4458,12 @@ enum GLMOfflineRegression {
             try expect(GLMUsageComparison.outcome(current: 1500, base: 0).text == "新增 1.50K", "base-zero must be 新增")
             try expect(GLMUsageComparison.outcome(current: 1074, base: 1000).text == "+7.4%", "percent text wrong")
             try expect(GLMUsageComparison.outcome(current: 926, base: 1000).text == "-7.4%", "negative percent text wrong")
+            try expect(GLMUsageComparison.outcome(current: 1074, base: 1000).direction == .increase
+                       && GLMUsageComparison.outcome(current: 926, base: 1000).direction == .decrease
+                       && GLMUsageComparison.outcome(current: 1, base: 0).direction == .increase
+                       && GLMUsageComparison.outcome(current: 0, base: 0).direction == .neutral
+                       && GLMUsageComparison.outcome(current: nil, base: 1).direction == .neutral,
+                       "comparison direction classification wrong")
             try expect(GLMUsageComparison.outcome(current: 1000, base: 1000) == .flat, "equal values must be 持平")
             try expect(GLMUsageComparison.outcome(current: 9998, base: 10000) == .flat, "tiny negative pct must be flat (no -0.0%)")
             try expect(GLMUsageComparison.outcome(current: 10002, base: 10000) == .flat, "tiny positive pct must be flat")
