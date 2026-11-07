@@ -277,12 +277,14 @@ enum GLMStartPlanUsage {
     }
 }
 
-// MARK: - 每日用量（近 30 天完整自然日）
+// MARK: - 每日用量（近 30 天，含今日未走完的部分累计）
 //
 // 数据来源：30 天慢刷新的 model-usage 响应 + 本机 Start Plan 逐次用量，不新增请求/定时器。
 // 真实接口口径（2026-11-06 只读验收，主会话探针，与 totalUsage 逐日求和精确配平）：
 // granularity=daily，x_time 为本地自然日 "yyyy-MM-dd" 标签（30 天窗返回 31 个、
 // 严格递增、零缺口、首标签=请求起点日），modelDataList[].tokensUsage 与标签按下标对齐。
+// 2026-11-07 起窗口含今日（对齐 KimiUsage/CodexUsage 的「今日」口径），不再止于昨日：
+// 今日柱随当日用量增长，比较条同口径（今日 vs 昨日、含今日的 7 日 vs 再前 7 日）。
 // 公开实现（CodexBar zai.js）的小时粒度假设与真实响应不符——以验收口径为准。
 // 字段依据公开实现交叉证实（CodexBar Sources/CodexBarCore/Resources/Plugins/zai.js：
 // data.x_time 时间标签数组 + data.modelDataList[].tokensUsage 与其按下标对齐）；
@@ -344,30 +346,31 @@ enum GLMDailyUsage {
         return Timeline(times: times, totals: totals)
     }
 
-    /// 日序列 → 最近 days 个自然日桶（旧→新，不含今天）。日粒度直映射
-    /// （2026-11-06 只读验收确认服务端按本地自然日汇总，无需本地小时网格/DST 推断）：
-    /// - 桶范围 = today-days ... today-1；今天（未走完）与窗口外的标签丢弃；
+    /// 日序列 → 最近 days 个自然日桶（旧→新，含今日未走完的部分累计；
+    /// 2026-11-07 起不再止于昨日，对齐 KimiUsage/CodexUsage 的「今日」口径）。
+    /// 日粒度直映射（2026-11-06 只读验收确认服务端按本地自然日汇总，无需本地小时网格/DST 推断）：
+    /// - 桶范围 = today-(days-1) ... today；今日柱为当日部分累计（随用时增长）；窗口外的标签丢弃；
     /// - coverageStart（请求窗口起点）所在日按自然日对齐后准入——服务端日标签
-    ///   即该自然日的完整汇总，不再按小时覆盖率判缺失；
+    ///   即该自然日的汇总（今日为部分累计），不再按小时覆盖率判缺失；
     /// - 桶范围内序列缺失的日期 → tokens=nil（数据不足），绝不补 0。
     /// 注意：timeline 求和与响应 totalUsage（周期表数字）不承诺配平，两者来源独立。
     static func frame(from timeline: Timeline, calendar: Calendar = .current,
                       now: Date, days: Int = 30, coverageStart: Date? = nil) -> [GLMDayBucket]? {
         guard days > 0 else { return nil }
         guard let todayStart = calendar.date(from: calendar.dateComponents([.year, .month, .day], from: now)),
-              let oldest = calendar.date(byAdding: .day, value: -days, to: todayStart) else { return nil }
+              let oldest = calendar.date(byAdding: .day, value: -(days - 1), to: todayStart) else { return nil }
         var sums: [Date: Double] = [:]
         for (index, raw) in timeline.times.enumerated() {
             guard timeline.totals[index].isFinite else { return nil }
             let day = calendar.startOfDay(for: raw)
-            let admissible = day >= oldest && day < todayStart
+            let admissible = day >= oldest && day <= todayStart
                 && (coverageStart == nil || day >= calendar.startOfDay(for: coverageStart!))
             if admissible { sums[day] = timeline.totals[index] }
         }
         var buckets: [GLMDayBucket] = []
         buckets.reserveCapacity(days)
         for offset in 0..<days {
-            guard let day = calendar.date(byAdding: .day, value: offset - days, to: todayStart) else { return nil }
+            guard let day = calendar.date(byAdding: .day, value: offset - (days - 1), to: todayStart) else { return nil }
             buckets.append(GLMDayBucket(day: day, tokens: sums[day]))
         }
         return buckets
@@ -430,8 +433,8 @@ enum GLMUsageComparison {
         return .percent(String(format: "%+.1f%%", pct))
     }
 
-    /// 面板两项比较：D=最后一日（最新完整日）；较昨日 = D vs D−1；
-    /// 较前 7 天 = 截至 D 的 7 个完整日 vs 再前 7 个完整日（14 日全覆盖才比较）
+    /// 面板两项比较：D=最后一日（今日，未走完的部分累计，与柱图末端一致）；
+    /// 较昨日 = 今日 vs 昨日；较前 7 天 = 含今日的 7 日 vs 再前 7 日（14 日全覆盖才比较）
     static func dailyPair(buckets: [GLMDayBucket]) -> (dayOnDay: Outcome, weekOnWeek: Outcome) {
         let dayOnDay = outcome(current: buckets.last?.tokens,
                                base: buckets.count >= 2 ? buckets[buckets.count - 2].tokens : nil)
@@ -1748,7 +1751,7 @@ final class GLMPillBackground: NSView {
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
 }
 
-// MARK: - 每日用量柱状图（近 30 完整自然日）
+// MARK: - 每日用量柱状图（近 30 天，含今日部分累计）
 //
 // 数据只来自慢项刷新缓存（GLMDayBucket）：悬停/点击/键盘选择全部读内存，
 // 不联网、不重算历史、无独立定时器。命中区域覆盖整天宽度（缺失/零值日也能读取）；
@@ -1888,7 +1891,7 @@ final class GLMDailyChartCanvas: NSView {
             setAccessibilityValue(""); return
         }
         let tokens = bucket.tokens.map { "\(Fmt.tokens($0)) tokens" } ?? "数据不足"
-        setAccessibilityValue("\(Fmt.monthDay(bucket.day)) \(tokens)")
+        setAccessibilityValue("\(GLMDailyUsageSectionView.dayText(for: bucket.day)) \(tokens)")
     }
 }
 
@@ -1977,6 +1980,13 @@ final class GLMComparisonStrip: NSView {
 final class GLMDailyUsageSectionView: NSView {
     static let dateLabelIdentifier = NSUserInterfaceItemIdentifier("GLMDailyDateLabel")
     static let valueLabelIdentifier = NSUserInterfaceItemIdentifier("GLMDailyValueLabel")
+
+    /// 选中日文案：今日柱为未走完的部分累计，日期加「（今日未结束）」后缀
+    /// （CodexUsage 简析图同款口径）；跨午夜后选中的昨日自动不再带后缀。
+    static func dayText(for day: Date, now: Date = Date()) -> String {
+        let text = Fmt.monthDay(day)
+        return day == Calendar.current.startOfDay(for: now) ? text + "（今日未结束）" : text
+    }
 
     private let dateLabel = NSTextField(wrappingLabelWithString: "")
     private let valueLabel = NSTextField(wrappingLabelWithString: "")
@@ -2092,7 +2102,8 @@ final class GLMDailyUsageSectionView: NSView {
             return
         }
 
-        // 默认选中最新完整日，即使数据缺失也展示该日状态；面板打开期间重建保留选择。
+        // 默认选中最新一日（含今日窗口下即今日，未走完的部分累计），即使数据缺失也展示该日状态；
+        // 面板打开期间重建保留选择。
         let defaultIndex = selectedIndex ?? buckets.count - 1
         canvas.configure(buckets: buckets, initialIndex: defaultIndex)
         canvas.focusRingType = .default
@@ -2143,7 +2154,7 @@ final class GLMDailyUsageSectionView: NSView {
         let buckets = canvas.dayBuckets
         guard buckets.indices.contains(index) else { return }
         let bucket = buckets[index]
-        dateLabel.stringValue = Fmt.monthDay(bucket.day)
+        dateLabel.stringValue = Self.dayText(for: bucket.day)
         if let tokens = bucket.tokens {
             valueLabel.stringValue = "\(Fmt.tokens(tokens)) Token"
             valueLabel.textColor = .labelColor
@@ -2220,7 +2231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var weekCardsLastOK: Date?
     private var subscriptionLastOK: Date?
     private var dailyLastOK: Date?
-    // 每日图选中日（面板每 10s 重建后沿用；nil = 用默认最新有记录完整日）
+    // 每日图选中日（面板每 10s 重建后沿用；nil = 用默认最新有记录日，通常为今日）
     private var dailySelectedIndex: Int?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -3089,17 +3100,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     }
 
     /// 合成每日桶（仅预览/离线测试）：确定性伪随机高度 + 固定零日/缺日位点，
+    /// 窗口与生产一致（今日-29 ... 今日，含今日部分累计），
     /// 交互测试依赖位点稳定，改位点必须同步 --preview-daily-test 的断言
     private func previewDailyBuckets() -> [GLMDayBucket] {
         let cal = Calendar.current
         let todayStart = cal.startOfDay(for: Date())
         var buckets: [GLMDayBucket] = []
         for index in 0..<30 {
-            guard let day = cal.date(byAdding: .day, value: index - 30, to: todayStart) else { continue }
+            guard let day = cal.date(byAdding: .day, value: index - 29, to: todayStart) else { continue }
             var tokens: Double? = 900_000 + Double((index * 137_917) % 1_400_000)
             if index == 10 || index == 24 { tokens = 0 }                       // 有记录的零日
-            if index == 29 { tokens = 2_000_000 }                              // 昨日（较昨日基准）
-            if index == 28 { tokens = 1_000_000 }                              // 前日（较昨日对比项）
+            if index == 29 { tokens = 2_000_000 }                              // 今日（部分累计，较昨日当前项）
+            if index == 28 { tokens = 1_000_000 }                              // 昨日（较昨日基准）
             if CommandLine.arguments.contains("--preview-daily-gaps"), index == 3 || index == 4 || index == 17 {
                 tokens = nil                                                   // 缺失日（缺口）
             }
@@ -3726,7 +3738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         func verify(_ step: String, index: Int) {
             let bucket = buckets[index]
-            let expectedDate = Fmt.monthDay(bucket.day)
+            let expectedDate = GLMDailyUsageSectionView.dayText(for: bucket.day)
             let expectedValue = bucket.tokens.map { "\(Fmt.tokens($0)) Token" } ?? "数据不足"
             guard dateLabel.stringValue == expectedDate else {
                 fail("\(step): date \(dateLabel.stringValue) != \(expectedDate)"); exit(1)
@@ -3774,7 +3786,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             }
             NSApp.sendEvent(exitEvent)
             // 离开图表保留最后选中值
-            guard dateLabel.stringValue == Fmt.monthDay(buckets[20].day) else {
+            guard dateLabel.stringValue == GLMDailyUsageSectionView.dayText(for: buckets[20].day) else {
                 fail("mouse-exited: selection jumped"); exit(1)
             }
             print("GLM_DAILY_TEST mouse-exited-keeps-selection: PASS"); fflush(stdout)
@@ -3806,7 +3818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             guard let reopenedCanvas = findView(self.panelController.view, GLMDailyChartCanvas.self),
                   let reopenedDate = findLabel(self.panelController.view, GLMDailyUsageSectionView.dateLabelIdentifier),
                   reopenedCanvas.selectedIndex == buckets.count - 1,
-                  reopenedDate.stringValue == Fmt.monthDay(buckets[buckets.count - 1].day) else {
+                  reopenedDate.stringValue == GLMDailyUsageSectionView.dayText(for: buckets[buckets.count - 1].day) else {
                 fail("reopened panel did not select latest day")
             }
             print("GLM_DAILY_TEST reopen-selects-latest: PASS")
@@ -4600,25 +4612,27 @@ enum GLMOfflineRegression {
                                        ["modelName": "b", "tokensUsage": [1e308]]]
             }, "overflowing model sum accepted")
 
-            // 聚合（日粒度直映射口径）：桶 = 今日-30 ... 昨日；今天/窗口外丢弃；缺日 = nil
+            // 聚合（日粒度直映射口径）：桶 = 今日-29 ... 今日（含今日部分累计）；窗口外丢弃；缺日 = nil
             let frameNow = shDate(2026, 11, 6, 15)
-            let windowStart = frameNow.addingTimeInterval(-30 * 86400)   // 2026-10-07 15:00 → 起点日按自然日准入
+            let windowStart = frameNow.addingTimeInterval(-30 * 86400)   // 2026-10-07 15:00 → 起点日=今日-30，止步窗外
             let frameTimes: [Date] = [shDate(2026, 10, 6), shDate(2026, 10, 7),
                                       shDate(2026, 11, 5), shDate(2026, 11, 6)]
             let frameTotals: [Double] = [100, 7, 240, 999]
             let frame = GLMDailyUsage.frame(from: GLMDailyUsage.Timeline(times: frameTimes, totals: frameTotals),
                                             calendar: shanghaiCal, now: frameNow, coverageStart: windowStart)
             try expect(frame?.count == 30, "daily frame must have 30 buckets")
-            try expect(frame?[0].day == shDate(2026, 10, 7) && frame?[0].tokens == 7,
-                       "window-start day must be admissible as a complete day")
-            try expect(frame?.last?.day == shDate(2026, 11, 5) && frame?.last?.tokens == 240,
-                       "last bucket must be yesterday")
+            try expect(frame?.first?.day == shDate(2026, 10, 8) && frame?.first?.tokens == nil,
+                       "oldest bucket must be today-29 without records (nil, not zero)")
+            try expect(frame?.last?.day == shDate(2026, 11, 6) && frame?.last?.tokens == 999,
+                       "last bucket must be today with its partial-day total")
+            try expect(frame?.contains(where: { $0.day == shDate(2026, 11, 5) && $0.tokens == 240 }) == true,
+                       "yesterday bucket wrong")
             try expect(frame?.contains(where: { $0.day == shDate(2026, 10, 6) }) == false,
                        "label before oldest leaked into frame")
+            try expect(frame?.contains(where: { $0.day == shDate(2026, 10, 7) }) == false,
+                       "window-start day (today-30) must stay outside the today-inclusive frame")
             try expect(frame?.contains(where: { $0.day == shDate(2026, 11, 4) && $0.tokens == nil }) == true,
                        "day without records became zero")
-            try expect(frame?.contains(where: { $0.day == shDate(2026, 11, 6) }) == false,
-                       "today must not appear in complete-day frame")
             // 非有限日总量防御（直接构造 Timeline 的越界用法也不得漏过）
             let badFrame = GLMDailyUsage.frame(
                 from: GLMDailyUsage.Timeline(times: [shDate(2026, 11, 5)], totals: [.infinity]),
