@@ -1666,18 +1666,54 @@ enum GLMRemainingColor {
     }
 }
 final class GLMPanelCard: NSView {
+    static let contentInset: CGFloat = 14
+    static let verticalInset: CGFloat = 12
+
     let content = GLMPanelStack()
+
     init() {
-        super.init(frame: .zero); translatesAutoresizingMaskIntoConstraints = false
-        wantsLayer = true; layer?.cornerRadius = 12; layer?.borderWidth = 0.5
-        content.orientation = .vertical; content.alignment = .leading; content.spacing = 4; content.translatesAutoresizingMaskIntoConstraints = false
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        // 阴影在卡片自身 layer 上绘制，绝不能因 masksToBounds 被圆角背景一起裁掉。
+        layer?.cornerRadius = 14
+        layer?.borderWidth = 0.5
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowRadius = 11
+        layer?.shadowOffset = CGSize(width: 0, height: -2)
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 6
+        content.translatesAutoresizingMaskIntoConstraints = false
         addSubview(content)
-        NSLayoutConstraint.activate([content.topAnchor.constraint(equalTo: topAnchor, constant: 8), content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8), content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8), content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8)])
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: topAnchor, constant: Self.verticalInset),
+            content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Self.verticalInset),
+            content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.contentInset),
+            content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.contentInset)
+        ])
     }
+
     required init?(coder: NSCoder) { fatalError() }
     override var wantsUpdateLayer: Bool { true }
-    override func updateLayer() { effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor; layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.09).cgColor } }
-    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            // popover 材质之上只叠语义化动态色：浅色拉开层级，深色以细微色差和描边为主。
+            layer?.backgroundColor = (dark
+                ? NSColor.labelColor.withAlphaComponent(0.055)
+                : NSColor.controlBackgroundColor.withAlphaComponent(0.82)).cgColor
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(dark ? 0.14 : 0.09).cgColor
+            layer?.shadowOpacity = dark ? 0.03 : 0.06
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
 }
 
 final class GLMPanelAction: NSButton {
@@ -3132,10 +3168,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let inner = width - 32
         let root = panelRoot
         for view in root.arrangedSubviews { root.removeArrangedSubview(view); view.removeFromSuperview() }
-        root.orientation = .vertical; root.alignment = .leading; root.spacing = 8
-        root.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
+        root.orientation = .vertical; root.alignment = .leading; root.spacing = 10
+        // 给卡片阴影留出绘制空间；scroll 只裁主容器边缘，不裁卡片自身阴影。
+        root.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false
         func add(_ v: NSView) { root.addArrangedSubview(v); v.widthAnchor.constraint(equalToConstant: inner).isActive = true }
+        func addContent(_ v: NSView, to card: GLMPanelCard) {
+            card.content.addArrangedSubview(v)
+            v.widthAnchor.constraint(equalTo: card.content.widthAnchor).isActive = true
+        }
         func label(_ text: String, size: CGFloat = 11, bold: Bool = false, color: NSColor = .labelColor) -> NSTextField {
             let f = NSTextField(wrappingLabelWithString: text); f.font = .systemFont(ofSize: size, weight: bold ? .semibold : .regular); f.textColor = color
             f.lineBreakMode = .byWordWrapping; f.maximumNumberOfLines = 0; return f
@@ -3168,37 +3209,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             item.heightAnchor.constraint(equalToConstant: 26).isActive = true
             return item
         }
+        // 更新进行中：原按钮位置换成进度行（重开面板也在此恢复）；空闲时才显示更新按钮
+        if UpdateProgressController.shared.isActive { add(UpdateProgressRowView()) }
+        else if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
+
+        let quotaCard = GLMPanelCard()
+        quotaCard.content.spacing = 6
+        let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor)
+        resetHeading.alignment = .right
+        addContent(resetHeading, to: quotaCard)
+
         func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool) {
-            let r = row()
-            let title = label(name, size: 11, bold: true); title.widthAnchor.constraint(equalToConstant: 36).isActive = true; r.addArrangedSubview(title)
+            let group = GLMPanelStack()
+            group.orientation = .vertical
+            group.alignment = .leading
+            group.spacing = 5
+            func addToGroup(_ view: NSView) {
+                group.addArrangedSubview(view)
+                view.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+            }
+
+            // 周期、百分比、进度条与重置时间共用一行，避免为进度条额外占用一行高度。
+            let heading = row()
+            heading.spacing = 4
+            let title = label(name, size: 11, bold: true)
+            title.widthAnchor.constraint(equalToConstant: 36).isActive = true
+            heading.addArrangedSubview(title)
             let ratio = entry?.usedRemainingRatio
-            let pct = label(Fmt.pct(ratio), size: 12, bold: true, color: GLMRemainingColor.color(ratio)); pct.widthAnchor.constraint(equalToConstant: 34).isActive = true; r.addArrangedSubview(pct)
-            let bar = GLMQuotaBar(ratio); bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true; r.addArrangedSubview(bar)
+            let pct = label(Fmt.pct(ratio), size: 12, bold: true, color: GLMRemainingColor.color(ratio))
+            pct.widthAnchor.constraint(equalToConstant: 34).isActive = true
+            heading.addArrangedSubview(pct)
+            let bar = GLMQuotaBar(ratio)
+            bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true
+            heading.addArrangedSubview(bar)
             let reset = label(entry?.reset.map { Fmt.weekDayTime($0) } ?? "时间未知", size: 10, bold: true)
             reset.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
             reset.alignment = .right
             reset.lineBreakMode = .byTruncatingTail
             reset.maximumNumberOfLines = 1
             reset.widthAnchor.constraint(equalToConstant: 110).isActive = true
-            reset.setContentCompressionResistancePriority(.required, for: .horizontal); r.addArrangedSubview(reset); add(r)
-            if let e = entry { add(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
-            else { add(label("暂无数据", color: .secondaryLabelColor)) }
-            if let e = error { add(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
-            if let warning = warning { add(label("部分数据异常：\(warning)", color: .systemOrange)) }
-            if error == nil && stale { add(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
+            reset.setContentCompressionResistancePriority(.required, for: .horizontal)
+            heading.addArrangedSubview(reset)
+            addToGroup(heading)
+
+            // 余量和所有异常文本独占卡片全宽，不参与右侧时间列的宽度竞争。
+            if let e = entry { addToGroup(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
+            else { addToGroup(label("暂无数据", color: .secondaryLabelColor)) }
+            if let e = error { addToGroup(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
+            if let warning = warning { addToGroup(label("部分数据异常：\(warning)", color: .systemOrange)) }
+            if error == nil && stale { addToGroup(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
+            addContent(group, to: quotaCard)
         }
-        // 更新进行中：原按钮位置换成进度行（重开面板也在此恢复）；空闲时才显示更新按钮
-        if UpdateProgressController.shared.isActive { add(UpdateProgressRowView()) }
-        else if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
-        let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor); resetHeading.alignment = .right; add(resetHeading)
         quota(usage.fiveHour, "5 小时", usage.fiveHourError, usage.fiveHourWarning, fiveHourLastOK, fiveHourStale)
+        if let fiveHourGroup = quotaCard.content.arrangedSubviews.last {
+            quotaCard.content.setCustomSpacing(10, after: fiveHourGroup)
+        }
         quota(usage.week, "7 天", usage.weekError, usage.weekWarning, weekLastOK, weekStale)
+        if usage.subscription != nil || usage.subscriptionError != nil || subscriptionStale {
+            addContent(separator(), to: quotaCard)
+        }
         if let sub = usage.subscription {
             let expiry = sub.expireDate.map { "套餐到期：\(Fmt.fullTime.string(from: $0))" } ?? "套餐到期：暂无数据"
-            add(label(expiry, color: .secondaryLabelColor))
+            addContent(label(expiry, color: .secondaryLabelColor), to: quotaCard)
         }
-        if let error = usage.subscriptionError { add(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed)) }
-        else if subscriptionStale { add(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange)) }
+        if let error = usage.subscriptionError { addContent(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed), to: quotaCard) }
+        else if subscriptionStale { addContent(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange), to: quotaCard) }
+        add(quotaCard)
         let peak = Peak.evaluate()
         let peakCard = GLMPanelCard()
         let peakTitle = row(); peakTitle.spacing = 8; peakTitle.addArrangedSubview(symbol("clock")); peakTitle.addArrangedSubview(label("峰谷状态", size: 13, bold: true)); peakTitle.addArrangedSubview(spacer())
@@ -3262,16 +3338,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             if let message = message { let l = label(message, color: .systemRed); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
         }
         add(cards)
+        let usageCard = GLMPanelCard()
+        usageCard.content.spacing = 4
         let usageSection = section("用量情况", icon: "square.stack.3d.up.fill", expanded: tokenExpanded, action: #selector(toggleToken))
-        add(usageSection)
+        addContent(usageSection, to: usageCard)
         let windows: [(String, ModelUsage?, Date?, Bool, String?)] = [
             ("今日", usage.tokensToday, tokensTodayLastOK, tokensTodayStale, usage.tokensTodayError),
             ("近 7 天", usage.tokens7d, tokens7dLastOK, tokens7dStale, usage.tokens7dError),
             ("近 30 天", usage.tokens30d, tokens30dLastOK, tokens30dStale, usage.tokens30dError)]
         func tableCells(_ values: [String], header: Bool, modelDetail: Bool = false) -> NSStackView {
             let r = row(); r.spacing = 4
-            // PR #6 将展开指示移到行首，三列与两个间距填满整行。
-            let tableWidth = inner - 8
+            // 三列与两个间距填满卡片内容宽；展开指示仍保留在行首。
+            let tableWidth = inner - GLMPanelCard.contentInset * 2 - 8
             // 明细行将调用次数列之前的空间更多留给模型名；Token 右边缘保持与汇总行对齐。
             let widths = modelDetail
                 ? [tableWidth * 0.46, tableWidth * 0.20, tableWidth * 0.34]
@@ -3300,12 +3378,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             return r
         }
         if tokenExpanded {
-            let tableHeader = tableCells(["周期", "Token", "调用次数"], header: true); add(tableHeader)
+            let tableHeader = tableCells(["周期", "Token", "调用次数"], header: true)
+            addContent(tableHeader, to: usageCard)
             // 参考 CodexUsage：普通汇总行紧凑排列，展开的明细组末留出间隔。
             var previous: NSView? = tableHeader
             var previousEndsGroup = false
             func tighten(after view: NSView?, gap: CGFloat) {
-                if let view = view { root.setCustomSpacing(gap, after: view) }
+                if let view = view { usageCard.content.setCustomSpacing(gap, after: view) }
             }
             for (index, window) in windows.enumerated() {
                 let (name, stats, _, _, _) = window
@@ -3322,7 +3401,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 item.toolTip = models.isEmpty ? "暂无模型明细" : (expanded ? "收起模型明细" : "展开模型明细")
                 cells.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(cells)
                 NSLayoutConstraint.activate([cells.leadingAnchor.constraint(equalTo: item.leadingAnchor), cells.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
-                item.heightAnchor.constraint(equalToConstant: 23).isActive = true; add(item)
+                item.heightAnchor.constraint(equalToConstant: 23).isActive = true
+                addContent(item, to: usageCard)
                 tighten(after: previous, gap: previous === tableHeader ? 3 : (previousEndsGroup ? 8 : 4))
                 previous = item
                 previousEndsGroup = false
@@ -3330,7 +3410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                     for (modelIndex, model) in models.enumerated() {
                         let detail = tableCells([model.name, Fmt.tokens(model.tokens), ""], header: false, modelDetail: true)
                         detail.heightAnchor.constraint(equalToConstant: 20).isActive = true
-                        add(detail)
+                        addContent(detail, to: usageCard)
                         tighten(after: previous, gap: 3)
                         previous = detail
                         previousEndsGroup = modelIndex == models.count - 1
@@ -3339,23 +3419,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             }
         }
         for (name, _, last, stale, error) in windows {
-            if let error = error { add(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
-            else if stale { add(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
+            if let error = error { addContent(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed), to: usageCard) }
+            else if stale { addContent(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange), to: usageCard) }
         }
-        // 每日用量：位于用量情况与 MCP 之间；数据只读慢项缓存，悬停/键盘不发请求。
-        // 打开期间跨面板重建保留选择；重新打开面板时恢复最新日期。
-        // 旧值保留期间有解析/刷新失败或超时 → 仅在「近 30 天」旁给简短「待更新」，不写技术细节。
-        add(separator())
+        add(usageCard)
+
+        // 每日用量：标题、选中行、图表和比较条作为一个完整模块进入独立卡片。
+        let dailyCard = GLMPanelCard()
+        dailyCard.content.spacing = 4
         let dailyPending = usage.dailyTokens != nil && (usage.dailyTokensError != nil || dailyStale)
         let dailySection = GLMDailyUsageSectionView(buckets: usage.dailyTokens, selectedIndex: dailySelectedIndex,
                                                     expanded: dailyExpanded, toggleTarget: self,
                                                     toggleAction: #selector(toggleDaily), pendingNote: dailyPending) { [weak self] index in
             self?.dailySelectedIndex = index
         }
-        add(dailySection)
-        add(separator())
+        addContent(dailySection, to: dailyCard)
+        add(dailyCard)
+
+        let mcpCard = GLMPanelCard()
+        mcpCard.content.spacing = 4
         let mcpSection = section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP))
-        add(mcpSection)
+        addContent(mcpSection, to: mcpCard)
         // 键盘可达（PRD §6.2 支持键盘切换日期）：把柱图接进 key view loop——
         // 「用量情况」标题 → 柱图 → 「MCP 工具」标题为显式顺序，其余环节按几何自动；
         // Full Keyboard Access 下 Tab 即可到达柱图，左右方向键切换日期
@@ -3366,11 +3450,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             usageSection.nextKeyView = mcpSection   // 折叠时柱图不在视图层级，直接桥接相邻板块
         }
         if mcpExpanded {
-            if let t = usage.tools30d { add(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor)) }
-            else { add(label("暂无数据", color: .secondaryLabelColor)) }
+            if let t = usage.tools30d { addContent(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor), to: mcpCard) }
+            else { addContent(label("暂无数据", color: .secondaryLabelColor), to: mcpCard) }
         }
-        if let e = usage.toolsError { add(label("MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemRed)) }
-        else if toolsStale { add(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange)) }
+        if let e = usage.toolsError { addContent(label("MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemRed), to: mcpCard) }
+        else if toolsStale { addContent(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange), to: mcpCard) }
+        add(mcpCard)
 
         let header = row(); header.spacing = 12
         let icon = NSImageView(image: NSApp.applicationIconImage); icon.widthAnchor.constraint(equalToConstant: 32).isActive = true; icon.heightAnchor.constraint(equalToConstant: 32).isActive = true; header.addArrangedSubview(icon)
@@ -3433,7 +3518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         if !panelConfigured {
             let container = NSView(); container.translatesAutoresizingMaskIntoConstraints = false
             container.wantsLayer = true
-            container.layer?.cornerRadius = 16
+            container.layer?.cornerRadius = 20
             container.layer?.masksToBounds = true
             panelEffect.frame = container.bounds
             panelEffect.autoresizingMask = [.width, .height]
@@ -3588,15 +3673,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 NSApp.sendEvent(event)
             }
         }
-        // 步骤设计：面板加入每日用量后整体更高，模型窗全开会顶到最大高度
-        // （截断区内增减不改变窗口高，会误报 0），因此：
-        // 模型开窗 0/1→收1→开2（终态 [0,2]）在前、每步仍有真实增减；
-        // 收起 Token 表后窗口远低于上限，MCP 与 footer(刷新提示行) 的增减在非截断区验证
+        // 六张卡片增加了固定外框高度：连续展开多个模型窗会顶到最大高度，
+        // 截断区内继续展开不会改变窗口高。逐项开/收可让每步都在非截断区验证真实增减；
+        // 收起 Token 表后，再验证 MCP 与 footer（刷新提示行）的增减。
         let steps: [(HeightChange, () -> Void)] = [
             (.increase, { click(#selector(self.toggleModels(_:)), tag: 0) }),
+            (.decrease, { click(#selector(self.toggleModels(_:)), tag: 0) }),
             (.increase, { click(#selector(self.toggleModels(_:)), tag: 1) }),
             (.decrease, { click(#selector(self.toggleModels(_:)), tag: 1) }),
             (.increase, { click(#selector(self.toggleModels(_:)), tag: 2) }),
+            (.decrease, { click(#selector(self.toggleModels(_:)), tag: 2) }),
             (.decrease, { click(#selector(self.toggleToken)) }),
             (.decrease, { click(#selector(self.toggleMCP)) }),
             (.increase, { click(#selector(self.toggleMCP)) }),
@@ -3606,6 +3692,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             if index == steps.count {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     verify("async-refresh", .same, strictAnchor: false)
+                    // 多窗展开状态单独做重开保持回归；这里直接布置终态，避免在截断区追加无高度变化的点击。
+                    self.expandedModelWindows = [0, 2]
+                    self.rebuildMenu()
                     guard self.expandedModelWindows == [0, 2] else { fail("model expansion state lost"); return }
                     self.popover.performClose(nil)
                     guard !self.popover.isShown else { fail("close"); return }
