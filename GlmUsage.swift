@@ -348,6 +348,12 @@ struct ToolUsage {
 struct ResetCards {
     var fiveHour: [Date]?
     var week: [Date]?
+
+    func availableCount(now: Date) -> Int? {
+        guard let fiveHour = fiveHour, let week = week else { return nil }
+        return GLMFreshness.availableCards(fiveHour, now: now).count
+            + GLMFreshness.availableCards(week, now: now).count
+    }
 }
 
 /// 重置卡类型（服务器 reset_type 取值）
@@ -3057,6 +3063,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         add(peakCard)
         let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 8; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 13, bold: true))
+        if let count = usage.resetCards?.availableCount(now: Date()), count > 0 {
+            let countLabel = label("×\(count)", size: 12, bold: true, color: NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1))
+            countLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+            countLabel.setAccessibilityLabel("\(count) 张可用重置卡")
+            cardHead.addArrangedSubview(countLabel)
+        }
         // 「🎫 使用重置卡」按钮（图标+文字，表意=消耗一张卡）：一类卡可用直接确认，两类都有先选类型，无卡提示；使用中不可点
         let resetBtn = GLMPanelAction(title: "使用重置卡", target: self, action: #selector(onResetCardIcon(_:)))
         resetBtn.isBordered = false
@@ -4061,6 +4073,13 @@ enum GLMOfflineRegression {
                        "valid empty card lists were not accepted")
             try expect(GLMFreshness.availableCards([now.addingTimeInterval(-1), now.addingTimeInterval(30)],
                 now: now).count == 1, "expired cached card remained available")
+            try expect(ResetCards(fiveHour: [now.addingTimeInterval(-1), now.addingTimeInterval(30)],
+                                  week: [now.addingTimeInterval(60), now]).availableCount(now: now) == 2,
+                       "reset card count included expired cards or missed a type")
+            try expect(ResetCards(fiveHour: [], week: []).availableCount(now: now) == 0,
+                       "empty reset card count was not zero")
+            try expect(ResetCards(fiveHour: nil, week: [now.addingTimeInterval(30)]).availableCount(now: now) == nil,
+                       "incomplete reset card data was counted as a total")
 
             // 使用重置卡响应解析：成功 / 明确拒绝不可重试 / 5xx 可重试 / 缺 used 不算成功
             let useOK = Fetcher.parseResetUseResponse(["code": 0, "data": ["used": true]], httpStatus: 200)
