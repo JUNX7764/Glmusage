@@ -1557,11 +1557,19 @@ final class GLMPanelCard: NSView {
 
 final class GLMPanelAction: NSButton {
     var prominent = false { didSet { needsDisplay = true } }
+    var subtleBackground = false { didSet { needsDisplay = true } }
     private var hovered = false { didSet { needsDisplay = true } }
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            let color: NSColor = prominent ? NSColor(calibratedRed: 0.04, green: 0.32, blue: 0.22, alpha: hovered ? 0.8 : 1) : NSColor.labelColor.withAlphaComponent(hovered ? 0.08 : 0)
+            let color: NSColor
+            if prominent {
+                color = NSColor(calibratedRed: 0.04, green: 0.32, blue: 0.22, alpha: hovered ? 0.8 : 1)
+            } else if subtleBackground {
+                color = NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: hovered ? 0.28 : 0.18)
+            } else {
+                color = NSColor.labelColor.withAlphaComponent(hovered ? 0.10 : 0)
+            }
             layer?.backgroundColor = color.cgColor
         }
     }
@@ -1630,6 +1638,18 @@ final class GLMDailyChartCanvas: NSView {
     private var trackingArea: NSTrackingArea?
 
     override var acceptsFirstResponder: Bool { true }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds, xRadius: 3, yRadius: 3).fill() }
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { noteFocusRingMaskChanged() }
+        return accepted
+    }
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        if accepted { noteFocusRingMaskChanged() }
+        return accepted
+    }
 
     /// 当前全部日桶（只读暴露给区块视图与离线测试）
     var dayBuckets: [GLMDayBucket] { buckets }
@@ -1784,6 +1804,7 @@ final class GLMComparisonStrip: NSView {
             }
             let half = NSView()
             half.translatesAutoresizingMaskIntoConstraints = false
+            half.toolTip = index == 0 ? "最新完整日与前一日比较" : "最近 7 个完整日与此前 7 个完整日比较"
             let row = NSStackView()
             row.orientation = .horizontal
             row.alignment = .centerY
@@ -1931,10 +1952,10 @@ final class GLMDailyUsageSectionView: NSView {
             return
         }
 
-        // 默认选中最新有记录的完整日；面板重建后沿用用户上次选中
-        let defaultIndex = selectedIndex ?? buckets.lastIndex { $0.tokens != nil } ?? buckets.count - 1
+        // 默认选中最新完整日，即使数据缺失也展示该日状态；面板打开期间重建保留选择。
+        let defaultIndex = selectedIndex ?? buckets.count - 1
         canvas.configure(buckets: buckets, initialIndex: defaultIndex)
-        canvas.focusRingType = .none   // 键盘可达但不画焦点环（数值行已即时反馈选中日）
+        canvas.focusRingType = .default
         canvas.onSelect = { [weak self] index in
             self?.syncSelection(index)
             onSelect(index)
@@ -1958,7 +1979,7 @@ final class GLMDailyUsageSectionView: NSView {
         let alignments: [NSTextAlignment] = [.left, .center, .right]
         for (tickDate, alignment) in zip(tickDates, alignments) {
             let tick = NSTextField(wrappingLabelWithString: Fmt.dayTick(tickDate))
-            tick.font = .systemFont(ofSize: 9)
+            tick.font = .systemFont(ofSize: 10)
             tick.textColor = .secondaryLabelColor
             tick.alignment = alignment
             tick.lineBreakMode = .byTruncatingTail
@@ -1994,8 +2015,8 @@ final class GLMDailyUsageSectionView: NSView {
 
     private func comparisonPairs(for buckets: [GLMDayBucket]?) -> [(label: String, value: String, muted: Bool)] {
         let outcomes = GLMUsageComparison.dailyPair(buckets: buckets ?? [])
-        return [("较昨日", outcomes.dayOnDay.text, outcomes.dayOnDay.isMuted),
-                ("较前 7 天", outcomes.weekOnWeek.text, outcomes.weekOnWeek.isMuted)]
+        return [("日环比", outcomes.dayOnDay.text, outcomes.dayOnDay.isMuted),
+                ("7日环比", outcomes.weekOnWeek.text, outcomes.weekOnWeek.isMuted)]
     }
 }
 
@@ -2079,6 +2100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         if preview {
             if CommandLine.arguments.contains("--preview-dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
+            // 几何测试需保留展开模型所需的高度余量；每日图交互由独立测试覆盖。
+            if CommandLine.arguments.contains("--preview-popover-test") { dailyExpanded = false }
             installPreviewData()
             rebuildMenu()
             statusItem.button?.title = "GLM 预览"
@@ -2704,6 +2727,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     @objc private func togglePanel() {
         if popover.isShown { popover.performClose(nil); return }
+        dailySelectedIndex = nil
         if !preview { refresh(tokens: false); checkForUpdate() }
         rebuildMenu()
         if let button = statusItem.button {
@@ -2973,7 +2997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         func separator() -> NSBox { let line = NSBox(); line.boxType = .separator; line.heightAnchor.constraint(equalToConstant: 1).isActive = true; return line }
         func button(_ title: String, _ action: Selector, prominent: Bool = false) -> GLMPanelAction {
-            let b = GLMPanelAction(title: title, target: self, action: action); b.isBordered = false; b.focusRingType = .none; b.wantsLayer = true; b.layer?.cornerRadius = 6; b.prominent = prominent
+            let b = GLMPanelAction(title: title, target: self, action: action); b.isBordered = false; b.focusRingType = .default; b.wantsLayer = true; b.layer?.cornerRadius = 6; b.prominent = prominent
             b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: prominent ? NSColor.white : NSColor.labelColor, .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular)])
             b.heightAnchor.constraint(greaterThanOrEqualToConstant: prominent ? 30 : 24).isActive = true
             return b
@@ -3036,7 +3060,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         // 「🎫 使用重置卡」按钮（图标+文字，表意=消耗一张卡）：一类卡可用直接确认，两类都有先选类型，无卡提示；使用中不可点
         let resetBtn = GLMPanelAction(title: "使用重置卡", target: self, action: #selector(onResetCardIcon(_:)))
         resetBtn.isBordered = false
-        resetBtn.focusRingType = .none
+        resetBtn.focusRingType = .default
+        resetBtn.subtleBackground = true
+        resetBtn.wantsLayer = true
+        resetBtn.layer?.cornerRadius = 5
+        resetBtn.widthAnchor.constraint(greaterThanOrEqualToConstant: 86).isActive = true
         resetBtn.image = NSImage(systemSymbolName: "ticket.fill", accessibilityDescription: nil)?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
         resetBtn.imagePosition = .imageLeft
@@ -3046,15 +3074,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         resetBtn.isEnabled = !resetUseInFlight
         resetBtn.toolTip = resetUseInFlight ? "重置卡使用中…" : "使用一张重置卡，立即重置对应额度窗口"
         resetBtn.setAccessibilityLabel(resetUseInFlight ? "重置卡使用中" : "使用重置卡")
-        cardHead.addArrangedSubview(resetBtn)
         cardHead.addArrangedSubview(spacer())
+        cardHead.addArrangedSubview(resetBtn)
         cards.content.addArrangedSubview(cardHead); cardHead.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
         if let c = usage.resetCards {
+            func cardRow(_ name: String, _ detail: String, color: NSColor) {
+                let line = row()
+                let nameLabel = label(name, color: .secondaryLabelColor)
+                nameLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+                let detailLabel = label(detail, color: color)
+                detailLabel.alignment = .right
+                detailLabel.maximumNumberOfLines = 1
+                detailLabel.lineBreakMode = .byTruncatingTail
+                line.addArrangedSubview(nameLabel)
+                line.addArrangedSubview(spacer())
+                line.addArrangedSubview(detailLabel)
+                cards.content.addArrangedSubview(line)
+                line.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
+            }
             for (name, dates) in [("5 小时卡", c.fiveHour), ("周卡", c.week)] {
                 if let dates = dates {
                     let available = GLMFreshness.availableCards(dates, now: Date())
-                    if available.isEmpty { let l = label("\(name) · 暂无可用", color: .secondaryLabelColor); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
-                    for d in available { let l = label("\(name) · \(Fmt.expires(d)) 过期", color: d.timeIntervalSinceNow <= 72 * 3600 ? .systemOrange : .labelColor); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
+                    if available.isEmpty { cardRow(name, "暂无可用", color: .secondaryLabelColor) }
+                    for d in available { cardRow(name, "\(Fmt.expires(d)) 过期", color: d.timeIntervalSinceNow <= 72 * 3600 ? .systemOrange : .labelColor) }
                 }
             }
         } else { let l = label("暂无数据", color: .secondaryLabelColor); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
@@ -3071,7 +3113,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             ("近 30 天", usage.tokens30d, tokens30dLastOK, tokens30dStale, usage.tokens30dError)]
         func tableCells(_ values: [String], header: Bool, modelDetail: Bool = false) -> NSStackView {
             let r = row(); r.spacing = 4
-            let widths = [inner * 0.44, inner * 0.24, inner * 0.20]
+            // PR #6 将展开指示移到行首，三列与两个间距填满整行。
+            let tableWidth = inner - 8
+            let widths = [tableWidth * 0.32, tableWidth * 0.34, tableWidth * 0.34]
             for (index, text) in values.enumerated() {
                 let color: NSColor = header || modelDetail ? .secondaryLabelColor : (index == 1 ? NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) : .labelColor)
                 let f = label(text, size: header ? 10 : 11, bold: !header && !modelDetail && index > 0, color: color)
@@ -3097,7 +3141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         if tokenExpanded {
             let tableHeader = tableCells(["周期", "Token", "调用次数"], header: true); add(tableHeader)
-            // 行距 3 / 组末 8（对齐 CodexUsage 周期表口径）；root 默认 8 只用于板块之间
+            // 参考 CodexUsage：普通汇总行紧凑排列，展开的明细组末留出间隔。
             var previous: NSView? = tableHeader
             var previousEndsGroup = false
             func tighten(after view: NSView?, gap: CGFloat) {
@@ -3119,9 +3163,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 cells.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(cells)
                 NSLayoutConstraint.activate([cells.leadingAnchor.constraint(equalTo: item.leadingAnchor), cells.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
                 item.heightAnchor.constraint(equalToConstant: 23).isActive = true; add(item)
-                tighten(after: previous, gap: previousEndsGroup ? 8 : 3)
+                tighten(after: previous, gap: previous === tableHeader ? 3 : (previousEndsGroup ? 8 : 4))
                 previous = item
-                previousEndsGroup = !expanded || models.isEmpty
+                previousEndsGroup = false
                 if expanded {
                     for (modelIndex, model) in models.enumerated() {
                         let detail = tableCells([model.name, Fmt.tokens(model.tokens), ""], header: false, modelDetail: true)
@@ -3139,8 +3183,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             else if stale { add(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
         }
         // 每日用量：位于用量情况与 MCP 之间；数据只读慢项缓存，悬停/键盘不发请求。
-        // 选中状态跨面板重建保留（10s 节奏重建不打断阅读）。
+        // 打开期间跨面板重建保留选择；重新打开面板时恢复最新日期。
         // 旧值保留期间有解析/刷新失败或超时 → 仅在「近 30 天」旁给简短「待更新」，不写技术细节。
+        add(separator())
         let dailyPending = usage.dailyTokens != nil && (usage.dailyTokensError != nil || dailyStale)
         let dailySection = GLMDailyUsageSectionView(buckets: usage.dailyTokens, selectedIndex: dailySelectedIndex,
                                                     expanded: dailyExpanded, toggleTarget: self,
@@ -3148,6 +3193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             self?.dailySelectedIndex = index
         }
         add(dailySection)
+        add(separator())
         let mcpSection = section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP))
         add(mcpSection)
         // 键盘可达（PRD §6.2 支持键盘切换日期）：把柱图接进 key view loop——
@@ -3605,7 +3651,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             guard let accessibilityText = canvas.accessibilityValue() as? String, !accessibilityText.isEmpty else {
                 fail("accessibility value empty"); exit(1)
             }
-            print("GLM daily test: PASS (hover hit columns, zero/missing readable, exit keeps selection, click, keyboard, a11y)")
+            self.togglePanel()
+            self.togglePanel()
+        }
+        steps.append {
+            guard let reopenedCanvas = findView(self.panelController.view, GLMDailyChartCanvas.self),
+                  let reopenedDate = findLabel(self.panelController.view, GLMDailyUsageSectionView.dateLabelIdentifier),
+                  reopenedCanvas.selectedIndex == buckets.count - 1,
+                  reopenedDate.stringValue == Fmt.monthDay(buckets[buckets.count - 1].day) else {
+                fail("reopened panel did not select latest day")
+            }
+            print("GLM_DAILY_TEST reopen-selects-latest: PASS")
+            print("GLM daily test: PASS (hover hit columns, zero/missing readable, exit keeps selection, click, keyboard, a11y, reopen)")
             fflush(stdout)
             try? "PASS".write(toFile: "/tmp/glm_daily_test_result.txt", atomically: true, encoding: .utf8)
             exit(0)
