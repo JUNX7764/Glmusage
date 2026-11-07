@@ -3260,7 +3260,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             let r = row(); r.spacing = 4
             // PR #6 将展开指示移到行首，三列与两个间距填满整行。
             let tableWidth = inner - 8
-            let widths = [tableWidth * 0.32, tableWidth * 0.34, tableWidth * 0.34]
+            // 明细行将调用次数列之前的空间更多留给模型名；Token 右边缘保持与汇总行对齐。
+            let widths = modelDetail
+                ? [tableWidth * 0.46, tableWidth * 0.20, tableWidth * 0.34]
+                : [tableWidth * 0.32, tableWidth * 0.34, tableWidth * 0.34]
             for (index, text) in values.enumerated() {
                 let color: NSColor = header || modelDetail ? .secondaryLabelColor : (index == 1 ? NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) : .labelColor)
                 let f = label(text, size: header ? 10 : 11, bold: !header && !modelDetail && index > 0, color: color)
