@@ -3215,9 +3215,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
         let quotaCard = GLMPanelCard()
         quotaCard.content.spacing = 6
+        // 卡片标题行（CodexUsage 同款布局、自家绿色系）：图标+标题居左，「重置时间」列头居右
+        let quotaHead = row()
+        quotaHead.spacing = 8
+        quotaHead.addArrangedSubview(symbol("stopwatch"))
+        quotaHead.addArrangedSubview(label("用量进度", size: 13, bold: true))
+        quotaHead.addArrangedSubview(spacer())
         let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor)
         resetHeading.alignment = .right
-        addContent(resetHeading, to: quotaCard)
+        quotaHead.addArrangedSubview(resetHeading)
+        addContent(quotaHead, to: quotaCard)
 
         func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool) {
             let group = GLMPanelStack()
