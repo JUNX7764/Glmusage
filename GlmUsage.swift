@@ -1824,7 +1824,8 @@ final class GLMDailyUsageSectionView: NSView {
     /// 柱图（供面板把每日图接进 key view loop，Tab/FKA 可达）
     var chartCanvas: GLMDailyChartCanvas { canvas }
 
-    init(buckets: [GLMDayBucket]?, selectedIndex: Int?, pendingNote: Bool = false, onSelect: @escaping (Int) -> Void) {
+    init(buckets: [GLMDayBucket]?, selectedIndex: Int?, expanded: Bool,
+         toggleTarget: AnyObject?, toggleAction: Selector, pendingNote: Bool = false, onSelect: @escaping (Int) -> Void) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let stack = GLMPanelStack()
@@ -1836,7 +1837,7 @@ final class GLMDailyUsageSectionView: NSView {
         NSLayoutConstraint.activate([stack.topAnchor.constraint(equalTo: topAnchor), stack.bottomAnchor.constraint(equalTo: bottomAnchor),
                                      stack.leadingAnchor.constraint(equalTo: leadingAnchor), stack.trailingAnchor.constraint(equalTo: trailingAnchor)])
 
-        // 标题行：非折叠板块（PRD §4 仅用量情况/MCP 可折叠）
+        // 标题行：折叠按钮与用量情况/MCP 同款（chevron + 整行可点，PRD §6.4）
         let header = NSStackView()
         header.orientation = .horizontal
         header.alignment = .centerY
@@ -1855,12 +1856,11 @@ final class GLMDailyUsageSectionView: NSView {
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
         spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
-        let range = NSTextField(wrappingLabelWithString: "近 30 天")
-        range.font = .systemFont(ofSize: 10)
-        range.textColor = .secondaryLabelColor
-        range.lineBreakMode = .byTruncatingTail
-        range.maximumNumberOfLines = 1
-        range.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let chevron = NSImageView(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil) ?? NSImage())
+        chevron.contentTintColor = .secondaryLabelColor
+        chevron.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+        chevron.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        chevron.heightAnchor.constraint(equalToConstant: 22).isActive = true
         // 旧值保留期间的简短提示（PRD §9「必要时显示简短待更新」；非技术脚注）
         if pendingNote {
             let pending = NSTextField(wrappingLabelWithString: "待更新")
@@ -1874,9 +1874,26 @@ final class GLMDailyUsageSectionView: NSView {
         header.addArrangedSubview(icon)
         header.addArrangedSubview(title)
         header.addArrangedSubview(spacer)
-        header.addArrangedSubview(range)
-        stack.addArrangedSubview(header)
-        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        header.addArrangedSubview(chevron)
+        // 整行可点折叠（与 section() 的板块标题同款）；状态在 AppDelegate，点击走 rebuildMenu
+        header.translatesAutoresizingMaskIntoConstraints = false
+        let toggle = GLMPanelAction(title: "", target: toggleTarget, action: toggleAction)
+        toggle.isBordered = false
+        toggle.wantsLayer = true
+        toggle.layer?.cornerRadius = 6
+        let actionTitle = (expanded ? "收起" : "展开") + "每日用量"
+        toggle.setAccessibilityLabel(actionTitle)
+        toggle.toolTip = actionTitle
+        toggle.addSubview(header)
+        NSLayoutConstraint.activate([header.leadingAnchor.constraint(equalTo: toggle.leadingAnchor),
+                                     header.trailingAnchor.constraint(equalTo: toggle.trailingAnchor),
+                                     header.centerYAnchor.constraint(equalTo: toggle.centerYAnchor)])
+        toggle.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        stack.addArrangedSubview(toggle)
+        toggle.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        // 折叠：仅保留标题行（待更新提示仍在），日期/柱图/刻度/比较条全部不入层级
+        guard expanded else { return }
 
         // 选中行：所选日期 + Token 值；悬停立即切换，缺数据时显示「暂不可用」
         dateLabel.identifier = Self.dateLabelIdentifier
@@ -2010,6 +2027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var tokenExpanded = true
     private var expandedModelWindows: Set<Int> = []
     private var mcpExpanded = true
+    private var dailyExpanded = true
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     private var updateProgressObserver: NSObjectProtocol?
@@ -2829,6 +2847,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         rebuildMenu()
     }
     @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildMenu() }
+    @objc private func toggleDaily() { dailyExpanded.toggle(); rebuildMenu() }
     // 版本点击等临时状态行；dismissAfter 到点后自动清除（与 CodexUsage 一致）
     private func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
         updateMessageDismissal?.cancel()
@@ -3078,11 +3097,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
         if tokenExpanded {
             let tableHeader = tableCells(["周期", "Token", "调用次数"], header: true); add(tableHeader)
+            // 行距 3 / 组末 8（对齐 CodexUsage 周期表口径）；root 默认 8 只用于板块之间
+            var previous: NSView? = tableHeader
+            var previousEndsGroup = false
+            func tighten(after view: NSView?, gap: CGFloat) {
+                if let view = view { root.setCustomSpacing(gap, after: view) }
+            }
             for (index, window) in windows.enumerated() {
                 let (name, stats, _, _, _) = window
                 let models = stats.map { TokenModelList.visible($0.byModel) } ?? []
                 let expanded = expandedModelWindows.contains(index)
-                let cells = tableCells([name, stats.map { Fmt.tokens($0.totalTokens) } ?? "--", stats.map { Fmt.count($0.totalCalls) } ?? "--"], header: false)
+                // 折叠指示符在行首（周期名前缀，CodexUsage 同款）；无明细不加
+                let nameLabel = models.isEmpty ? name : (expanded ? "⌄ " : "› ") + name
+                let cells = tableCells([nameLabel, stats.map { Fmt.tokens($0.totalTokens) } ?? "--", stats.map { Fmt.count($0.totalCalls) } ?? "--"], header: false)
                 let item = GLMPanelAction(title: "", target: self, action: #selector(toggleModels(_:)))
                 item.isBordered = false; item.wantsLayer = true; item.layer?.cornerRadius = 5; item.tag = index
                 item.isEnabled = !models.isEmpty
@@ -3091,20 +3118,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 item.toolTip = models.isEmpty ? "暂无模型明细" : (expanded ? "收起模型明细" : "展开模型明细")
                 cells.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(cells)
                 NSLayoutConstraint.activate([cells.leadingAnchor.constraint(equalTo: item.leadingAnchor), cells.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
-                if !models.isEmpty {
-                    let arrow = NSImageView(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil) ?? NSImage())
-                    arrow.contentTintColor = .secondaryLabelColor.withAlphaComponent(0.45); arrow.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 6, weight: .light)
-                    arrow.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(arrow)
-                    NSLayoutConstraint.activate([arrow.trailingAnchor.constraint(equalTo: item.trailingAnchor, constant: -3), arrow.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
-                }
                 item.heightAnchor.constraint(equalToConstant: 23).isActive = true; add(item)
+                tighten(after: previous, gap: previousEndsGroup ? 8 : 3)
+                previous = item
+                previousEndsGroup = !expanded || models.isEmpty
                 if expanded {
-                    root.setCustomSpacing(4, after: item)
                     for (modelIndex, model) in models.enumerated() {
                         let detail = tableCells([model.name, Fmt.tokens(model.tokens), ""], header: false, modelDetail: true)
                         detail.heightAnchor.constraint(equalToConstant: 20).isActive = true
                         add(detail)
-                        root.setCustomSpacing(modelIndex == models.count - 1 ? 12 : 4, after: detail)
+                        tighten(after: previous, gap: 3)
+                        previous = detail
+                        previousEndsGroup = modelIndex == models.count - 1
                     }
                 }
             }
@@ -3118,7 +3143,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         // 旧值保留期间有解析/刷新失败或超时 → 仅在「近 30 天」旁给简短「待更新」，不写技术细节。
         let dailyPending = usage.dailyTokens != nil && (usage.dailyTokensError != nil || dailyStale)
         let dailySection = GLMDailyUsageSectionView(buckets: usage.dailyTokens, selectedIndex: dailySelectedIndex,
-                                                    pendingNote: dailyPending) { [weak self] index in
+                                                    expanded: dailyExpanded, toggleTarget: self,
+                                                    toggleAction: #selector(toggleDaily), pendingNote: dailyPending) { [weak self] index in
             self?.dailySelectedIndex = index
         }
         add(dailySection)
@@ -3127,8 +3153,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         // 键盘可达（PRD §6.2 支持键盘切换日期）：把柱图接进 key view loop——
         // 「用量情况」标题 → 柱图 → 「MCP 工具」标题为显式顺序，其余环节按几何自动；
         // Full Keyboard Access 下 Tab 即可到达柱图，左右方向键切换日期
-        usageSection.nextKeyView = dailySection.chartCanvas
-        dailySection.chartCanvas.nextKeyView = mcpSection
+        if dailyExpanded {
+            usageSection.nextKeyView = dailySection.chartCanvas
+            dailySection.chartCanvas.nextKeyView = mcpSection
+        } else {
+            usageSection.nextKeyView = mcpSection   // 折叠时柱图不在视图层级，直接桥接相邻板块
+        }
         if mcpExpanded {
             if let t = usage.tools30d { add(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor)) }
             else { add(label("暂无数据", color: .secondaryLabelColor)) }
