@@ -3,6 +3,23 @@
 # 不影响文件树浏览、上传或 Agent 文件访问。
 # 修改 .gitignore 不会自动同步到本文件；可在设置页「从 .gitignore 同步」。
 
+# 构建产物
+*.app
+*-bin
+*.zip
+.DS_Store
+# 图标生成中间产物（保留 icns 成品）
+AppIcon.iconset/
+icon_1024x1024.png
+
+# Python 测试缓存
+__pycache__/
+
+# 跨仓库审计工作区（仅本机存在，其他仓库 .app 的对照副本）
+.sibling-audit/
+
+# DMG 产物（release.sh 构建在 mktemp 目录，此处仅防手动产物误入）
+*.dmg
 
 # ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
 .git/

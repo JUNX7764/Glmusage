@@ -711,12 +711,13 @@ enum Fetcher {
         }
         guard let req = req else { completion(nil, "bad url"); return }
         URLSession.shared.dataTask(with: req) { data, resp, err in
+            // 先看 HTTP 状态：非 200 且 body 非 JSON 时也能报出真实状态码，而不是笼统的 bad response
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                completion(nil, "HTTP \(http.statusCode)"); return
+            }
             guard err == nil, let data = data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 completion(nil, err?.localizedDescription ?? "bad response"); return
-            }
-            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-                completion(nil, "HTTP \(http.statusCode)"); return
             }
             guard let code = GLMNumber.integer(obj["code"]), code == 200 else {
                 let code = GLMNumber.integer(obj["code"]).map(String.init) ?? "missing or invalid"
@@ -785,6 +786,9 @@ enum Fetcher {
             let label = isFive ? "5 小时窗口" : "7 天额度"
             let window = isFive ? "5H" : "7D"
             let invalid = "invalid \(window) quota fields"
+            // number 语义按 unit 不同：5 小时窗实测 number==5（小时数），必须校验；
+            // 周窗（unit 6）实测返回 number==1（2026-11-04 实际接口脱敏样例，与官方文档「7 天」
+            // 不一致），不能照搬 number==7 校验，否则会把真实周窗响应全部拒绝
             if type == "CREDIT_LIMIT" && (unit == nil || (isFive && number != 5)) {
                 if isFive { result.fiveHourError = invalid } else { result.weekError = invalid }
                 continue
@@ -864,8 +868,9 @@ enum Fetcher {
                 completion(startPlan.merging(usage, from: from, to: to),
                            daily.buckets.map { startPlan.merging($0) }, daily.parseFailed, nil)
             } catch {
-                // 整次合并失败，沿用现有 freshness 逻辑保留上次完整统计。
-                completion(nil, nil, false, "赠送用量暂不可用")
+                // 本地赠送用量库读失败（如 ZCode 正活跃写入、busy 超时）：服务端统计本身有效，
+                // 降级为未合并的服务端数据继续展示，不再整体丢弃本次成功响应回退旧值。
+                completion(usage, daily.buckets, daily.parseFailed, nil)
             }
         }
     }
@@ -891,9 +896,14 @@ enum Fetcher {
         var byModel: [(String, Double)] = []
         if let rawList = data["modelSummaryList"] {
             guard let list = rawList as? [[String: Any]] else { return nil }
+            var seen = Set<String>()
             for model in list {
                 guard let count = GLMNumber.integer(model["totalTokens"]), count >= 0 else { return nil }
-                byModel.append((model["modelName"] as? String ?? "?", Double(count)))
+                let name = model["modelName"] as? String ?? "?"
+                // 重名模型行 = 协议异常：与 parseTimeline 同口径整体拒绝，避免明细重复展示/双计观感
+                guard !seen.contains(name) else { return nil }
+                seen.insert(name)
+                byModel.append((name, Double(count)))
             }
         }
         return ModelUsage(totalTokens: Double(tokens), totalCalls: Double(calls), byModel: byModel)
@@ -1311,13 +1321,23 @@ enum Peak {
         !festival && (2...6).contains(c.weekday!) && c.hour! >= 14 && c.hour! < 18
     }
 
+    /// 与峰谷判定同一时区（Asia/Shanghai）的「MM-dd HH:mm」：系统时区非 +8 时，
+    /// 避免「今天 14:00」的判定与时刻文案用两套时区自相矛盾
+    private static let dayTimeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "MM-dd HH:mm"
+        f.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        return f
+    }()
+
     /// 目标时刻落在今天/明天时用相对表述，否则「MM-dd HH:mm」；文案口径与 evaluate 现有输出一致
     private static func relativeDayText(_ target: Date, time: String, at date: Date) -> String {
         if cal.isDate(target, inSameDayAs: date) { return "今天 \(time)" }
         if let tomorrow = cal.date(byAdding: .day, value: 1, to: date), cal.isDate(target, inSameDayAs: tomorrow) {
             return "明天 \(time)"
         }
-        return Fmt.dayTime(target)
+        return dayTimeFmt.string(from: target)
     }
 
     /// emoji：⚡ 深夜活动 ＞ 🔥 高峰 ＞ 无（普通非高峰不占宽度）
@@ -1657,6 +1677,7 @@ final class UpdateChecker {
 
     /// force=false 时按 interval 节流；completion 固定主线程回调
     func check(force: Bool = false, completion: @escaping () -> Void = {}) {
+        if BuildInfo.version == "unknown" { completion(); return }   // 非 build.sh 产物：无版本可比，不发请求
         if inFlight { completions.append(completion); return }
         if !force, let last = lastCheck, Date().timeIntervalSince(last) < UpdateCheck.interval {
             completion()
@@ -2211,7 +2232,7 @@ final class GLMDailyUsageSectionView: NSView {
         header.addArrangedSubview(title)
         header.addArrangedSubview(spacer)
         header.addArrangedSubview(chevron)
-        // 整行可点折叠（与 section() 的板块标题同款）；状态在 AppDelegate，点击走 rebuildMenu
+        // 整行可点折叠（与 section() 的板块标题同款）；状态在 AppDelegate，点击走 rebuildPanel
         header.translatesAutoresizingMaskIntoConstraints = false
         let toggle = GLMPanelAction(title: "", target: toggleTarget, action: toggleAction)
         toggle.isBordered = false
@@ -2335,7 +2356,7 @@ final class GLMDailyUsageSectionView: NSView {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     // 状态栏底色随全屏进出/深浅模式翻转时，KVO 触发按新外观重画（否则浅色栏上残留白色余量文字）；
     // setImage 也会再次触发 KVO 通知，用明暗主题快照去重防止 renderBar↔KVO 反馈循环
@@ -2383,15 +2404,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var cycle = 0
     private let refreshGate = RefreshGate()
     private let quotaGate = RefreshGate()
-    // 菜单打开期间不重建菜单（避免打开中的菜单被替换闪断），关闭时补一次
-    private var menuOpen = false
-    private var pendingMenuRebuild = false
     private let launchAgentLabel = "com.local.glm-usage"
     // token 统计每 N 个刷新周期拉一次（主循环 10s × 30 = 5 分钟；额度窗口每轮都刷）
     private let tokenEveryCycles = 30
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
     private let quotaStaleAfter: TimeInterval = 600
     private let tokensStaleAfter: TimeInterval = 1800
+    // 重置卡/套餐慢通道的过期阈值：慢项 5 分钟一刷，15 分钟（900s）内无成功即视为过期
+    private let cardsStaleAfter: TimeInterval = 900
     private var lastAttemptAt = Date()
     private var fiveHourLastOK: Date?
     private var weekLastOK: Date?
@@ -2427,7 +2447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             // 几何测试需保留展开模型所需的高度余量；每日图交互由独立测试覆盖。
             if CommandLine.arguments.contains("--preview-popover-test") { dailyExpanded = false }
             installPreviewData()
-            rebuildMenu()
+            rebuildPanel()
             statusItem.button?.title = "GLM 预览"
             if previewPopover && CommandLine.arguments.contains("--preview-popover-ui") {
                 let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 300, height: 60), styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -2478,7 +2498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             }
             return
         }
-        rebuildMenu()
+        rebuildPanel()
         renderBar()
         // 面板内更新进度：状态翻转时重建面板（按钮↔进度行），进度百分比由进度行自刷；
         // 菜单栏 toolTip 同步更新状态，面板关闭时更新也在后台继续
@@ -2623,8 +2643,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             // 双保险：本方法在 preview 下不会被调用（启动即 return），此处再显式断开
             // 预览路径与凭据读取的关联，防止未来重构把凭据读取带进假数据预览。
             let accountEmail = preview ? nil : CredStore.loadAccountEmail()
+            let previousEmail = usage.accountEmail
             accumulator.update { current in
-                current.accountEmail = accountEmail
+                // 凭据库瞬时读取失败（文件 busy/锁）会读到 nil：沿用上轮邮箱避免头部整行闪烁；
+                // 退出登录后同样读到 nil，旧值保留到下次成功读取或重启（展示侧五重门禁兜底）
+                current.accountEmail = accountEmail ?? previousEmail
             }
             wg.enter()
             Fetcher.fetchToolUsage(apiKey: key, from: now.addingTimeInterval(-30 * 86400), to: now) { r, err in
@@ -2726,23 +2749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     /// 菜单栏图标 + 下拉菜单的统一渲染入口；菜单打开期间延迟重建到关闭时
     private func updateUI() {
         renderBar()
-        rebuildMenu()
-    }
-
-    // 打开菜单即触发一轮全量刷新（RefreshGate 防重入、合并重复请求）与一次节流更新检查；
-    // 数据到位时若菜单仍打开，重建延迟到关闭后，下次打开即为最新
-    func menuWillOpen(_ menu: NSMenu) {
-        menuOpen = true
-        refresh(tokens: false)
-        checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
-    }
-
-    func menuDidClose(_ menu: NSMenu) {
-        menuOpen = false
-        if pendingMenuRebuild {
-            pendingMenuRebuild = false
-            rebuildMenu()
-        }
+        rebuildPanel()
     }
 
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
@@ -2757,13 +2764,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var tokens30dStale: Bool { isStale(tokens30dLastOK, hasData: usage.tokens30d != nil, after: tokensStaleAfter) }
     private var toolsStale: Bool { isStale(toolsLastOK, hasData: usage.tools30d != nil, after: tokensStaleAfter) }
     private var fiveHourCardsStale: Bool {
-        isStale(fiveHourCardsLastOK, hasData: usage.resetCards?.fiveHour != nil, after: 900)
+        isStale(fiveHourCardsLastOK, hasData: usage.resetCards?.fiveHour != nil, after: cardsStaleAfter)
     }
     private var weekCardsStale: Bool {
-        isStale(weekCardsLastOK, hasData: usage.resetCards?.week != nil, after: 900)
+        isStale(weekCardsLastOK, hasData: usage.resetCards?.week != nil, after: cardsStaleAfter)
     }
     private var subscriptionStale: Bool {
-        isStale(subscriptionLastOK, hasData: usage.subscription != nil, after: 900)
+        isStale(subscriptionLastOK, hasData: usage.subscription != nil, after: cardsStaleAfter)
     }
     // 每日桶：与慢项同节奏刷新；超过 30 分钟未成功视为过期（仅用于简短「待更新」提示）
     private var dailyStale: Bool {
@@ -2809,7 +2816,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let active = UpdateProgressController.shared.isActive
         if active != updateProgressWasActive {
             updateProgressWasActive = active
-            rebuildMenu()
+            rebuildPanel()
             if !active, UpdateProgressController.shared.phase == .failed {
                 setUpdateMessage("更新失败，详见弹窗提示", dismissAfter: 8)
             }
@@ -2847,8 +2854,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                     peakLine: peak.line)
     }
 
+    // status.json 写盘限频：更新下载期间进度行高频触发 renderBar，避免写盘被抬到 0.25s 级
+    private var lastStatusWrite = Date.distantPast
+
     // 自诊断：把渲染内容写到本地，便于排查
     private func writeStatus(line1: String, line2: String, peakLine: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastStatusWrite) >= 1 else { return }
+        lastStatusWrite = now
         let dir = Self.supportDir
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         // 重置卡/套餐自诊断（只含到期时间与名称，不含任何密钥）
@@ -2912,158 +2925,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     }
 
     // 下拉面板
-    private func rebuildMenu() {
-        let menu = NSMenu()
-
-        // 更新横幅（最上方）：GitHub 发布了更高版本的 Release 才出现（与 commit 动态无关）；
-        // 点击运行 .app 内置 update.sh 从 Release 下载替换，内置脚本缺失时退化为打开 Releases 页
-        if UpdateChecker.shared.available {
-            let banner = NSMenuItem(title: "⬆ 新版本可用，点击更新", action: #selector(onUpdateApp), keyEquivalent: "")
-            banner.target = self
-            menu.addItem(banner)
-            menu.addItem(.separator())
-        }
-
-        func info(_ title: String) -> NSMenuItem {
-            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            return item
-        }
-
-        menu.addItem(info("GLM 余额" + (usage.level.map { "（\($0) 套餐）" } ?? "")))
-        menu.addItem(.separator())
-
-        func limitLine(_ e: LimitEntry?, label: String, lastOK: Date?, stale: Bool, error: String?, warning: String?) -> String {
-            var s = "\(label)："
-            if let e = e {
-                s += "剩余 \(Fmt.pctLong(e.usedRemainingRatio))"
-                if e.limit > 0 { s += "（剩 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits）" }
-                if e.reset != nil { s += "（\(Fmt.weekDayTime(e.reset)) 重置）" }
-            } else { s += "暂无数据" }
-            if stale { s += " · ⚠️ 数据已过期" }
-            if let error = error { s += " · 刷新失败：\(error)" }
-            if let warning = warning { s += " · 部分数据异常：\(warning)" }
-            if lastOK != nil, stale || error != nil { s += " · 最后成功 \(Fmt.lastOK(lastOK))" }
-            return s
-        }
-        menu.addItem(info(limitLine(usage.fiveHour, label: "5 小时窗口", lastOK: fiveHourLastOK,
-                                  stale: fiveHourStale, error: usage.fiveHourError, warning: usage.fiveHourWarning)))
-        menu.addItem(info(limitLine(usage.week, label: "7 天额度", lastOK: weekLastOK,
-                                  stale: weekStale, error: usage.weekError, warning: usage.weekWarning)))
-
-        menu.addItem(.separator())
-
-        // 峰谷状态 + 限时活动
-        let pk = Peak.evaluate()
-        menu.addItem(info(pk.line))
-        if let ev = pk.eventLine { menu.addItem(info(ev)) }
-
-        // 重置卡（额度重置卡）板块：首轮未拉到数据时不画分隔线，避免连续双 separator；≤72 小时临期加 ⚠️
-        if usage.resetCards != nil || usage.resetCardsError != nil {
-            menu.addItem(.separator())
-        }
-        func cardLine(_ label: String, _ d: Date) -> String {
-            let warn = d.timeIntervalSinceNow <= 72 * 3600
-            return (warn ? "⚠️ " : "  ") + "\(label) · \(Fmt.expires(d)) 过期"
-        }
-        if let cards = usage.resetCards {
-            let f5 = GLMFreshness.availableCards(cards.fiveHour ?? [], now: Date())
-            let wk = GLMFreshness.availableCards(cards.week ?? [], now: Date())
-            var parts: [String] = []
-            if cards.fiveHour != nil { parts.append("5 小时 ×\(f5.count)") }
-            if cards.week != nil { parts.append("周 ×\(wk.count)") }
-            let bothKnownEmpty = cards.fiveHour != nil && cards.week != nil && f5.isEmpty && wk.isEmpty
-            if bothKnownEmpty {
-                menu.addItem(info("重置卡：暂无可用"))
-            } else {
-                if !parts.isEmpty { menu.addItem(info("重置卡：" + parts.joined(separator: " · "))) }
-                for d in f5 { menu.addItem(info(cardLine("5 小时卡", d))) }
-                for d in wk { menu.addItem(info(cardLine("周卡", d))) }
-                // 使用入口（写操作）：仅在确有可用卡时出现，点击后弹确认框
-                func useItem(_ type: ResetCardType, count: Int) {
-                    let item = NSMenuItem(title: resetUseInFlight
-                        ? "\(type.displayName)使用中…"
-                        : "使用\(type.displayName)（剩 \(count) 张）…",
-                        action: #selector(onUseReset(_:)), keyEquivalent: "")
-                    item.target = self
-                    item.representedObject = type.rawValue
-                    item.isEnabled = !resetUseInFlight
-                    menu.addItem(item)
-                }
-                if !f5.isEmpty { useItem(.fiveHour, count: f5.count) }
-                if !wk.isEmpty { useItem(.week, count: wk.count) }
-            }
-        }
-        if let e = usage.fiveHourCardsError {
-            let short = e
-            menu.addItem(info("5 小时卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试） · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))"))
-        }
-        if fiveHourCardsStale { menu.addItem(info("⚠️ 5 小时卡数据已过期 · 最后成功 \(Fmt.lastOK(fiveHourCardsLastOK))")) }
-        if let e = usage.weekCardsError {
-            let short = e
-            menu.addItem(info("周卡获取失败：\(short)（ZCode 登录态可能过期，打开 ZCode 客户端刷新后重试） · 最后成功 \(Fmt.lastOK(weekCardsLastOK))"))
-        }
-        if weekCardsStale { menu.addItem(info("⚠️ 周卡数据已过期 · 最后成功 \(Fmt.lastOK(weekCardsLastOK))")) }
-
-        // 用量情况（与面板 section 同名；此 NSMenu 为 fallback 死代码，仅防漂移）
-        menu.addItem(.separator())
-        menu.addItem(info("Token 用量（服务端统计）"))
-        func addTokenSection(_ label: String, _ stats: ModelUsage?, lastOK: Date?, stale: Bool, error: String?) {
-            var lines: [String]
-            if let stats = stats, !stats.isEmpty {
-                lines = ["\(label)：\(Fmt.tokens(stats.totalTokens)) tokens · 调用 \(Fmt.count(stats.totalCalls)) 次"]
-                lines += TokenModelList.render(stats.byModel)
-            } else {
-                lines = ["\(label)：暂无记录"]
-            }
-            if stale { lines[0] += " · ⚠️ 数据已过期" }
-            if let error = error { lines[0] += " · 刷新失败：\(error)" }
-            if lastOK != nil, stale || error != nil { lines[0] += " · 最后成功 \(Fmt.lastOK(lastOK))" }
-            for line in lines { menu.addItem(info(line)) }
-        }
-        addTokenSection("今日", usage.tokensToday, lastOK: tokensTodayLastOK,
-                        stale: tokensTodayStale, error: usage.tokensTodayError)
-        addTokenSection("近 7 天", usage.tokens7d, lastOK: tokens7dLastOK,
-                        stale: tokens7dStale, error: usage.tokens7dError)
-        addTokenSection("近 30 天", usage.tokens30d, lastOK: tokens30dLastOK,
-                        stale: tokens30dStale, error: usage.tokens30dError)
-
-        if let t = usage.tools30d {
-            menu.addItem(.separator())
-            var line = "MCP 工具（近 30 天）：网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次"
-            if toolsStale { line += " · ⚠️ 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))" }
-            menu.addItem(info(line))
-        }
-        if let e = usage.toolsError { menu.addItem(info("MCP 工具刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))")) }
-
-        menu.addItem(.separator())
-        menu.addItem(info("最近尝试刷新 \(Fmt.fullTime.string(from: lastAttemptAt))"))
-        menu.addItem(.separator())
-
-        let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-
-        let loginItem = NSMenuItem(title: "开机自启", action: #selector(onToggleLogin), keyEquivalent: "")
-        loginItem.target = self
-        loginItem.state = (!preview && isLoginItemEnabled()) ? .on : .off
-        menu.addItem(loginItem)
-
-        menu.addItem(.separator())
-        menu.addItem(info("版本 \(BuildInfo.version)"))
-        let quit = NSMenuItem(title: "退出", action: #selector(onQuit), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-
-        buildPanel(menu)
-
+    // 历史上此处还构造过一个 NSMenu（menu delegate 从未接线、从未展示，文案需人肉与面板同步）；
+    // 2026-11-08 review 确认死代码后整段切除。面板打开时的刷新与更新检查在 togglePanel 内完成。
+    private func rebuildPanel() {
+        buildPanel()
     }
 
     @objc private func togglePanel() {
         if popover.isShown { popover.performClose(nil); return }
         dailySelectedIndex = nil
         if !preview { refresh(tokens: false); checkForUpdate() }
-        rebuildMenu()
+        rebuildPanel()
         if let button = statusItem.button {
             let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
             panelBackground.opacity = reduceTransparency ? 1 : 0.9
@@ -3112,7 +2984,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         }
     }
 
-    @objc private func toggleToken() { tokenExpanded.toggle(); rebuildMenu() }
+    @objc private func toggleToken() { tokenExpanded.toggle(); rebuildPanel() }
 
     // 面板标题行的小重置图标：一类卡可用直接确认；两类都有先选类型；无卡提示
     @objc private func onResetCardIcon(_ sender: NSButton) {
@@ -3180,7 +3052,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             persistPendingResetKeys()
             key = fresh
         }
-        rebuildMenu()
+        rebuildPanel()
         Fetcher.useResetCard(jwt: jwt, maas: maas, resetType: type, idempotencyKey: key) { [weak self] outcome in
             DispatchQueue.main.async {
                 guard let self = self else { return }
@@ -3213,16 +3085,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         guard (0..<3).contains(index) else { return }
         if expandedModelWindows.contains(index) { expandedModelWindows.remove(index) }
         else { expandedModelWindows.insert(index) }
-        rebuildMenu()
+        rebuildPanel()
     }
-    @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildMenu() }
-    @objc private func toggleDaily() { dailyExpanded.toggle(); rebuildMenu() }
+    @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildPanel() }
+    @objc private func toggleDaily() { dailyExpanded.toggle(); rebuildPanel() }
     // 版本点击等临时状态行；dismissAfter 到点后自动清除（与 CodexUsage 一致）
     private func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
         updateMessageDismissal?.cancel()
         updateMessageDismissal = nil
         updateMessage = message
-        rebuildMenu()
+        rebuildPanel()
         if message != nil, let delay = dismissAfter {
             let dismissal = DispatchWorkItem { [weak self] in self?.setUpdateMessage(nil) }
             updateMessageDismissal = dismissal
@@ -3321,7 +3193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         return buckets
     }
 
-    private func buildPanel(_ menu: NSMenu) {
+    private func buildPanel() {
         let savedOffset = activeScroll?.contentView.bounds.origin ?? .zero
         let width: CGFloat = CommandLine.arguments.contains("--preview-narrow") ? 280 : 336
         let inner = width - 32
@@ -3883,7 +3755,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                     verify("async-refresh", .same, strictAnchor: false)
                     // 多窗展开状态单独做重开保持回归；这里直接布置终态，避免在截断区追加无高度变化的点击。
                     self.expandedModelWindows = [0, 2]
-                    self.rebuildMenu()
+                    self.rebuildPanel()
                     guard self.expandedModelWindows == [0, 2] else { fail("model expansion state lost"); return }
                     self.popover.performClose(nil)
                     guard !self.popover.isShown else { fail("close"); return }
@@ -4150,6 +4022,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
         }
         updateUI()
+        // 只写 plist 不做 launchctl bootstrap：本会话不生效，明示而非静默
+        setUpdateMessage(isLoginItemEnabled() ? "已开启开机自启（下次登录生效）" : "已关闭开机自启（下次登录生效）",
+                         dismissAfter: 4)
     }
 
     @objc private func onRefresh() {
@@ -4186,6 +4061,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             NSWorkspace.shared.open(UpdateCheck.releasesPage); return
         }
         guard let tag = UpdateChecker.shared.targetTag else { return }
+        // 用户决策（2026-11-08）：更新不弹二次确认——横幅点击即走下载/校验/重启流程，
+        // 面板内原位进度行就是过程反馈；与「使用重置卡」（消耗性写操作）的确认语义区分开
         UpdateProgressController.shared.start(script: script, tag: tag, appPath: Bundle.main.bundleURL.path)
     }
 
@@ -4358,6 +4235,7 @@ enum GLMOfflineRegression {
             try expect(partial.week?.used == 100 && partial.weekError == nil,
                        "valid 7D quota was discarded with invalid 5H")
             // 超额用尽（currentValue > usage）是服务端合法状态：应保留窗口并显示 100% 已用
+            // （周窗 number==1 是真实接口实测值，见下方 roundedQuotaJSON 注释）
             let overUsed = Fetcher.parseQuota(["limits": [
                 ["type": "CREDIT_LIMIT", "unit": 6, "number": 1, "usage": 60_000,
                  "currentValue": 60_004, "remaining": 0, "percentage": 100]
@@ -4450,6 +4328,12 @@ enum GLMOfflineRegression {
             try expect(Fetcher.parseModelUsage(["totalUsage": ["totalTokensUsage": 10,
                 "totalModelCallCount": 3]])?.totalCalls == 3,
                 "valid model call count changed")
+            // 重名模型行 = 协议异常：与 parseTimeline 同口径整体拒绝，不双计展示
+            try expect(Fetcher.parseModelUsage([
+                "totalUsage": ["totalTokensUsage": 10, "totalModelCallCount": 3],
+                "modelSummaryList": [["modelName": "glm-a", "totalTokens": 5],
+                                     ["modelName": "glm-a", "totalTokens": 7]]
+            ]) == nil, "duplicate model rows were accepted in modelSummaryList")
 
             // 临时 SQLite 覆盖真实读取 → 周期总量/模型合并 → 日图的整条补统计路径。
             let startPlanPath = root.appendingPathComponent("zcode.sqlite").path
