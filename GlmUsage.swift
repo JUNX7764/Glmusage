@@ -1265,22 +1265,28 @@ enum Peak {
         return date
     }
 
+    /// 高峰时刻判定（工作日 14:00–18:00，双节活动日全天非高峰）；evaluate 与面板 display 共用
+    private static func isPeakMoment(_ c: DateComponents, festival: Bool) -> Bool {
+        !festival && (2...6).contains(c.weekday!) && c.hour! >= 14 && c.hour! < 18
+    }
+
+    /// 目标时刻落在今天/明天时用相对表述，否则「MM-dd HH:mm」；文案口径与 evaluate 现有输出一致
+    private static func relativeDayText(_ target: Date, time: String, at date: Date) -> String {
+        if cal.isDate(target, inSameDayAs: date) { return "今天 \(time)" }
+        if let tomorrow = cal.date(byAdding: .day, value: 1, to: date), cal.isDate(target, inSameDayAs: tomorrow) {
+            return "明天 \(time)"
+        }
+        return Fmt.dayTime(target)
+    }
+
     /// emoji：⚡ 深夜活动 ＞ 🔥 高峰 ＞ 无（普通非高峰不占宽度）
     static func evaluate(at date: Date = Date()) -> (emoji: String?, line: String, eventLine: String?) {
         let c = cal.dateComponents([.year, .month, .day, .hour, .weekday], from: date)
         let festival = isFestivalDay(c)
         let night = isNightWindow(date)
-        let peak = !festival && (2...6).contains(c.weekday!) && c.hour! >= 14 && c.hour! < 18
+        let peak = isPeakMoment(c, festival: festival)
 
-        let np = nextPeakStart(date)
-        let npText: String
-        if cal.isDate(np, inSameDayAs: date) {
-            npText = "今天 14:00"
-        } else if let tomorrow = cal.date(byAdding: .day, value: 1, to: date), cal.isDate(np, inSameDayAs: tomorrow) {
-            npText = "明天 14:00"
-        } else {
-            npText = Fmt.dayTime(np)
-        }
+        let npText = relativeDayText(nextPeakStart(date), time: "14:00", at: date)
 
         let emoji = night ? "⚡" : (peak ? "🔥" : nil)
         let line = peak
@@ -1290,6 +1296,27 @@ enum Peak {
         if festival { eventLine = "🎉 双节活动：全天按非高峰 5 折（至 10-07）" }
         if night { eventLine = "🌙 深夜错峰：Flash 免费 · 其他 Agent 额度 ×2（至 10-07）" }
         return (emoji, line, eventLine)
+    }
+
+    /// 面板峰谷卡的结构化展示数据：与 evaluate 共用同一套判定与时间措辞，只省去整句拼装
+    struct Display {
+        let isPeak: Bool
+        let badge: String        // 非高峰 / 高峰中
+        let discount: String     // 5 折 / 原价
+        let nextLabel: String    // 下次高峰开始 / 下次非高峰开始
+        let nextTime: String     // 今天 14:00 / 明天 14:00 / 11-09 14:00 / 今天 18:00
+    }
+
+    static func display(at date: Date = Date()) -> Display {
+        let c = cal.dateComponents([.year, .month, .day, .hour, .weekday], from: date)
+        if isPeakMoment(c, festival: isFestivalDay(c)) {
+            // 高峰窗口固定 14:00–18:00，结束时刻即当天 18:00（与 evaluate 文案「18:00 后恢复 5 折」同源）
+            let end = cal.date(bySettingHour: 18, minute: 0, second: 0, of: date)!
+            return Display(isPeak: true, badge: "高峰中", discount: "原价",
+                           nextLabel: "下次非高峰开始", nextTime: relativeDayText(end, time: "18:00", at: date))
+        }
+        return Display(isPeak: false, badge: "非高峰", discount: "5 折",
+                       nextLabel: "下次高峰开始", nextTime: relativeDayText(nextPeakStart(date), time: "14:00", at: date))
     }
 }
 
@@ -1743,6 +1770,62 @@ final class GLMPanelAction: NSButton {
     override func updateTrackingAreas() { super.updateTrackingAreas(); for area in trackingAreas { removeTrackingArea(area) }; addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)) }
     override func mouseEntered(with event: NSEvent) { hovered = true }
     override func mouseExited(with event: NSEvent) { hovered = false }
+}
+
+// 峰谷卡状态胶囊：非高峰绿 / 高峰低饱和暖色，浅底深字，明暗模式各自取色（GLMRemainingColor 同源色值）
+enum GLMPeakTint {
+    static func color(_ dark: UInt32, _ light: UInt32, alpha: CGFloat = 1) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let darkMode = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let hex = darkMode ? dark : light
+            return NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
+                           green: CGFloat((hex >> 8) & 0xff) / 255,
+                           blue: CGFloat(hex & 0xff) / 255,
+                           alpha: alpha)
+        }
+    }
+    static var accent: NSColor { color(0x96CDA7, 0x3E8660) }          // 主题绿：折扣数字、非高峰胶囊
+    static var warm: NSColor { color(0xE5A37D, 0xB46539) }            // 低饱和暖色：高峰胶囊
+}
+
+// 只读胶囊，不接收鼠标事件；底色与文字色在 updateLayer 内按当前外观解析，明暗切换即时生效
+final class GLMPeakBadge: NSView {
+    private let textField: NSTextField
+    let isPeak: Bool
+
+    init(isPeak: Bool, text: String) {
+        self.isPeak = isPeak
+        textField = NSTextField(labelWithString: text)
+        textField.font = .systemFont(ofSize: 10, weight: .semibold)
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 8.5
+        layer?.masksToBounds = true
+        textField.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(textField)
+        NSLayoutConstraint.activate([
+            textField.topAnchor.constraint(equalTo: topAnchor, constant: 2.5),
+            textField.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2.5),
+            textField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            textField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8)
+        ])
+        setAccessibilityLabel(isPeak ? "当前高峰，积分全价" : "当前非高峰，积分 5 折")
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let tint = isPeak ? GLMPeakTint.warm : GLMPeakTint.accent
+            layer?.backgroundColor = tint.withAlphaComponent(dark ? 0.16 : 0.13).cgColor
+            textField.textColor = tint
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
 }
 
 final class GLMQuotaBar: NSView {
@@ -3291,12 +3374,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         if let error = usage.subscriptionError { addContent(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed), to: quotaCard) }
         else if subscriptionStale { addContent(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange), to: quotaCard) }
         add(quotaCard)
-        let peak = Peak.evaluate()
+        // 峰谷卡＝极简状态条：标题+状态胶囊一行，折扣与下次切换一行；限时活动行沿用旧版追加在下方。
+        // 视觉回归可用 --preview-peak 强制按高峰时刻渲染（下个工作日 14:00）
+        let peakNow = CommandLine.arguments.contains("--preview-peak") ? Peak.nextPeakStart(Date()) : Date()
+        let peak = Peak.evaluate(at: peakNow)
+        let peakInfo = Peak.display(at: peakNow)
         let peakCard = GLMPanelCard()
-        let peakTitle = row(); peakTitle.spacing = 8; peakTitle.addArrangedSubview(symbol("clock")); peakTitle.addArrangedSubview(label("峰谷状态", size: 13, bold: true)); peakTitle.addArrangedSubview(spacer())
+        let peakTitle = row(); peakTitle.spacing = 8
+        peakTitle.addArrangedSubview(symbol("clock"))
+        peakTitle.addArrangedSubview(label("峰谷状态", size: 13, bold: true))
+        peakTitle.addArrangedSubview(spacer())
+        peakTitle.addArrangedSubview(GLMPeakBadge(isPeak: peakInfo.isPeak, text: peakInfo.badge))
         peakCard.content.addArrangedSubview(peakTitle); peakTitle.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
-        for line in [peak.line, peak.eventLine].compactMap({ $0 }) {
-            let field = label(line, size: 11); peakCard.content.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
+        peakCard.content.setCustomSpacing(5, after: peakTitle)
+        // 折扣组基线对齐读作一个短语；右列右对齐，标签弱、时间强调但低于折扣
+        let discountGroup = NSStackView(views: [
+            label(peakInfo.discount, size: 18, bold: true, color: peakInfo.isPeak ? .labelColor : GLMPeakTint.accent),
+            label("积分消耗", size: 10.5, color: .secondaryLabelColor)])
+        discountGroup.orientation = .horizontal; discountGroup.alignment = .firstBaseline; discountGroup.spacing = 5
+        let nextTime = label(peakInfo.nextTime, size: 12.5, bold: true)
+        nextTime.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
+        nextTime.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let nextGroup = NSStackView(views: [label(peakInfo.nextLabel, size: 10, color: .secondaryLabelColor), nextTime])
+        nextGroup.orientation = .vertical; nextGroup.alignment = .trailing; nextGroup.spacing = 1.5
+        let peakInfoRow = row(); peakInfoRow.spacing = 4
+        peakInfoRow.addArrangedSubview(discountGroup)
+        peakInfoRow.addArrangedSubview(spacer())
+        peakInfoRow.addArrangedSubview(nextGroup)
+        addContent(peakInfoRow, to: peakCard)
+        if let event = peak.eventLine {
+            let field = label(event, size: 11); peakCard.content.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
         }
         add(peakCard)
         let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 8; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 13, bold: true))
