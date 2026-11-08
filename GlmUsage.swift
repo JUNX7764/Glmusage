@@ -468,11 +468,50 @@ enum ResetCardType: String {
     var displayName: String { self == .fiveHour ? "5 小时重置卡" : "周重置卡" }
 }
 
-/// 使用重置卡的结果：retryable=true 表示结果未知（网络/5xx），保留同一幂等 key 重试不会重复扣卡
+/// 使用重置卡的结果：retryable=true 表示结果未知（网络/5xx/响应不完整），保留同一幂等 key 重试不会重复扣卡
 struct ResetUseOutcome {
     var used: Bool
     var error: String?
     var retryable: Bool
+}
+
+/// 重置卡幂等 key 的跨进程持久化：「结果未知」后进程可能被 launchd 重启，key 只存内存会在
+/// 重启边界失效、重试生成新 key 导致重复扣卡。文件仅含 类型→{key, createdAt}，不含任何凭据。
+enum GLMPendingResetStore {
+    /// 未决 key 保留期：幂等复用只需覆盖结果未知后的短期重试，超期自动剪枝
+    static let retention: TimeInterval = 7 * 24 * 3600
+
+    struct Entry: Equatable {
+        let key: String
+        let createdAt: Date
+    }
+
+    static func load(dir: String, now: Date = Date()) -> [String: Entry] {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: dir + "/pending-resets.json")),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        var out: [String: Entry] = [:]
+        for (type, value) in obj {
+            guard let entry = value as? [String: Any],
+                  let key = entry["key"] as? String, !key.isEmpty,
+                  let at = entry["at"] as? Double,
+                  now.timeIntervalSince1970 - at < retention else { continue }
+            out[type] = Entry(key: key, createdAt: Date(timeIntervalSince1970: at))
+        }
+        return out
+    }
+
+    static func save(_ keys: [String: Entry], dir: String) {
+        var obj: [String: [String: Any]] = [:]
+        for (type, e) in keys {
+            obj[type] = ["key": e.key, "at": e.createdAt.timeIntervalSince1970]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // .atomic：写盘中途被杀不留半截文件——半截文件会让 load 兜底清空未决 key，恰是本功能要防的重复扣卡窗口
+        try? data.write(to: URL(fileURLWithPath: dir + "/pending-resets.json"), options: [.atomic])
+    }
 }
 
 /// 套餐订阅信息（subscription/list）
@@ -972,7 +1011,8 @@ enum Fetcher {
         }.resume()
     }
 
-    /// 纯解析：成功 = code==0 且 data.used==true；服务端明确拒绝不可重试，网络/5xx 结果未知可安全重试
+    /// 纯解析：成功 = code==0 且 data.used==true；服务端明确拒绝不可重试，
+    /// 网络/5xx/code==0 但缺 used==true 均视为结果未知、可安全重试（复用同一幂等 key）
     static func parseResetUseResponse(_ obj: [String: Any], httpStatus: Int?) -> ResetUseOutcome {
         if let http = httpStatus, http != 200 {
             return ResetUseOutcome(used: false, error: "HTTP \(http)", retryable: http >= 500)
@@ -989,7 +1029,8 @@ enum Fetcher {
         if (d["used"] as? Bool) == true {
             return ResetUseOutcome(used: true, error: nil, retryable: false)
         }
-        return ResetUseOutcome(used: false, error: "服务器未确认使用成功", retryable: false)
+        // code==0 但服务端未确认 used==true：消费状态未知，必须保留幂等 key（协议异常 ≠ 明确拒绝）
+        return ResetUseOutcome(used: false, error: "服务器未确认使用结果", retryable: true)
     }
 
     /// 套餐订阅：取 status=="VALID" 的第一条；到期时间解析失败时仅降级显示名称
@@ -2305,7 +2346,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var appearancePollTimer: Timer?
     // 重置卡使用：进行中防重入；结果未知（网络/5xx）时按类型保留同一幂等 key，重试不重复扣卡
     private var resetUseInFlight = false
-    private var pendingResetKeys: [String: String] = [:]
+    private var pendingResetKeys: [String: GLMPendingResetStore.Entry] = [:]
+    // 自诊断与幂等 key 持久化目录（与 status.json 同目录；key 文件不含任何凭据）
+    private static let supportDir = NSHomeDirectory() + "/Library/Application Support/GlmUsage"
+
+    // 幂等 key 变更即落盘：结果未知后即使进程重启，重试仍复用同一 key
+    private func persistPendingResetKeys() {
+        GLMPendingResetStore.save(pendingResetKeys, dir: Self.supportDir)
+    }
     private let popover = NSPopover()
     private let panelController = NSViewController()
     private let panelRoot = GLMPanelStack()
@@ -2359,6 +2407,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var dailySelectedIndex: Int?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 恢复上次「结果未知」遗留的幂等 key：跨重启防重复扣卡
+        pendingResetKeys = GLMPendingResetStore.load(dir: Self.supportDir)
         NSLog("[GlmUsage] launched, creating status item")
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
@@ -2799,7 +2849,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     // 自诊断：把渲染内容写到本地，便于排查
     private func writeStatus(line1: String, line2: String, peakLine: String) {
-        let dir = NSHomeDirectory() + "/Library/Application Support/GlmUsage"
+        let dir = Self.supportDir
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         // 重置卡/套餐自诊断（只含到期时间与名称，不含任何密钥）
         var cardsStatus: [String] = []
@@ -2852,6 +2902,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             "quotaError": usage.quotaError ?? "",
             "tokensError": usage.tokensError ?? "",
             "resetCards": cardsStatus,
+            "pendingResets": pendingResetKeys.keys.sorted(),
             "subscription": usage.subscription?.name ?? "",
             "subscriptionExpire": usage.subscription?.expireDate.map { Fmt.iso8601.string(from: $0) } ?? ""
         ]
@@ -3120,8 +3171,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
         resetUseInFlight = true
         // 上次结果未知则复用同一幂等 key（服务器按 key 幂等，重试不会重复扣卡）
-        let key = pendingResetKeys[type.rawValue] ?? UUID().uuidString
-        pendingResetKeys[type.rawValue] = key
+        let key: String
+        if let existing = pendingResetKeys[type.rawValue] {
+            key = existing.key
+        } else {
+            let fresh = UUID().uuidString
+            pendingResetKeys[type.rawValue] = .init(key: fresh, createdAt: Date())
+            persistPendingResetKeys()
+            key = fresh
+        }
         rebuildMenu()
         Fetcher.useResetCard(jwt: jwt, maas: maas, resetType: type, idempotencyKey: key) { [weak self] outcome in
             DispatchQueue.main.async {
@@ -3129,10 +3187,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 self.resetUseInFlight = false
                 if outcome.used {
                     self.pendingResetKeys.removeValue(forKey: type.rawValue)
+                    self.persistPendingResetKeys()
                     self.setUpdateMessage("已使用\(type.displayName) ✓", dismissAfter: 3)
                 } else {
-                    if !outcome.retryable { self.pendingResetKeys.removeValue(forKey: type.rawValue) }
-                    let suffix = outcome.retryable ? "（结果未知，已刷新卡数；未扣卡可重试）" : ""
+                    if !outcome.retryable {
+                        self.pendingResetKeys.removeValue(forKey: type.rawValue)
+                        self.persistPendingResetKeys()
+                    }
+                    let suffix = outcome.retryable ? "（结果未知，已保留防重扣凭证，可安全重试）" : ""
                     self.setUpdateMessage("使用\(type.displayName)失败：\(outcome.error ?? "未知错误")\(suffix)", dismissAfter: 6)
                 }
                 // 成功/失败都刷新额度与卡数：成功立刻反映新窗口，结果未知用于对账
@@ -4513,7 +4575,7 @@ enum GLMOfflineRegression {
             try expect(ResetCards(fiveHour: nil, week: [now.addingTimeInterval(30)]).availableCount(now: now) == nil,
                        "incomplete reset card data was counted as a total")
 
-            // 使用重置卡响应解析：成功 / 明确拒绝不可重试 / 5xx 可重试 / 缺 used 不算成功
+            // 使用重置卡响应解析：成功 / 明确拒绝不可重试 / 5xx 可重试 / code==0 缺 used=结果未知必须可重试
             let useOK = Fetcher.parseResetUseResponse(["code": 0, "data": ["used": true]], httpStatus: 200)
             try expect(useOK.used && useOK.error == nil && !useOK.retryable,
                        "successful reset use response was rejected")
@@ -4524,9 +4586,25 @@ enum GLMOfflineRegression {
             let use5xx = Fetcher.parseResetUseResponse([:], httpStatus: 502)
             try expect(!use5xx.used && use5xx.retryable, "5xx reset use response was not retryable")
             let useNoFlag = Fetcher.parseResetUseResponse(["code": 0, "data": [String: Any]()], httpStatus: 200)
-            try expect(!useNoFlag.used, "reset use without used=true was accepted")
+            try expect(!useNoFlag.used && useNoFlag.retryable,
+                       "code==0 without used=true must stay retryable (unknown outcome)")
+            let useFalseFlag = Fetcher.parseResetUseResponse(["code": 0, "data": ["used": false]], httpStatus: 200)
+            try expect(!useFalseFlag.used && useFalseFlag.retryable,
+                       "code==0 with used=false must stay retryable (unknown outcome)")
             try expect(ResetCardType.fiveHour.rawValue == "FIVE_HOUR" && ResetCardType.week.rawValue == "WEEK",
                        "reset card type wire values changed")
+            // 幂等 key 跨进程持久化：读写往返 / 过期剪枝 / 损坏文件兜底
+            let storeDir = root.appendingPathComponent("pending-resets", isDirectory: true).path
+            GLMPendingResetStore.save(["FIVE_HOUR": .init(key: "k-fresh", createdAt: now),
+                                       "WEEK": .init(key: "k-stale", createdAt: now.addingTimeInterval(-8 * 86_400))],
+                                      dir: storeDir)
+            let reloaded = GLMPendingResetStore.load(dir: storeDir, now: now)
+            try expect(reloaded["FIVE_HOUR"]?.key == "k-fresh" && reloaded["WEEK"] == nil,
+                       "pending reset store lost fresh key or kept expired one")
+            try JSONSerialization.data(withJSONObject: ["unexpected": true])
+                .write(to: URL(fileURLWithPath: storeDir + "/pending-resets.json"))
+            try expect(GLMPendingResetStore.load(dir: storeDir, now: now).isEmpty,
+                       "corrupt pending reset store was not rejected safely")
 
             let emptySubscription = Fetcher.parseSubscription([["status": "EXPIRED", "productName": "Old"]])
             try expect(emptySubscription.0 == nil && emptySubscription.1 == nil, "no active subscription must be a successful empty result")
@@ -4935,7 +5013,7 @@ enum GLMOfflineRegression {
             try expect(!CredStore.isValidEmail(String(repeating: "a", count: 250) + "@example.com"),
                        "over-length email accepted")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures)")
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)
