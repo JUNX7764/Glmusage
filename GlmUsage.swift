@@ -2320,13 +2320,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 }
             }
             if let i = CommandLine.arguments.firstIndex(of: "--preview-screenshot"), CommandLine.arguments.count > i + 1 {
+                let shotPath = CommandLine.arguments[i + 1]
+                fputs("GLM preview screenshot: scheduled\n", stderr)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                    guard let view = self?.previewWindow?.contentView else { return }
-                    view.layoutSubtreeIfNeeded()
-                    if let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
-                        view.cacheDisplay(in: view.bounds, to: image)
-                        if let data = image.representation(using: .png, properties: [:]) { try? data.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1])) }
+                    fputs("GLM preview screenshot: fired\n", stderr)
+                    guard let view = self?.previewWindow?.contentView else {
+                        fputs("GLM preview screenshot: FAIL no preview window\n", stderr); exit(1)
                     }
+                    view.layoutSubtreeIfNeeded()
+                    if let image = view.bitmapImageRepForCachingDisplay(in: view.bounds), image.pixelsWide > 0 {
+                        view.cacheDisplay(in: view.bounds, to: image)
+                        if let data = image.representation(using: .png, properties: [:]), !data.isEmpty {
+                            do { try data.write(to: URL(fileURLWithPath: shotPath), options: .atomic); print("GLM preview screenshot: wrote \(shotPath)"); exit(0) }
+                            catch { fputs("GLM preview screenshot: FAIL write \(error)\n", stderr); exit(1) }
+                        }
+                    }
+                    fputs("GLM preview screenshot: FAIL render bounds=\(view.bounds)\n", stderr); exit(1)
                 }
             }
             return
