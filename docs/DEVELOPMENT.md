@@ -60,6 +60,9 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 # 每日用量交互回归（悬停/键盘/Tab 可达/零日缺失读取；与上一条错开 ≥5s 逐个跑）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-test --preview-daily-gaps
 
+# 峰谷卡高峰状态视觉回归：配合 --preview-screenshot 截图，强制按高峰时刻渲染
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview --preview-peak --preview-screenshot /tmp/glm_peak.png
+
 # 真实自检：读取本机凭据并联网，不属于离线测试
 ./GlmUsage.app/Contents/MacOS/GlmUsage --once
 ```
