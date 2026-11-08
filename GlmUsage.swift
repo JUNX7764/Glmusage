@@ -4061,15 +4061,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             NSWorkspace.shared.open(UpdateCheck.releasesPage); return
         }
         guard let tag = UpdateChecker.shared.targetTag else { return }
-        // 与「使用重置卡」同款二次确认：更新会替换应用并自动重启，属不可逆的破坏性操作
-        NSApp.activate(ignoringOtherApps: true)
-        let confirm = NSAlert()
-        confirm.messageText = "下载并更新到 \(tag)？"
-        confirm.informativeText = "将下载 Release 包、校验后替换当前应用并自动重启，期间面板会显示进度。"
-        confirm.alertStyle = .informational
-        confirm.addButton(withTitle: "更新")
-        confirm.addButton(withTitle: "取消")
-        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        // 用户决策（2026-11-08）：更新不弹二次确认——横幅点击即走下载/校验/重启流程，
+        // 面板内原位进度行就是过程反馈；与「使用重置卡」（消耗性写操作）的确认语义区分开
         UpdateProgressController.shared.start(script: script, tag: tag, appPath: Bundle.main.bundleURL.path)
     }
 
