@@ -1,7 +1,7 @@
 # GlmUsage 开发与维护
 
 > **当前工程事实源**。构建、测试、发布、接口或权限行为变化时，应在同一个提交中更新本文。
-> 最后核对：2026-11-07。
+> 最后核对：2026-11-08。
 
 ## 文档入口与效力
 
@@ -59,6 +59,15 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 # 每日用量交互回归（悬停/键盘/Tab 可达/零日缺失读取；与上一条错开 ≥5s 逐个跑）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-test --preview-daily-gaps
+
+# 每日图空态/缺口/基期0/数据不足变体（与 --preview-daily-test 错开 ≥5s 逐个跑）
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-unavailable
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-basezero
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-insufficient
+
+# 更新流程预览（进度行原位展示；不执行真实更新）
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-updating
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-updating-install
 
 # 峰谷卡高峰状态视觉回归：配合 --preview-screenshot 截图，强制按高峰时刻渲染
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview --preview-peak --preview-screenshot /tmp/glm_peak.png

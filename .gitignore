@@ -9,3 +9,9 @@ icon_1024x1024.png
 
 # Python 测试缓存
 __pycache__/
+
+# 跨仓库审计工作区（仅本机存在，其他仓库 .app 的对照副本）
+.sibling-audit/
+
+# DMG 产物（release.sh 构建在 mktemp 目录，此处仅防手动产物误入）
+*.dmg
