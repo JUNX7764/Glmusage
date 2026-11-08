@@ -2410,7 +2410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
     private let quotaStaleAfter: TimeInterval = 600
     private let tokensStaleAfter: TimeInterval = 1800
-    // 重置卡/套餐慢通道的过期阈值：慢项 5 分钟一刷，10 分钟内无成功即视为过期
+    // 重置卡/套餐慢通道的过期阈值：慢项 5 分钟一刷，15 分钟（900s）内无成功即视为过期
     private let cardsStaleAfter: TimeInterval = 900
     private var lastAttemptAt = Date()
     private var fiveHourLastOK: Date?
