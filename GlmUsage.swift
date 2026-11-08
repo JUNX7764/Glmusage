@@ -1292,31 +1292,39 @@ enum Peak {
         let line = peak
             ? "🔥 高峰期 · 积分全价（18:00 后恢复 5 折）"
             : "⚡ 非高峰 · 积分 5 折（下个高峰 \(npText)）"
-        var eventLine: String? = nil
-        if festival { eventLine = "🎉 双节活动：全天按非高峰 5 折（至 10-07）" }
-        if night { eventLine = "🌙 深夜错峰：Flash 免费 · 其他 Agent 额度 ×2（至 10-07）" }
-        return (emoji, line, eventLine)
+        return (emoji, line, eventLine(festival: festival, night: night))
     }
 
-    /// 面板峰谷卡的结构化展示数据：与 evaluate 共用同一套判定与时间措辞，只省去整句拼装
+    /// 限时活动行：深夜错峰优先于双节（两者重叠时深夜窗口覆盖全天文案）
+    private static func eventLine(festival: Bool, night: Bool) -> String? {
+        if night { return "🌙 深夜错峰：Flash 免费 · 其他 Agent 额度 ×2（至 10-07）" }
+        if festival { return "🎉 双节活动：全天按非高峰 5 折（至 10-07）" }
+        return nil
+    }
+
+    /// 面板峰谷卡的结构化展示数据：与 evaluate 共用同一套判定、时间措辞与活动行，只省去整句拼装
     struct Display {
         let isPeak: Bool
         let badge: String        // 非高峰 / 高峰中
         let discount: String     // 5 折 / 原价
         let nextLabel: String    // 下次高峰开始 / 下次非高峰开始
         let nextTime: String     // 今天 14:00 / 明天 14:00 / 11-09 14:00 / 今天 18:00
+        let eventLine: String?
     }
 
     static func display(at date: Date = Date()) -> Display {
         let c = cal.dateComponents([.year, .month, .day, .hour, .weekday], from: date)
-        if isPeakMoment(c, festival: isFestivalDay(c)) {
+        let festival = isFestivalDay(c)
+        let night = isNightWindow(date)
+        let event = eventLine(festival: festival, night: night)
+        if isPeakMoment(c, festival: festival) {
             // 高峰窗口固定 14:00–18:00，结束时刻即当天 18:00（与 evaluate 文案「18:00 后恢复 5 折」同源）
             let end = cal.date(bySettingHour: 18, minute: 0, second: 0, of: date)!
             return Display(isPeak: true, badge: "高峰中", discount: "原价",
-                           nextLabel: "下次非高峰开始", nextTime: relativeDayText(end, time: "18:00", at: date))
+                           nextLabel: "下次非高峰开始", nextTime: relativeDayText(end, time: "18:00", at: date), eventLine: event)
         }
         return Display(isPeak: false, badge: "非高峰", discount: "5 折",
-                       nextLabel: "下次高峰开始", nextTime: relativeDayText(nextPeakStart(date), time: "14:00", at: date))
+                       nextLabel: "下次高峰开始", nextTime: relativeDayText(nextPeakStart(date), time: "14:00", at: date), eventLine: event)
     }
 }
 
@@ -1676,6 +1684,13 @@ enum GLMRemainingColor {
                 alpha: 1)
     }
 
+    /// 明暗两态动态色：余量色阶与峰谷卡主题色（GLMPeakTint）共用同一解码与外观解析
+    static func dynamic(_ dark: UInt32, _ light: UInt32) -> NSColor {
+        NSColor(name: nil) { appearance in
+            rgb(appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light)
+        }
+    }
+
     static func color(_ remaining: Double?) -> NSColor {
         NSColor(name: nil) { appearance in
             color(remaining, appearance: appearance)
@@ -1772,20 +1787,10 @@ final class GLMPanelAction: NSButton {
     override func mouseExited(with event: NSEvent) { hovered = false }
 }
 
-// 峰谷卡状态胶囊：非高峰绿 / 高峰低饱和暖色，浅底深字，明暗模式各自取色（GLMRemainingColor 同源色值）
+// 峰谷卡状态胶囊：非高峰绿 / 高峰低饱和暖色，浅底深字（色值与 GLMRemainingColor 同源，共用其动态色解码）
 enum GLMPeakTint {
-    static func color(_ dark: UInt32, _ light: UInt32, alpha: CGFloat = 1) -> NSColor {
-        NSColor(name: nil) { appearance in
-            let darkMode = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            let hex = darkMode ? dark : light
-            return NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
-                           green: CGFloat((hex >> 8) & 0xff) / 255,
-                           blue: CGFloat(hex & 0xff) / 255,
-                           alpha: alpha)
-        }
-    }
-    static var accent: NSColor { color(0x96CDA7, 0x3E8660) }          // 主题绿：折扣数字、非高峰胶囊
-    static var warm: NSColor { color(0xE5A37D, 0xB46539) }            // 低饱和暖色：高峰胶囊
+    static var accent: NSColor { GLMRemainingColor.dynamic(0x96CDA7, 0x3E8660) }   // 主题绿：折扣数字、非高峰胶囊
+    static var warm: NSColor { GLMRemainingColor.dynamic(0xE5A37D, 0xB46539) }     // 低饱和暖色：高峰胶囊
 }
 
 // 只读胶囊，不接收鼠标事件；底色与文字色在 updateLayer 内按当前外观解析，明暗切换即时生效
@@ -3377,7 +3382,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         // 峰谷卡＝极简状态条：标题+状态胶囊一行，折扣与下次切换一行；限时活动行沿用旧版追加在下方。
         // 视觉回归可用 --preview-peak 强制按高峰时刻渲染（下个工作日 14:00）
         let peakNow = CommandLine.arguments.contains("--preview-peak") ? Peak.nextPeakStart(Date()) : Date()
-        let peak = Peak.evaluate(at: peakNow)
         let peakInfo = Peak.display(at: peakNow)
         let peakCard = GLMPanelCard()
         let peakTitle = row(); peakTitle.spacing = 8
@@ -3402,7 +3406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         peakInfoRow.addArrangedSubview(spacer())
         peakInfoRow.addArrangedSubview(nextGroup)
         addContent(peakInfoRow, to: peakCard)
-        if let event = peak.eventLine {
+        if let event = peakInfo.eventLine {
             let field = label(event, size: 11); peakCard.content.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
         }
         add(peakCard)
