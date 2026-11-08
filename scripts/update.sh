@@ -210,7 +210,17 @@ if ! NEW_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${NEW_AP
 fi
 [ "$NEW_VERSION" = "$TARGET_TAG" ] || { echo "!! 发布包构建版本与目标不符"; exit 1; }
 OLD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${INSTALLED}/Contents/Info.plist")" || { echo "!! 当前应用缺少构建版本"; exit 1; }
-[ "$(version_newer "$NEW_VERSION" "$OLD_VERSION")" = yes ] || { echo "!! 目标版本必须高于当前应用"; exit 1; }
+if [ "$(version_newer "$NEW_VERSION" "$OLD_VERSION")" = yes ]; then :; else
+    case "$OLD_VERSION" in
+        *-dirty|unknown) echo "!! 当前是开发构建（版本 ${OLD_VERSION}），不支持自动更新，请手动安装正式版" ;;
+        *) echo "!! 目标版本必须高于当前应用（当前 ${OLD_VERSION}，目标 ${NEW_VERSION}）" ;;
+    esac
+    exit 1
+fi
+# 纵深防御：URL 白名单与 SHA256 之外，再复验发布包身份，防止同源包内容错装
+NEW_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${NEW_APP}/Contents/Info.plist" 2>/dev/null)" || { echo "!! 发布包缺少 Bundle Identifier，已中止"; exit 1; }
+[ -n "$NEW_BUNDLE_ID" ] || { echo "!! 发布包缺少 Bundle Identifier，已中止"; exit 1; }
+[ "$NEW_BUNDLE_ID" = "$LABEL" ] || { echo "!! 发布包 Bundle Identifier（${NEW_BUNDLE_ID}）与 ${LABEL} 不符，已中止"; exit 1; }
 if ! codesign --verify --deep --strict "$NEW_APP"; then
     echo "!! 新版本签名校验未通过，已中止"
     exit 1
@@ -271,9 +281,10 @@ fi
 
 echo "==> 5/5 启动并检查新版本"
 start_and_wait
+# 启动验证通过即锁定成功：随后的清理若失败，退出 trap 不得回滚（避免误杀已验证健康的新版本）
+SUCCESS=1
 rm -rf "$BACKUP"
 BACKUP=""
 rm -rf "$WORK"
 WORK=""
-SUCCESS=1
 echo "✅ 更新完成：${INSTALLED}（版本 ${NEW_VERSION}）"

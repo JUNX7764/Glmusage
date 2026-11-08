@@ -89,6 +89,12 @@ out=""
 while [ "$#" -gt 0 ]; do
     if [ "$1" = "-o" ]; then out="$2"; shift 2; else shift; fi
 done
+if [ "${MOCK_CURL_RELEASE_FAIL:-0}" = 1 ]; then
+    case "$out" in *releases.json) exit 7 ;; esac
+fi
+if [ "${MOCK_CURL_DOWNLOAD_FAIL:-0}" = 1 ]; then
+    case "$out" in *"$MOCK_EXECUTABLE".zip) exit 7 ;; esac
+fi
 case "$out" in
     *releases.json)
         printf '%s' "$MOCK_RELEASES_JSON" > "$out"
@@ -215,6 +221,7 @@ chmod +x "$out"
         resources.mkdir(parents=True)
         info = {
             "CFBundleExecutable": EXECUTABLE,
+            "CFBundleIdentifier": LABEL,
             "CFBundleShortVersionString": version.lstrip("v"),
             "CFBundleVersion": version.lstrip("v"),
             "CUBuildVersion": version,
@@ -317,6 +324,55 @@ exit 0
         self.assertIn("没有找到 ZIP 和 SHA256 齐全", result.stdout)
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
         self.assertTrue(self.state.exists())
+
+    def test_update_without_launchagent_stops_and_starts_via_open(self):
+        installed = self.prepare_update()
+        # 无 LaunchAgent（关闭开机自启）时走 open -n 路径；mock 的 ps 以状态文件代替真实进程，
+        # 用 BASH_ENV 注入 kill shim 让 stop_target 的 kill 移除状态文件（kill 是内建命令无法走 PATH mock）
+        killshim = self.base / "kill-env.sh"
+        killshim.write_text(f'kill() {{ echo "kill $*" >> "{self.log}"; rm -f "{self.state}"; return 0; }}\n')
+        result = self.run_update(MOCK_AGENT_ACTIVE="0", BASH_ENV=str(killshim))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        opens = [line for line in self.log_lines() if line.startswith("open ")]
+        self.assertTrue(any(" -n " in line for line in opens))
+        launch_lines = [line for line in self.log_lines() if line.startswith("launchctl")]
+        self.assertFalse(any("bootout" in line or "bootstrap" in line for line in launch_lines))
+        self.assertTrue(self.state.exists())
+
+    def test_release_api_failure_preserves_old_app_and_service(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_CURL_RELEASE_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("Release 信息获取失败", result.stdout)
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+        self.assertTrue(self.state.exists())
+
+    def test_release_download_failure_preserves_old_app_and_service(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_CURL_DOWNLOAD_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("发布包下载失败", result.stdout)
+        self.assertFalse(any("bootout" in line for line in self.log_lines()))
+        self.assertTrue(self.state.exists())
+
+    def test_foreign_bundle_id_is_rejected_before_staging(self):
+        installed = self.prepare_update()
+        payload = self.make_app(self.base / "payload-foreign", "v2.0.0", "foreign")
+        info_path = payload / "Contents" / "Info.plist"
+        with info_path.open("rb") as handle:
+            info = plistlib.load(handle)
+        info["CFBundleIdentifier"] = "com.evil.other"
+        with info_path.open("wb") as handle:
+            plistlib.dump(info, handle)
+        self.env["MOCK_PAYLOAD"] = str(payload)
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertIn("Bundle Identifier", result.stdout)
+        self.assertFalse(any(line.startswith("mv ") for line in self.log_lines()))
 
     def test_sha256_mismatch_aborts_before_any_replacement(self):
         installed = self.prepare_update()
