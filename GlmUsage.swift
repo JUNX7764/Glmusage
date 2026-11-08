@@ -509,7 +509,8 @@ enum GLMPendingResetStore {
         }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        try? data.write(to: URL(fileURLWithPath: dir + "/pending-resets.json"))
+        // .atomic：写盘中途被杀不留半截文件——半截文件会让 load 兜底清空未决 key，恰是本功能要防的重复扣卡窗口
+        try? data.write(to: URL(fileURLWithPath: dir + "/pending-resets.json"), options: [.atomic])
     }
 }
 
