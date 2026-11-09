@@ -1858,6 +1858,7 @@ enum GLMPeakTint {
 // 只读胶囊，不接收鼠标事件；底色与文字色在 updateLayer 内按当前外观解析，明暗切换即时生效
 final class GLMPeakBadge: NSView {
     private let textField: NSTextField
+    private let dotView = NSView()
     let isPeak: Bool
 
     init(isPeak: Bool, text: String) {
@@ -1869,12 +1870,20 @@ final class GLMPeakBadge: NSView {
         wantsLayer = true
         layer?.cornerRadius = 8.5
         layer?.masksToBounds = true
+        dotView.translatesAutoresizingMaskIntoConstraints = false
+        dotView.wantsLayer = true
+        dotView.layer?.cornerRadius = 2.5
+        addSubview(dotView)
         textField.translatesAutoresizingMaskIntoConstraints = false
         addSubview(textField)
         NSLayoutConstraint.activate([
+            dotView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            dotView.centerYAnchor.constraint(equalTo: textField.centerYAnchor),
+            dotView.widthAnchor.constraint(equalToConstant: 5),
+            dotView.heightAnchor.constraint(equalToConstant: 5),
             textField.topAnchor.constraint(equalTo: topAnchor, constant: 2.5),
             textField.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2.5),
-            textField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            textField.leadingAnchor.constraint(equalTo: dotView.trailingAnchor, constant: 4),
             textField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8)
         ])
         setAccessibilityLabel(isPeak ? "当前高峰，积分全价" : "当前非高峰，积分 5 折")
@@ -1888,6 +1897,7 @@ final class GLMPeakBadge: NSView {
             let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             let tint = isPeak ? GLMPeakTint.warm : GLMPeakTint.accent
             layer?.backgroundColor = tint.withAlphaComponent(dark ? 0.16 : 0.13).cgColor
+            dotView.layer?.backgroundColor = tint.cgColor
             textField.textColor = tint
         }
     }
