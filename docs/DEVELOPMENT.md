@@ -1,7 +1,7 @@
 # GlmUsage 开发与维护
 
 > **当前工程事实源**。构建、测试、发布、接口或权限行为变化时，应在同一个提交中更新本文。
-> 最后核对：2026-11-08。
+> 最后核对：2026-11-11。
 
 ## 文档入口与效力
 
@@ -28,7 +28,7 @@
 
 ## 原理与数据边界
 
-- **凭据**：只读解密 ZCode `~/.zcode/v2/credentials.json`。可使用环境变量 `ZCODE_CREDENTIAL_SECRET` 参与密钥派生，或用 `GLM_API_KEY` 直接提供 key。API key 与 OAuth token 只在必要内存中使用，不写入仓库、日志或诊断状态。
+- **凭据**：优先使用 `GLM_API_KEY`。未配置时，只读解密 ZCode `~/.zcode/v2/credentials.json` 中的 `enc:v1` 凭据，旧格式可使用 `ZCODE_CREDENTIAL_SECRET` 参与密钥派生。GlmUsage 会识别 ZCode 3.18.0 引入的 `enc:v2`，并提示通过 ZCode 的「使用统计 → 编程套餐」查看用量与重置卡。API Key 与 OAuth token 只在必要内存中使用，不写入仓库、日志或诊断状态。
 - **额度与用量**：通过智谱监控接口查询 5 小时、7 天额度、模型 Token / 调用数和 MCP 工具次数。
 - **Start Plan 用量**：只读 `~/.zcode/cli/db/db.sqlite` 的 `model_usage`，按请求时间将国内 Start Plan 的 Token 与调用数补入今天、近 7 天、近 30 天、模型明细和每日趋势。同名模型忽略大小写合并，保留官方显示名。使用 `provider_total_tokens`，缺失时回退 `computed_total_tokens`，缓存输入已计入总数；仅纳入已结束且 Token 大于零的请求，实际重试的额外消耗保留。使用系统 SQLite3，无第三方依赖。
 - **补统计边界**：赠送余额接口只提供额度桶累计值，不能用于拆分历史周期。补统计覆盖本机已记录的请求，其他设备的赠送用量不可得。缺少数据库或旧版无请求表时沿用服务端统计；现有表读取失败则保留上次完整合并值并提示待更新。`GLM_API_KEY` 覆盖凭据时沿用该 key 的服务端统计，避免混入另一个 ZCode 账号的本机用量。预览与自检使用假数据。
@@ -38,6 +38,8 @@
 - **刷新**：额度每 10 秒，慢项每 5 分钟；失败保留旧值与原成功时间，并显示错误或过期状态。
 
 凭据保存在本机，但查询智谱／ZCode 时会作为必要认证信息发送给对应服务；不会上传到开发者自有服务器。更新检查会连接 GitHub。应用只读取 ZCode 凭据，不修改凭据文件。
+
+`GLM_API_KEY` 需要由 GlmUsage 启动进程的环境提供，使用[个人或团队编程套餐对应的 API Key](https://docs.bigmodel.cn/cn/coding-plan/extension/coding-tool-helper)。该模式用于服务端额度和用量统计。新版 ZCode 登录的重置卡仍在 ZCode 内管理。
 
 ## 调试与自检
 
