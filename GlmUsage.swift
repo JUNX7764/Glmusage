@@ -3106,6 +3106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         dailyLastOK = now   // 预览每日桶视为新鲜，避免误显「待更新」
         subscriptionLastOK = now
         if CommandLine.arguments.contains("--preview-quota-alignment") {
+            // usedRatio 0 → 剩余 100% + 时间未知，即百分比列最宽展示值（曾因列宽 40pt 把 "100%" 折成两行）
             usage.fiveHour = LimitEntry(label: "5 小时窗口", isFiveHour: true, limit: 2000, used: 0, remaining: 2000, usedRatio: 0, reset: nil)
             usage.subscription = SubscriptionInfo(name: "GLM Coding Pro", expireDate: Date(timeIntervalSince1970: 1_820_000_000))
             subscriptionLastOK = now
@@ -3260,7 +3261,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let ratio = entry?.usedRemainingRatio
             let pct = label(Fmt.pct(ratio), size: 14, bold: true, color: GLMRemainingColor.color(ratio))
             pct.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
-            pct.widthAnchor.constraint(equalToConstant: 40).isActive = true
+            // 列宽按最宽展示值 "100%" 的实测渲染宽（40.89pt）取整，40pt 会折成 "100"/"%" 两行
+            pct.widthAnchor.constraint(equalToConstant: 46).isActive = true
             heading.addArrangedSubview(pct)
             let bar = GLMQuotaBar(ratio)
             bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true
