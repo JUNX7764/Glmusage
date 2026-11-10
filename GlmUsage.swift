@@ -1147,7 +1147,10 @@ enum StackImage {
         let g = geometry(badge1Width: b1?.size().width ?? 0, badge2Width: b2?.size().width ?? 0,
                          text1Width: s1.size().width, text2Width: s2.size().width)
         let draw = {
-            if let x = g.badge1X { b1?.draw(at: NSPoint(x: x, y: 10.5)) }
+            // badge1（峰谷 🔥/过期 ⚠️）挂在两行之间而非钉在 5H 行：emoji 墨迹高 12pt（文字仅 7pt），
+            // 原先 y=10.5 会顶着画布上缘（墨迹 11..21）。y=5.5 墨迹带 ≈6..18，中心 12 与两行墨迹块
+            // 中心（3.5..20.5 的中点）重合，底缘略高于 7D 行；⚠️ 单独出现时同样居中，语义由 toolTip/status.json 承载
+            if let x = g.badge1X { b1?.draw(at: NSPoint(x: x, y: 5.5)) }
             if let x = g.badge2X { b2?.draw(at: NSPoint(x: x, y: 0.5)) }
             s1.draw(at: NSPoint(x: g.textX, y: 10.5))
             s2.draw(at: NSPoint(x: g.textX, y: 0.5))
@@ -4611,6 +4614,35 @@ enum GLMOfflineRegression {
                            "menu bar uncached color image did not render for \(name.rawValue)")
             }
 
+            // 峰谷 badge 垂直位置：🔥 墨迹（橙红系，排除绿色百分比/黑色灰阶文字）应挂在两行之间
+            // —— 中心 ≈ 两行墨迹块中心 12，不再顶到画布上缘（旧 y=10.5 时墨迹 11..21），也不落到 7D 行基线
+            let peakBadgeLine = StackImage.Line(badge: "🔥", label: "5H", value: "99%", remaining: 0.99)
+            let plainBadgeLine = StackImage.Line(badge: "", label: "7D", value: "99%", remaining: 0.99)
+            if let tiff = StackImage.make(line1: peakBadgeLine, line2: plainBadgeLine,
+                                          appearance: NSAppearance(named: .aqua)!).tiffRepresentation,
+               let rep = NSBitmapImageRep(data: tiff) {
+                let scale = Double(rep.pixelsHigh) / 21.0
+                var minPy = Int.max, maxPy = -1
+                for py in 0..<rep.pixelsHigh {
+                    for px in 0..<rep.pixelsWide {
+                        guard let c = rep.colorAt(x: px, y: py)?.usingColorSpace(.sRGB),
+                              c.alphaComponent > 0.8 else { continue }
+                        let (r, gc, b) = (c.redComponent, c.greenComponent, c.blueComponent)
+                        if r > 0.55 && r > gc && r > b && max(r, gc, b) - min(r, gc, b) > 0.15 {
+                            minPy = min(minPy, py); maxPy = max(maxPy, py)
+                        }
+                    }
+                }
+                let inkTop = Double(rep.pixelsHigh - minPy) / scale
+                let inkBottom = Double(rep.pixelsHigh - maxPy - 1) / scale
+                try expect(maxPy >= 0 && (inkTop - inkBottom) >= 10
+                           && inkTop <= 19.5 && inkBottom >= 3.5
+                           && (inkTop + inkBottom) / 2 >= 9 && (inkTop + inkBottom) / 2 <= 14,
+                           "peak badge emoji is not hanging centered between the 5H/7D rows (ink \(inkBottom)-\(inkTop))")
+            } else {
+                try expect(false, "peak badge render failed; cannot verify vertical placement")
+            }
+
             // 外观重绘必须真正改变文字颜色：浅色外观画深字，深色外观画浅字。
             func neutralInkCount(_ image: NSImage, white: Bool) -> Int {
                 guard let data = image.tiffRepresentation,
@@ -4929,6 +4961,24 @@ if CommandLine.arguments.contains("--peak-test") {
     }
     print("GlmUsage --peak-test: \(cases.count - failures)/\(cases.count) passed")
     exit(failures == 0 ? 0 : 1)
+}
+
+// 离线菜单栏图标预览：按生产画法渲染一张带 🔥 badge 的 PNG（不启动 GUI、不读凭据），
+// 供 badge 几何/垂直位置调整时放大对比。用法：--preview-menubar <path>
+if let i = CommandLine.arguments.firstIndex(of: "--preview-menubar"), CommandLine.arguments.count > i + 1 {
+    let line1 = StackImage.Line(badge: "🔥", label: "5H", value: "88%", remaining: 0.88)
+    let line2 = StackImage.Line(badge: "", label: "7D", value: "45%", remaining: 0.45)
+    let img = StackImage.make(line1: line1, line2: line2)
+    if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+       let png = rep.representation(using: .png, properties: [:]) {
+        let path = CommandLine.arguments[i + 1]
+        try? png.write(to: URL(fileURLWithPath: path))
+        print("GlmUsage --preview-menubar: \(img.size) -> \(path)")
+    } else {
+        fputs("GlmUsage --preview-menubar: render failed\n", stderr)
+        exit(1)
+    }
+    exit(0)
 }
 
 
