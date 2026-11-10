@@ -1,6 +1,6 @@
 # GlmUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-06。
+> 状态：当前架构摘要。最后核对：2026-11-11。
 > 本文解释模块与边界，函数级行为以源码和测试为准。
 
 ## 1. 应用形态
@@ -17,7 +17,7 @@ GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当前
 
 | 模块 | 当前职责 |
 |---|---|
-| `CredStore` | 只读解密 ZCode 凭据，提供 API key 与 OAuth token |
+| `CredStore` | 接收 `GLM_API_KEY`，只读解密 ZCode `enc:v1` 凭据，识别 `enc:v2` 兼容状态 |
 | `Fetcher` | 智谱额度、模型、工具、订阅和 ZCode 重置卡请求 |
 | `GLMStartPlanUsage` | 只读 ZCode 请求用量表，将赠送用量按周期、模型和自然日补入现有统计 |
 | `Peak` | 高峰、非高峰和限时活动的本地时段计算 |
@@ -32,7 +32,7 @@ GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当前
 
 ### 额度、用量与订阅
 
-ZCode 本地加密凭据 → 内存 API key / OAuth token → 智谱与 ZCode 接口 → 新鲜度和错误合并 → Popover 与诊断状态。
+ZCode `enc:v1` 凭据或 `GLM_API_KEY` → 内存 API Key / OAuth token → 智谱与 ZCode 接口 → 新鲜度和错误合并 → Popover 与诊断状态。
 
 模型统计在同一刷新中合并本机 `model_usage` 的国内 Start Plan 请求。逐次请求的时间和 Token 总数用于周期汇总及日图，同名模型合并；服务端原始值加本次本机快照后进入新鲜度处理，重复刷新不会累加旧值。SQLite 只读，查询与网络回调在后台运行；无本机请求表时保留原统计，读取异常时沿用上次完整值。环境变量覆盖 API key 时只使用服务端统计。
 
@@ -54,6 +54,7 @@ GitHub Release → 可安装版本选择 → ZIP / SHA256 下载 → 身份、�
 
 - 智谱监控接口与 ZCode 逆向接口的稳定性不同，重置卡接口变化不得影响其他额度区块。
 - OAuth token 可能过期，重置卡失败必须独立降级，不能伪造成卡数为零。
+- ZCode 3.18.0 默认通过系统钥匙串管理新版登录凭据。新版凭据触发兼容提示；用户可提供套餐 API Key 查询服务端额度与用量，在 ZCode 内管理重置卡。
 - GitHub Release 与 SHA256 来自同一信任源；ad-hoc 签名不提供独立发布者身份验证。
 - Peak 活动日期是带时效的配置，必须可测试并在过期后自动失效。
 - 离线 mock、真实接口验证和真实安装验收是不同证据。

@@ -16,18 +16,37 @@ enum CredStore {
     static let credPath = NSHomeDirectory() + "/.zcode/v2/credentials.json"
     // 允许用环境变量直接提供 key（调试 / 无 ZCode 凭证库的场景）
     static let envKey = "GLM_API_KEY"
+    static let newCredentialMessage = "ZCode 新版登录暂不支持"
 
     static func loadApiKey() -> String? {
-        if let k = ProcessInfo.processInfo.environment[envKey],
-           !k.trimmingCharacters(in: .whitespaces).isEmpty { return k }
-        guard let data = FileManager.default.contents(atPath: credPath),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
-            return nil
-        }
-        // coding-plan 的 api-key 可能有多个账户：优先 bigmodel（国内订阅）
+        loadPlanCredential().key
+    }
+
+    static func loadPlanCredential() -> (key: String?, error: String) {
+        let envValue = ProcessInfo.processInfo.environment[envKey]
+        if let value = envValue, !value.trimmingCharacters(in: .whitespaces).isEmpty { return (value, "") }
+        return resolvePlanCredential(record: credentialRecord() ?? [:])
+    }
+
+    private static func credentialRecord() -> [String: String]? {
+        guard let data = FileManager.default.contents(atPath: credPath) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: String]
+    }
+
+    static func resolvePlanCredential(envValue: String? = nil, record: [String: String], secret: String? = nil) -> (key: String?, error: String) {
+        if let value = envValue, !value.trimmingCharacters(in: .whitespaces).isEmpty { return (value, "") }
+        // 纯 OAuth 登录时使用 access_token 作为监控接口的 Bearer 凭证。
+        let selected = preferredApiKey(record: record) ?? record["oauth:bigmodel:access_token"] ?? ""
+        if selected.hasPrefix("enc:v2:") { return (nil, newCredentialMessage) }
+        if let key = decrypt(selected, secret: secret) { return (key, "") }
+        return (nil, "未找到或无法读取 ZCode 凭证")
+    }
+
+    static func preferredApiKey(record obj: [String: String]) -> String? {
+        // 包含新版候选，避免跳过优先账户后静默使用其他账户。
         var candidates: [(key: String, enc: String)] = []
         for (k, v) in obj {
-            guard v.hasPrefix("enc:v1:"), k.contains("api-key"), k.contains("coding-plan") else {
+            guard (v.hasPrefix("enc:v1:") || v.hasPrefix("enc:v2:")), k.contains("api-key"), k.contains("coding-plan") else {
                 continue
             }
             candidates.append((k, v))
@@ -37,25 +56,25 @@ enum CredStore {
             if am != bm { return am }            // bigmodel 优先
             return a.key < b.key
         }
-        if let enc = candidates.first?.enc { return decrypt(enc) }
-        // 纯 OAuth 登录的凭证库没有独立 api-key 条目；监控接口实测接受 access_token 作为 Bearer 凭证
-        return decrypt(obj["oauth:bigmodel:access_token"] ?? "")
+        return candidates.first?.enc
     }
 
     // 重置卡（额度重置卡）接口所需的两个 ZCode 登录态 token（同一密文格式、同一把密钥）。
-    // 任一缺失/解密失败返回 nil，由调用方优雅降级；同样只存内存、绝不落盘。
-    static func loadResetTokens() -> (jwt: String, maas: String)? {
-        guard let data = FileManager.default.contents(atPath: credPath),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
-            return nil
-        }
-        guard let jwt = decrypt(obj["zcodejwttoken"] ?? "")?.trimmingCharacters(in: .whitespacesAndNewlines),
+    static func loadResetCredential() -> (tokens: (jwt: String, maas: String)?, error: String) {
+        resolveResetCredential(record: credentialRecord() ?? [:])
+    }
+
+    static func resolveResetCredential(record: [String: String], secret: String? = nil) -> (tokens: (jwt: String, maas: String)?, error: String) {
+        let jwtValue = record["zcodejwttoken"] ?? ""
+        let maasValue = record["oauth:bigmodel:access_token"] ?? ""
+        if jwtValue.hasPrefix("enc:v2:") || maasValue.hasPrefix("enc:v2:") { return (nil, newCredentialMessage) }
+        guard let jwt = decrypt(jwtValue, secret: secret)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !jwt.isEmpty,
-              let maas = decrypt(obj["oauth:bigmodel:access_token"] ?? "")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let maas = decrypt(maasValue, secret: secret)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !maas.isEmpty else {
-            return nil
+            return (nil, "未找到或无法读取 ZCode 登录凭证")
         }
-        return (jwt, maas)
+        return ((jwt, maas), "")
     }
 
     /// 邮箱展示决策（纯函数，self-test 直接覆盖整条 loadAccountEmail 集成路径；
@@ -87,18 +106,11 @@ enum CredStore {
         let envValue = ProcessInfo.processInfo.environment[envKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if envValue?.isEmpty == false { return nil }   // env 覆盖凭据源 → 隐藏
-        guard let data = FileManager.default.contents(atPath: credPath),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
-            return nil
-        }
-        // 候选口径与 loadApiKey 完全一致（api-key + coding-plan + enc:v1:，zai 系同样命中）
-        let candidateCount = obj.filter { key, value in
-            key.contains("api-key") && key.contains("coding-plan") && value.hasPrefix("enc:v1:")
-        }.count
+        guard let obj = credentialRecord(), preferredApiKey(record: obj) == nil else { return nil }
         let oauthToken = decrypt(obj["oauth:bigmodel:access_token"] ?? "")
         let rawUserInfo = obj["oauth:bigmodel:user_info"] ?? ""
         let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:v1:") ? decrypt(rawUserInfo) : rawUserInfo)
-        return resolveAccountEmail(envValue: envValue, credentialKeyCandidates: candidateCount,
+        return resolveAccountEmail(envValue: envValue, credentialKeyCandidates: 0,
                                    oauthAccessToken: oauthToken, userInfoJSON: userInfoJSON)
     }
 
@@ -107,14 +119,15 @@ enum CredStore {
         value.count <= 254 && value.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$"#, options: .regularExpression) != nil
     }
 
-    static func decrypt(_ s: String) -> String? {
+    static func decrypt(_ s: String, secret: String? = nil) -> String? {
+        guard s.hasPrefix("enc:v1:") else { return nil }
         let parts = s.dropFirst("enc:v1:".count)
             .split(separator: ".")
             .map { base64urlDecode(String($0)) }
         guard parts.count == 3, let iv = parts[0], let tag = parts[1], let ct = parts[2] else {
             return nil
         }
-        let secret = resolveSecret()
+        let secret = secret ?? resolveSecret()
         let key = SymmetricKey(data: SHA256.hash(data: Data(secret.utf8)))
         guard let box = try? AES.GCM.open(
             AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: iv), ciphertext: ct, tag: tag),
@@ -2614,11 +2627,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func performQuotaRefresh() {
         lastAttemptAt = Date()
-        let currentKey = CredStore.loadApiKey()
-        bindPlanCredential(currentKey)
-        guard let key = currentKey else {
+        let credential = CredStore.loadPlanCredential()
+        bindPlanCredential(credential.key)
+        guard let key = credential.key else {
             var failed = UsageData()
-            failed.fiveHourError = "未找到 ZCode 凭证"; failed.weekError = failed.fiveHourError
+            failed.fiveHourError = credential.error; failed.weekError = failed.fiveHourError
             failed.quotaError = failed.fiveHourError
             finishQuota(failed)
             return
@@ -2658,11 +2671,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func performRefresh(tokens: Bool) {
-        let currentKey = CredStore.loadApiKey()
-        bindPlanCredential(currentKey)
-        guard let key = currentKey else {
+        let credential = CredStore.loadPlanCredential()
+        bindPlanCredential(credential.key)
+        guard let key = credential.key else {
             var failed = UsageData()
-            let error = "未找到 ZCode 凭证（~/.zcode/v2/credentials.json）"
+            let error = credential.error
             failed.quotaError = error
             failed.fiveHourError = error
             failed.weekError = error
@@ -2743,7 +2756,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 wg.leave()
             }
             // 重置卡（额度重置卡）：ZCode 登录态 token 缺失/过期时优雅降级为错误提示
-            if let (jwt, maas) = CredStore.loadResetTokens() {
+            let resetCredential = CredStore.loadResetCredential()
+            if let (jwt, maas) = resetCredential.tokens {
                 wg.enter()
                 Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
                     accumulator.update { current in
@@ -2757,9 +2771,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             } else {
                 accumulator.update { current in
-                    current.fiveHourCardsError = "未找到 ZCode 登录凭证"
-                    current.weekCardsError = "未找到 ZCode 登录凭证"
-                    current.resetCardsError = "未找到 ZCode 登录凭证"
+                    let error = resetCredential.error
+                    current.fiveHourCardsError = error
+                    current.weekCardsError = error
+                    current.resetCardsError = error
                 }
             }
             // 套餐到期（与重置卡同周期刷新）
@@ -3114,8 +3129,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func beginUseReset(_ type: ResetCardType) {
         guard !resetUseInFlight else { return }
         if preview { setUpdateMessage("预览模式：不执行真实重置卡操作", dismissAfter: 3); return }
-        guard let (jwt, maas) = CredStore.loadResetTokens() else {
-            setUpdateMessage("使用\(type.displayName)失败：未找到 ZCode 登录凭证", dismissAfter: 5); return
+        let credential = CredStore.loadResetCredential()
+        guard let (jwt, maas) = credential.tokens else {
+            setUpdateMessage("使用\(type.displayName)失败：\(credential.error)", dismissAfter: 5); return
         }
         let available = GLMFreshness.availableCards(
             type == .fiveHour ? (usage.resetCards?.fiveHour ?? []) : (usage.resetCards?.week ?? []),
@@ -3205,6 +3221,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func installPreviewData() {
         let now = Date()
+        let newZCode = CommandLine.arguments.contains("--preview-new-zcode")
+        let empty = CommandLine.arguments.contains("--preview-empty")
         usage.level = "Pro"
         usage.subscription = SubscriptionInfo(name: "GLM Coding Pro", expireDate: now.addingTimeInterval(31_536_000))
         usage.fiveHour = LimitEntry(label: "5 小时窗口", isFiveHour: true, limit: 2000, used: 640, remaining: 1360, usedRatio: 0.32, reset: now.addingTimeInterval(7200))
@@ -3222,9 +3240,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             usage.subscription = SubscriptionInfo(name: "GLM Coding Pro", expireDate: Date(timeIntervalSince1970: 1_820_000_000))
             subscriptionLastOK = now
         }
-        if CommandLine.arguments.contains("--preview-empty") {
+        if empty {
             usage.tokensToday = nil
             usage.tokens7d = ModelUsage(totalTokens: 0, totalCalls: 0, byModel: [])
+        }
+        if newZCode {
+            usage.subscription = nil; usage.level = nil; subscriptionLastOK = nil
+            if empty {
+                usage = UsageData()
+                fiveHourLastOK = nil; weekLastOK = nil; fiveHourCardsLastOK = nil; weekCardsLastOK = nil
+                tokensTodayLastOK = nil; tokens7dLastOK = nil; tokens30dLastOK = nil; toolsLastOK = nil
+            }
+            let error = CredStore.newCredentialMessage
+            usage.quotaError = error; usage.fiveHourError = error; usage.weekError = error
+            usage.fiveHourCardsError = error; usage.weekCardsError = error; usage.resetCardsError = error
+            usage.tokensTodayError = error; usage.tokens7dError = error; usage.tokens30dError = error
+            usage.dailyTokensError = error; usage.toolsError = error; usage.subscriptionError = error
         }
         if CommandLine.arguments.contains("--preview-errors") {
             usage.week = nil; usage.weekError = "模拟网络错误：无法获取额度"
@@ -3249,7 +3280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // 每日用量预览：合成 30 个自然日桶（今日部分累计进图，与生产 frame 规则一致）。
         // 预览仅展示目标体验；生产数据来自真实接口（Gate 已于 2026-11-06 验收）。
-        usage.dailyTokens = CommandLine.arguments.contains("--preview-daily-unavailable")
+        usage.dailyTokens = (newZCode && empty) || CommandLine.arguments.contains("--preview-daily-unavailable")
             ? nil : previewDailyBuckets()
         // 头部邮箱预览（假数据；生产邮箱只来自现有凭据库且不可得即隐藏）
         if CommandLine.arguments.contains("--preview-email") {
@@ -3340,6 +3371,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if UpdateProgressController.shared.isActive { add(UpdateProgressRowView()) }
         else if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
 
+        let planLoginUnsupported = usage.quotaError == CredStore.newCredentialMessage
+        let resetLoginUnsupported = usage.resetCardsError == CredStore.newCredentialMessage
+        if planLoginUnsupported {
+            add(label("ZCode 新版登录暂不支持。请在 ZCode 的「使用统计 → 编程套餐」查看。", color: .systemOrange))
+        }
         let quotaCard = GLMPanelCard()
         quotaCard.content.spacing = 6
         // 卡片标题行（CodexUsage 同款布局、自家绿色系）：图标+标题居左，「重置时间」列头居右
@@ -3392,7 +3428,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 余量和所有异常文本独占卡片全宽，不参与右侧时间列的宽度竞争。
             if let e = entry { addToGroup(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
             else { addToGroup(label("暂无数据", color: .secondaryLabelColor)) }
-            if let e = error { addToGroup(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
+            if error == CredStore.newCredentialMessage {
+                if let last { addToGroup(label("上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor)) }
+            } else if let e = error { addToGroup(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
             if let warning = warning { addToGroup(label("部分数据异常：\(warning)", color: .systemOrange)) }
             if error == nil && stale { addToGroup(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
             addContent(group, to: quotaCard)
@@ -3402,14 +3440,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             quotaCard.content.setCustomSpacing(10, after: fiveHourGroup)
         }
         quota(usage.week, "7 天", usage.weekError, usage.weekWarning, weekLastOK, weekStale)
-        if usage.subscription != nil || usage.subscriptionError != nil || subscriptionStale {
+        let subscriptionError = usage.subscriptionError == CredStore.newCredentialMessage ? nil : usage.subscriptionError
+        if usage.subscription != nil || subscriptionError != nil || subscriptionStale {
             addContent(separator(), to: quotaCard)
         }
         if let sub = usage.subscription {
             let expiry = sub.expireDate.map { "套餐到期：\(Fmt.fullTime.string(from: $0))" } ?? "套餐到期：暂无数据"
             addContent(label(expiry, color: .secondaryLabelColor), to: quotaCard)
         }
-        if let error = usage.subscriptionError { addContent(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed), to: quotaCard) }
+        if let error = subscriptionError { addContent(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed), to: quotaCard) }
         else if subscriptionStale { addContent(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange), to: quotaCard) }
         add(quotaCard)
         // 峰谷卡＝极简状态条：标题+状态胶囊一行，折扣与下次切换一行；限时活动行沿用旧版追加在下方。
@@ -3441,7 +3480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         addContent(peakInfoRow, to: peakCard)
         add(peakCard)
         let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 6; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 12, bold: true))
-        if let count = usage.resetCards?.availableCount(now: Date()), count > 0 {
+        if !resetLoginUnsupported, let count = usage.resetCards?.availableCount(now: Date()), count > 0 {
             let countLabel = label("×\(count)", size: 12, bold: true, color: GLMPeakTint.accent)
             countLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
             countLabel.setAccessibilityLabel("\(count) 张可用重置卡")
@@ -3465,9 +3504,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         resetBtn.toolTip = resetUseInFlight ? "重置卡使用中…" : "使用一张重置卡，立即重置对应额度窗口"
         resetBtn.setAccessibilityLabel(resetUseInFlight ? "重置卡使用中" : "使用重置卡")
         cardHead.addArrangedSubview(spacer())
-        cardHead.addArrangedSubview(resetBtn)
+        if !resetLoginUnsupported { cardHead.addArrangedSubview(resetBtn) }
         cards.content.addArrangedSubview(cardHead); cardHead.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
-        if let c = usage.resetCards {
+        if resetLoginUnsupported {
+            let instruction = planLoginUnsupported ? "请在 ZCode 查看和使用" : "请在 ZCode 的「使用统计 → 编程套餐」查看和使用"
+            addContent(label(instruction, color: .secondaryLabelColor), to: cards)
+        } else if let c = usage.resetCards {
             func cardRow(_ name: String, _ detail: String, color: NSColor) {
                 let line = row()
                 let nameLabel = label(name, color: .secondaryLabelColor)
@@ -3490,7 +3532,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
         } else { let l = label("暂无数据", color: .secondaryLabelColor); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
-        for (name, error, stale, last) in [("5 小时卡", usage.fiveHourCardsError, fiveHourCardsStale, fiveHourCardsLastOK), ("周卡", usage.weekCardsError, weekCardsStale, weekCardsLastOK)] {
+        for (name, error, stale, last) in [("5 小时卡", usage.fiveHourCardsError, fiveHourCardsStale, fiveHourCardsLastOK), ("周卡", usage.weekCardsError, weekCardsStale, weekCardsLastOK)] where !resetLoginUnsupported {
             let message: String? = error.map { "\(name)获取失败：\($0)（ZCode 登录态可能过期，打开 ZCode 后重试） · 最后成功 \(Fmt.lastOK(last))" } ?? (stale ? "\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))" : nil)
             if let message = message { let l = label(message, color: .systemRed); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
         }
@@ -3576,7 +3618,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
         for (name, _, last, stale, error) in windows {
-            if let error = error { addContent(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed), to: usageCard) }
+            if error == CredStore.newCredentialMessage {
+                if let last { addContent(label("\(name)上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor), to: usageCard) }
+            } else if let error = error { addContent(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed), to: usageCard) }
             else if stale { addContent(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange), to: usageCard) }
         }
         add(usageCard)
@@ -3610,7 +3654,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let t = usage.tools30d { addContent(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor), to: mcpCard) }
             else { addContent(label("暂无数据", color: .secondaryLabelColor), to: mcpCard) }
         }
-        if let e = usage.toolsError { addContent(label("MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemRed), to: mcpCard) }
+        if usage.toolsError == CredStore.newCredentialMessage {
+            if let last = toolsLastOK { addContent(label("上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor), to: mcpCard) }
+        } else if let e = usage.toolsError { addContent(label("MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemRed), to: mcpCard) }
         else if toolsStale { addContent(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange), to: mcpCard) }
         add(mcpCard)
 
@@ -4171,8 +4217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 // MARK: - 入口（支持 --once 命令行自检）
 
 func onceMode() {
-    guard let key = CredStore.loadApiKey() else {
-        print("no coding-plan api key found"); exit(1)
+    let credential = CredStore.loadPlanCredential()
+    guard let key = credential.key else {
+        print("\(credential.error)；可在 ZCode 的「使用统计」查看，或通过 GLM_API_KEY 提供 API Key"); exit(1)
     }
     let group = DispatchGroup()
     // 与 App 主路径同款：网络回调来自不同线程，全部经加锁 accumulator 合并，
@@ -4212,7 +4259,8 @@ func onceMode() {
         group.leave()
     }
     // 重置卡（额度重置卡）+ 套餐到期：与 token 统计同批拉取
-    if let (jwt, maas) = CredStore.loadResetTokens() {
+    let resetCredential = CredStore.loadResetCredential()
+    if let (jwt, maas) = resetCredential.tokens {
         group.enter()
         Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
             acc.update { current in
@@ -4225,9 +4273,10 @@ func onceMode() {
         }
     } else {
         acc.update { current in
-            current.fiveHourCardsError = "未找到 ZCode 登录凭证"
-            current.weekCardsError = "未找到 ZCode 登录凭证"
-            current.resetCardsError = "未找到 ZCode 登录凭证"
+            let error = resetCredential.error
+            current.fiveHourCardsError = error
+            current.weekCardsError = error
+            current.resetCardsError = error
         }
     }
     group.enter()
@@ -5025,6 +5074,36 @@ enum GLMOfflineRegression {
             let userEmailJSON = #"{"id":"x","username":"User","displayName":"User","rawProfile":{"email":"User@Example.com"}}"#
             let userNameLikeJSON = #"{"id":"x","username":"user@example.com","displayName":"user@example.com","rawProfile":{"name":"user@example.com"}}"#
             let topLevelEmailJSON = #"{"id":"x","email":"user@example.com"}"#
+            // 假凭据仅在内存中生成，覆盖 v1 解密、v2 降级及 API Key 覆盖。
+            let fixtureSecret = "offline-fixture-secret"
+            let fixtureKey = SymmetricKey(data: SHA256.hash(data: Data(fixtureSecret.utf8)))
+            let fixtureBox = try AES.GCM.seal(Data("fixture-token".utf8), using: fixtureKey)
+            func b64url(_ data: Data) -> String {
+                data.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+                    .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+            }
+            let fixtureV1 = "enc:v1:" + b64url(Data(fixtureBox.nonce)) + "." + b64url(fixtureBox.tag) + "." + b64url(fixtureBox.ciphertext)
+            try expect(CredStore.decrypt(fixtureV1, secret: fixtureSecret) == "fixture-token", "v1 fixture failed")
+            try expect(CredStore.decrypt(fixtureV1, secret: "wrong") == nil, "wrong v1 key accepted")
+            let fixtureV2 = ["oauth:bigmodel:access_token": "enc:v2:os:fixture:opaque", "zcodejwttoken": "enc:v2:os:fixture:opaque"]
+            let upgradedPlan = CredStore.resolvePlanCredential(record: fixtureV2)
+            try expect(upgradedPlan.key == nil && upgradedPlan.error == CredStore.newCredentialMessage, "v2 plan status missing")
+            try expect(CredStore.decrypt("enc:v2:os:fixture:opaque", secret: fixtureSecret) == nil, "v2 must not be decrypted")
+            try expect(CredStore.resolvePlanCredential(envValue: "fixture-api-key", record: fixtureV2).key == "fixture-api-key", "API override lost")
+            let upgradedReset = CredStore.resolveResetCredential(record: fixtureV2)
+            try expect(upgradedReset.tokens == nil && upgradedReset.error == CredStore.newCredentialMessage, "v2 reset status missing")
+            let legacy = ["oauth:bigmodel:access_token": fixtureV1, "zcodejwttoken": fixtureV1]
+            try expect(CredStore.resolvePlanCredential(record: legacy, secret: fixtureSecret).key == "fixture-token", "legacy OAuth fallback failed")
+            try expect(CredStore.resolveResetCredential(record: legacy, secret: fixtureSecret).tokens?.jwt == "fixture-token", "legacy reset credential failed")
+            try expect(CredStore.resolvePlanCredential(record: [:]).error != CredStore.newCredentialMessage, "missing credential misclassified")
+            try expect(CredStore.resolvePlanCredential(record: ["oauth:bigmodel:user_info": "enc:v2:os:fixture:opaque"]).error != CredStore.newCredentialMessage, "unrelated v2 misclassified")
+            try expect(CredStore.resolvePlanCredential(record: ["coding-plan:api-key": "enc:v2:env:fixture:opaque"]).error == CredStore.newCredentialMessage, "v2 env not detected")
+            let mixed = ["coding-plan:api-key:bigmodel": "enc:v2:os:fixture:opaque", "coding-plan:api-key:zai": fixtureV1, "oauth:bigmodel:access_token": fixtureV1]
+            let mixedPlan = CredStore.resolvePlanCredential(record: mixed, secret: fixtureSecret)
+            try expect(mixedPlan.key == nil && mixedPlan.error == CredStore.newCredentialMessage, "v2 account silently fell back")
+            let preferredLegacy = ["coding-plan:api-key:bigmodel": fixtureV1, "coding-plan:api-key:zai": "enc:v2:os:fixture:opaque"]
+            try expect(CredStore.resolvePlanCredential(record: preferredLegacy, secret: fixtureSecret).key == "fixture-token", "lower-priority v2 hid usable legacy API key")
+
             try expect(CredStore.resolveAccountEmail(envValue: "sk-key", credentialKeyCandidates: 0,
                        oauthAccessToken: "token", userInfoJSON: userEmailJSON) == nil,
                        "env key override still allowed email")

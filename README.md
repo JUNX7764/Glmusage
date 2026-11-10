@@ -27,11 +27,13 @@
 
 ## 安装
 
-1. 建议先安装并登录 ZCode，确保账号有 GLM Coding Plan；也可使用 API key，详见开发者说明。
+1. 使用 GLM Coding Plan 的 API Key，配置方式见[开发者说明](docs/DEVELOPMENT.md#原理与数据边界)。使用旧版 ZCode 的用户也可以沿用 ZCode 登录。
 2. 前往[下载页面](https://github.com/JUNX7764/Glmusage/releases/latest)，下载 `GlmUsage.dmg`。
 3. 打开安装包，将 GlmUsage 拖入「应用程序」，然后打开。图标会出现在屏幕顶部菜单栏。
 
 首次打开如遇 macOS 安全提示，可在 Finder 中右键点击 GlmUsage，选择「打开」并按提示操作。应用目前使用 ad-hoc 签名。
+
+ZCode 3.18.0 的新版登录凭证由系统钥匙串保护。仅通过新版 ZCode 登录时，请在 ZCode 的「使用统计 → 编程套餐」查看额度、用量和重置卡。为 GlmUsage 提供套餐 API Key 后，可在菜单栏查询服务端额度与用量；重置卡仍可在 ZCode 内查看和使用。[ZCode 使用统计说明](https://zcode.z.ai/cn/docs/usage-stats)
 
 ## 更新
 
