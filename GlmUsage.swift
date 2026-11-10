@@ -3176,7 +3176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func buildPanel() {
         let savedOffset = activeScroll?.contentView.bounds.origin ?? .zero
-        let width: CGFloat = CommandLine.arguments.contains("--preview-narrow") ? 280 : 330
+        let width: CGFloat = CommandLine.arguments.contains("--preview-narrow") ? 280 : 340
         let inner = width - 32
         let root = panelRoot
         for view in root.arrangedSubviews { root.removeArrangedSubview(view); view.removeFromSuperview() }
@@ -3267,12 +3267,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let bar = GLMQuotaBar(ratio)
             bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true
             heading.addArrangedSubview(bar)
-            let reset = label(entry?.reset.map { Fmt.weekDayTime($0) } ?? "时间未知", size: 12, bold: true)
-            reset.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+            // 重置时间与「5 小时」标签同字号（11pt，实测最长 "12-06 周六 13:46" 95.1pt）
+            let reset = label(entry?.reset.map { Fmt.weekDayTime($0) } ?? "时间未知", size: 11, bold: true)
+            reset.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
             reset.alignment = .right
             reset.lineBreakMode = .byTruncatingTail
             reset.maximumNumberOfLines = 1
-            reset.widthAnchor.constraint(equalToConstant: 110).isActive = true
+            reset.widthAnchor.constraint(equalToConstant: 100).isActive = true
             reset.setContentCompressionResistancePriority(.required, for: .horizontal)
             heading.addArrangedSubview(reset)
             addToGroup(heading)
