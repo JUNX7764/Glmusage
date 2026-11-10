@@ -27,13 +27,13 @@
 
 ## 安装
 
-1. 使用 GLM Coding Plan 的 API Key，配置方式见[开发者说明](docs/DEVELOPMENT.md#原理与数据边界)。使用旧版 ZCode 的用户也可以沿用 ZCode 登录。
-2. 前往[下载页面](https://github.com/JUNX7764/Glmusage/releases/latest)，下载 `GlmUsage.dmg`。
-3. 打开安装包，将 GlmUsage 拖入「应用程序」，然后打开。图标会出现在屏幕顶部菜单栏。
+1. 前往[下载页面](https://github.com/JUNX7764/Glmusage/releases/latest)，下载 `GlmUsage.dmg`。
+2. 打开安装包，将 GlmUsage 拖入「应用程序」，然后打开。图标会出现在屏幕顶部菜单栏。
+3. 在菜单栏打开 GlmUsage，点击「连接套餐」，输入 GLM Coding Plan 的 API Key。验证通过后会立即刷新额度和用量。使用旧版 ZCode 的用户可以沿用已连接的账号。
 
 首次打开如遇 macOS 安全提示，可在 Finder 中右键点击 GlmUsage，选择「打开」并按提示操作。应用目前使用 ad-hoc 签名。
 
-ZCode 3.18.0 的新版登录凭证由系统钥匙串保护。仅通过新版 ZCode 登录时，请在 ZCode 的「使用统计 → 编程套餐」查看额度、用量和重置卡。为 GlmUsage 提供套餐 API Key 后，可在菜单栏查询服务端额度与用量；重置卡仍可在 ZCode 内查看和使用。[ZCode 使用统计说明](https://zcode.z.ai/cn/docs/usage-stats)
+使用新版 ZCode 的用户可以通过套餐 API Key 恢复菜单栏的服务端额度和用量。API Key 可在个人编程套餐的「套餐概览」或团队编程套餐的「我的套餐」获取。重置卡可在 ZCode 的「使用统计 → 编程套餐」查看和使用。[智谱 API Key 获取说明](https://docs.bigmodel.cn/cn/coding-plan/extension/coding-tool-helper) · [ZCode 使用统计说明](https://zcode.z.ai/cn/docs/usage-stats)
 
 ## 更新
 
@@ -43,7 +43,7 @@ ZCode 3.18.0 的新版登录凭证由系统钥匙串保护。仅通过新版 ZCo
 
 **应用在 Mac 本地运行，不会把用量数据上传到开发者服务器。**
 
-额度和用量由智谱或 ZCode 服务及本机 ZCode 请求记录提供，查询时会发送必要的认证信息；检查更新会连接 GitHub。应用只读 ZCode 凭据和本机请求用量，不修改源文件。
+额度和用量由智谱或 ZCode 服务及本机 ZCode 请求记录提供，查询时会向对应服务发送必要的认证信息。手动连接的套餐 API Key 保存在 GlmUsage 的 macOS 钥匙串条目中。ZCode 凭据和本机请求用量只读，检查更新会连接 GitHub。
 
 ## 其他工具
 

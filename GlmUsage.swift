@@ -3,6 +3,8 @@ import CryptoKit
 import Foundation
 import CoreFoundation
 import SQLite3
+import Security
+import LocalAuthentication
 
 // MARK: - 凭证读取（复用 ZCode 本地加密凭证库）
 //
@@ -12,12 +14,70 @@ import SQLite3
 // （与 ZCode 客户端 zcode.cjs 内置逻辑一致）。密文格式 iv.tag.ciphertext，均为 base64url。
 // 本应用只读取、绝不写入该文件；key 仅存在于内存。
 
+// Only this app's dedicated item is accessed; background reads must never prompt.
+enum GLMPlanKeychain {
+    static let service = "com.local.glm-usage.coding-plan"
+    static let account = "api-key"
+    enum ReadResult { case key(String), missing, unavailable }
+    static func query() -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+    static func read(interactive: Bool = false) -> ReadResult {
+        var q = query()
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        if !interactive {
+            let context = LAContext(); context.interactionNotAllowed = true
+            q[kSecUseAuthenticationContext as String] = context
+        }
+        var wasAllowed: DarwinBoolean = true
+        let restoreInteraction = !interactive && SecKeychainGetUserInteractionAllowed(&wasAllowed) == errSecSuccess
+        if restoreInteraction { SecKeychainSetUserInteractionAllowed(false) }
+        defer { if restoreInteraction { SecKeychainSetUserInteractionAllowed(wasAllowed.boolValue) } }
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &result)
+        if status == errSecItemNotFound { return .missing }
+        guard status == errSecSuccess, let data = result as? Data,
+              let value = String(data: data, encoding: .utf8), !value.isEmpty else { return .unavailable }
+        return .key(value)
+    }
+    // Called only after the user submits a verified key. Existing items are updated in place;
+    // an access denial never deletes the old item.
+    static func save(_ key: String) -> Bool {
+        let q = query()
+        let data = Data(key.utf8)
+        let status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
+        var item = q
+        item[kSecValueData as String] = data
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+    }
+}
+
 enum CredStore {
     static let credPath = NSHomeDirectory() + "/.zcode/v2/credentials.json"
     // 允许用环境变量直接提供 key（调试 / 无 ZCode 凭证库的场景）
     static let envKey = "GLM_API_KEY"
     static let newCredentialMessage = "ZCode 新版登录暂不支持"
+    static let missingPlanMessage = "未找到或无法读取 ZCode 凭证"
 
+    static let keychainUnavailableMessage = "已保存的套餐连接暂不可用，请重新连接"
+    // A single non-interactive lookup per process avoids repeated Keychain prompts/work.
+    private static var savedKey: GLMPlanKeychain.ReadResult = GLMPlanKeychain.read()
+    static func useSavedKey(_ key: String) { savedKey = .key(key) }
+    static func unlockSavedKey() -> Bool {
+        let result = GLMPlanKeychain.read(interactive: true)
+        if case .key = result { savedKey = result; return true }
+        return false
+    }
+    static var isSavedKeyActive: Bool {
+        let env = ProcessInfo.processInfo.environment[envKey]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if env?.isEmpty == false { return false }
+        if case .key = savedKey { return true }
+        return false
+    }
     static func loadApiKey() -> String? {
         loadPlanCredential().key
     }
@@ -25,7 +85,11 @@ enum CredStore {
     static func loadPlanCredential() -> (key: String?, error: String) {
         let envValue = ProcessInfo.processInfo.environment[envKey]
         if let value = envValue, !value.trimmingCharacters(in: .whitespaces).isEmpty { return (value, "") }
-        return resolvePlanCredential(record: credentialRecord() ?? [:])
+        switch savedKey {
+        case .key(let key): return (key, "")
+        case .unavailable: return (nil, keychainUnavailableMessage)
+        case .missing: return resolvePlanCredential(record: credentialRecord() ?? [:])
+        }
     }
 
     private static func credentialRecord() -> [String: String]? {
@@ -39,7 +103,7 @@ enum CredStore {
         let selected = preferredApiKey(record: record) ?? record["oauth:bigmodel:access_token"] ?? ""
         if selected.hasPrefix("enc:v2:") { return (nil, newCredentialMessage) }
         if let key = decrypt(selected, secret: secret) { return (key, "") }
-        return (nil, "未找到或无法读取 ZCode 凭证")
+        return (nil, missingPlanMessage)
     }
 
     static func preferredApiKey(record obj: [String: String]) -> String? {
@@ -731,13 +795,21 @@ final class RefreshGate {
     }
 }
 
+enum GLMPlanConnection {
+    enum Outcome { case invalid, saveFailed, connected }
+    static func commit(_ result: UsageData, key: String, save: (String) -> Bool) -> Outcome {
+        guard result.quotaError == nil, result.fiveHour != nil, result.week != nil else { return .invalid }
+        return save(key) ? .connected : .saveFailed
+    }
+}
+
 // MARK: - 网络请求（智谱开放平台监控接口）
 //
 // 三个接口均来自官方 glm-plan-usage 插件（zai-org/zai-coding-plugins）：
 //   GET {base}/api/monitor/usage/quota/limit                    额度窗口（无参数）
 //   GET {base}/api/monitor/usage/model-usage?startTime=&endTime= 按小时 token/调用数
 //   GET {base}/api/monitor/usage/tool-usage?startTime=&endTime=  MCP 工具次数
-// 时间参数为本地时区 "yyyy-MM-dd HH:mm:ss"；Authorization: Bearer <订阅 api-key>。
+// 时间参数为本地时区 "yyyy-MM-dd HH:mm:ss"；面板连接使用官方接口约定的原始 API Key，旧凭据沿用 Bearer。
 // token 统计由服务端完成，无需扫描本地会话日志（与 KimiUsage 的差异点）。
 // 另有两个扩展接口：
 //   GET https://zcode.z.ai/api/v1/coding-plan/reset/status  重置卡（额度重置卡），
@@ -747,10 +819,10 @@ final class RefreshGate {
 enum Fetcher {
     static let base = "https://open.bigmodel.cn"
 
-    private static func authRequest(_ urlStr: String, apiKey: String) -> URLRequest? {
+    static func authRequest(_ urlStr: String, apiKey: String, rawKey: Bool = false) -> URLRequest? {
         guard let url = URL(string: urlStr) else { return nil }
         var req = URLRequest(url: url, timeoutInterval: 15)
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue(rawKey ? apiKey : "Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.setValue("GlmUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return req
@@ -763,15 +835,15 @@ enum Fetcher {
     }
 
     /// 通用 GET（code==200 判成功），回调 data 字段原始 JSON（dict / array 均可）
-    private static func fetchRaw(apiKey: String, path: String, from: Date? = nil, to: Date? = nil,
+    private static func fetchRaw(apiKey: String, path: String, from: Date? = nil, to: Date? = nil, rawKey: Bool = false,
                                  completion: @escaping (Any?, String?) -> Void) {
         let req: URLRequest?
         if let from = from, let to = to {
             var comp = URLComponents(string: base + path)
             comp?.queryItems = winParams(from: from, to: to)
-            req = comp?.url.map { authRequest($0.absoluteString, apiKey: apiKey)! }
+            req = comp?.url.map { authRequest($0.absoluteString, apiKey: apiKey, rawKey: rawKey)! }
         } else {
-            req = authRequest(base + path, apiKey: apiKey)
+            req = authRequest(base + path, apiKey: apiKey, rawKey: rawKey)
         }
         guard let req = req else { completion(nil, "bad url"); return }
         URLSession.shared.dataTask(with: req) { data, resp, err in
@@ -785,23 +857,23 @@ enum Fetcher {
             }
             guard let code = GLMNumber.integer(obj["code"]), code == 200 else {
                 let code = GLMNumber.integer(obj["code"]).map(String.init) ?? "missing or invalid"
-                completion(nil, "code \(code) \(obj["msg"] as? String ?? "")"); return
+                completion(nil, "code \(code)"); return
             }
             completion(obj["data"], nil)
         }.resume()
     }
 
     /// data 为 dict 的接口走这里（额度窗口 / token 统计 / MCP 工具）
-    static func fetch(apiKey: String, path: String, from: Date? = nil, to: Date? = nil,
+    static func fetch(apiKey: String, path: String, from: Date? = nil, to: Date? = nil, rawKey: Bool = false,
                       completion: @escaping ([String: Any]?, String?) -> Void) {
-        fetchRaw(apiKey: apiKey, path: path, from: from, to: to) { data, err in
+        fetchRaw(apiKey: apiKey, path: path, from: from, to: to, rawKey: rawKey) { data, err in
             completion(data as? [String: Any], err)
         }
     }
 
     /// 额度窗口：5 小时 + 7 天（周）
-    static func fetchQuota(apiKey: String, completion: @escaping (UsageData) -> Void) {
-        fetch(apiKey: apiKey, path: "/api/monitor/usage/quota/limit") { data, err in
+    static func fetchQuota(apiKey: String, rawKey: Bool = false, completion: @escaping (UsageData) -> Void) {
+        fetch(apiKey: apiKey, path: "/api/monitor/usage/quota/limit", rawKey: rawKey) { data, err in
             completion(parseQuota(data, error: err, now: Date()))
         }
     }
@@ -912,18 +984,18 @@ enum Fetcher {
 
     /// model-usage：一个时间窗的 token/调用统计；第二/三参数为每日桶与其解析失败标记
     /// （复用同一响应，不新增请求；Gate 已于 2026-11-06 真实验收确认，解析失败仍整体拒绝）
-    static func fetchModelUsage(apiKey: String, from: Date, to: Date,
+    static func fetchModelUsage(apiKey: String, from: Date, to: Date, includeLocal: Bool = true, rawKey: Bool = false,
                                 completion: @escaping (ModelUsage?, [GLMDayBucket]?, Bool, String?) -> Void) {
         // 环境变量可指向其他账号，其用量不能与当前 ZCode 的本机记录直接合并。
         let externalKey = ProcessInfo.processInfo.environment[CredStore.envKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        fetch(apiKey: apiKey, path: "/api/monitor/usage/model-usage", from: from, to: to) { data, err in
+        fetch(apiKey: apiKey, path: "/api/monitor/usage/model-usage", from: from, to: to, rawKey: rawKey) { data, err in
             guard let data = data, err == nil else { completion(nil, nil, false, err ?? "no data"); return }
             guard let usage = parseModelUsage(data) else {
                 completion(nil, nil, false, "missing or invalid model usage fields"); return
             }
             let daily = Self.dailyBuckets(from: data, windowStart: from, now: Date())
-            guard externalKey?.isEmpty != false else {
+            guard includeLocal && externalKey?.isEmpty != false else {
                 completion(usage, daily.buckets, daily.parseFailed, nil)
                 return
             }
@@ -975,9 +1047,9 @@ enum Fetcher {
     }
 
     /// tool-usage：MCP 工具次数（网络搜索 / 网页读取）
-    static func fetchToolUsage(apiKey: String, from: Date, to: Date,
+    static func fetchToolUsage(apiKey: String, from: Date, to: Date, rawKey: Bool = false,
                                completion: @escaping (ToolUsage?, String?) -> Void) {
-        fetch(apiKey: apiKey, path: "/api/monitor/usage/tool-usage", from: from, to: to) { data, err in
+        fetch(apiKey: apiKey, path: "/api/monitor/usage/tool-usage", from: from, to: to, rawKey: rawKey) { data, err in
             guard let data = data, err == nil else { completion(nil, err ?? "no data"); return }
             guard let usage = parseToolUsage(data) else {
                 completion(nil, "missing or invalid tool usage fields"); return
@@ -2636,13 +2708,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             finishQuota(failed)
             return
         }
-        Fetcher.fetchQuota(apiKey: key) { [weak self] data in
+        let savedConnection = CredStore.isSavedKeyActive
+        Fetcher.fetchQuota(apiKey: key, rawKey: savedConnection) { [weak self] data in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                guard self.planCredentialMatches(key) else {
+                guard self.planCredentialMatches(key) && savedConnection == CredStore.isSavedKeyActive else {
                     self.updateUI()
-                    _ = self.quotaGate.finish()
-                    self.refreshQuota(manual: true)
+                    if self.quotaGate.finish() { self.performQuotaRefresh() }
+                    else { self.refreshQuota(manual: true) }
                     return
                 }
                 self.finishQuota(data)
@@ -2651,6 +2724,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func finishQuota(_ fresh: UsageData) {
+        applyQuota(fresh)
+        if quotaGate.finish() { performQuotaRefresh() }
+    }
+
+    private func applyQuota(_ fresh: UsageData) {
         let now = Date()
         let five = GLMFreshness.apply(fresh: fresh.fiveHour, failure: fresh.fiveHourError,
             old: usage.fiveHour, oldLastOK: fiveHourLastOK, oldError: usage.fiveHourError, now: now)
@@ -2667,7 +2745,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             planLevelLastOK = now
         }
         updateUI()
-        if quotaGate.finish() { performQuotaRefresh() }
     }
 
     private func performRefresh(tokens: Bool) {
@@ -2693,6 +2770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             finishRefresh(failed, tokens: tokens)
             return
         }
+        let savedConnection = CredStore.isSavedKeyActive
         let accumulator = RefreshAccumulator()
         let group = DispatchGroup()
 
@@ -2707,7 +2785,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let wg = DispatchGroup()
             for w in windows {
                 wg.enter()
-                Fetcher.fetchModelUsage(apiKey: key, from: w.from, to: w.to) { r, daily, dailyFailed, err in
+                Fetcher.fetchModelUsage(apiKey: key, from: w.from, to: w.to, includeLocal: !savedConnection, rawKey: savedConnection) { r, daily, dailyFailed, err in
                     accumulator.update { current in
                         switch w.label {
                         case 0:
@@ -2740,15 +2818,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 头部可选邮箱：读现有凭据库（本地文件、无网络），不可得 → nil → 整行隐藏。
             // 双保险：本方法在 preview 下不会被调用（启动即 return），此处再显式断开
             // 预览路径与凭据读取的关联，防止未来重构把凭据读取带进假数据预览。
-            let accountEmail = preview ? nil : CredStore.loadAccountEmail()
+            let accountEmail = (preview || savedConnection) ? nil : CredStore.loadAccountEmail()
             let previousEmail = usage.accountEmail
             accumulator.update { current in
                 // 凭据库瞬时读取失败（文件 busy/锁）会读到 nil：沿用上轮邮箱避免头部整行闪烁；
                 // 退出登录后同样读到 nil，旧值保留到下次成功读取或重启（展示侧五重门禁兜底）
-                current.accountEmail = accountEmail ?? previousEmail
+                current.accountEmail = savedConnection ? nil : (accountEmail ?? previousEmail)
             }
             wg.enter()
-            Fetcher.fetchToolUsage(apiKey: key, from: now.addingTimeInterval(-30 * 86400), to: now) { r, err in
+            Fetcher.fetchToolUsage(apiKey: key, from: now.addingTimeInterval(-30 * 86400), to: now, rawKey: savedConnection) { r, err in
                 accumulator.update { current in
                     current.tools30d = r
                     current.toolsError = r == nil ? (err ?? "no data") : nil
@@ -2756,7 +2834,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 wg.leave()
             }
             // 重置卡（额度重置卡）：ZCode 登录态 token 缺失/过期时优雅降级为错误提示
-            let resetCredential = CredStore.loadResetCredential()
+            let resetCredential = savedConnection ? (tokens: Optional<(jwt: String, maas: String)>.none, error: "套餐连接不支持重置卡，请在 ZCode 中使用") : CredStore.loadResetCredential()
             if let (jwt, maas) = resetCredential.tokens {
                 wg.enter()
                 Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
@@ -2793,10 +2871,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
-            guard self.planCredentialMatches(key) else {
+            guard self.planCredentialMatches(key) && savedConnection == CredStore.isSavedKeyActive else {
                 self.updateUI()
-                _ = self.refreshGate.finish()
-                self.refresh(tokens: true, manual: true)
+                if self.refreshGate.finish() { self.performRefresh(tokens: true) }
+                else { self.refresh(tokens: true, manual: true) }
                 return
             }
             self.finishRefresh(accumulator.snapshot(), tokens: tokens)
@@ -3129,6 +3207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func beginUseReset(_ type: ResetCardType) {
         guard !resetUseInFlight else { return }
         if preview { setUpdateMessage("预览模式：不执行真实重置卡操作", dismissAfter: 3); return }
+        guard !CredStore.isSavedKeyActive else { setUpdateMessage("请在 ZCode 中使用重置卡", dismissAfter: 4); return }
         let credential = CredStore.loadResetCredential()
         guard let (jwt, maas) = credential.tokens else {
             setUpdateMessage("使用\(type.displayName)失败：\(credential.error)", dismissAfter: 5); return
@@ -3371,10 +3450,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if UpdateProgressController.shared.isActive { add(UpdateProgressRowView()) }
         else if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
 
-        let planLoginUnsupported = usage.quotaError == CredStore.newCredentialMessage
+        let needsPlanConnection = [CredStore.newCredentialMessage, CredStore.keychainUnavailableMessage, CredStore.missingPlanMessage]
+            .contains { $0 == usage.quotaError }
         let resetLoginUnsupported = usage.resetCardsError == CredStore.newCredentialMessage
-        if planLoginUnsupported {
-            add(label("ZCode 新版登录暂不支持。请在 ZCode 的「使用统计 → 编程套餐」查看。", color: .systemOrange))
+        if needsPlanConnection {
+            let instruction = usage.quotaError == CredStore.keychainUnavailableMessage
+                ? "请解锁已保存的套餐连接" : "使用套餐 API Key 恢复自动刷新"
+            add(label(instruction, color: .systemOrange))
+            add(button("连接套餐", #selector(onConnectPlan), prominent: true))
         }
         let quotaCard = GLMPanelCard()
         quotaCard.content.spacing = 6
@@ -3428,7 +3511,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 余量和所有异常文本独占卡片全宽，不参与右侧时间列的宽度竞争。
             if let e = entry { addToGroup(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
             else { addToGroup(label("暂无数据", color: .secondaryLabelColor)) }
-            if error == CredStore.newCredentialMessage {
+            if needsPlanConnection && error == usage.quotaError {
                 if let last { addToGroup(label("上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor)) }
             } else if let e = error { addToGroup(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
             if let warning = warning { addToGroup(label("部分数据异常：\(warning)", color: .systemOrange)) }
@@ -3440,7 +3523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             quotaCard.content.setCustomSpacing(10, after: fiveHourGroup)
         }
         quota(usage.week, "7 天", usage.weekError, usage.weekWarning, weekLastOK, weekStale)
-        let subscriptionError = usage.subscriptionError == CredStore.newCredentialMessage ? nil : usage.subscriptionError
+        let subscriptionError = needsPlanConnection && usage.subscriptionError == usage.quotaError ? nil : usage.subscriptionError
         if usage.subscription != nil || subscriptionError != nil || subscriptionStale {
             addContent(separator(), to: quotaCard)
         }
@@ -3507,8 +3590,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if !resetLoginUnsupported { cardHead.addArrangedSubview(resetBtn) }
         cards.content.addArrangedSubview(cardHead); cardHead.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
         if resetLoginUnsupported {
-            let instruction = planLoginUnsupported ? "请在 ZCode 查看和使用" : "请在 ZCode 的「使用统计 → 编程套餐」查看和使用"
-            addContent(label(instruction, color: .secondaryLabelColor), to: cards)
+            addContent(label("请在 ZCode 的「使用统计 → 编程套餐」查看和使用", color: .secondaryLabelColor), to: cards)
         } else if let c = usage.resetCards {
             func cardRow(_ name: String, _ detail: String, color: NSColor) {
                 let line = row()
@@ -3618,7 +3700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
         for (name, _, last, stale, error) in windows {
-            if error == CredStore.newCredentialMessage {
+            if needsPlanConnection && error == usage.quotaError {
                 if let last { addContent(label("\(name)上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor), to: usageCard) }
             } else if let error = error { addContent(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed), to: usageCard) }
             else if stale { addContent(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange), to: usageCard) }
@@ -3654,7 +3736,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let t = usage.tools30d { addContent(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor), to: mcpCard) }
             else { addContent(label("暂无数据", color: .secondaryLabelColor), to: mcpCard) }
         }
-        if usage.toolsError == CredStore.newCredentialMessage {
+        if needsPlanConnection && usage.toolsError == usage.quotaError {
             if let last = toolsLastOK { addContent(label("上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor), to: mcpCard) }
         } else if let e = usage.toolsError { addContent(label("MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemRed), to: mcpCard) }
         else if toolsStale { addContent(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange), to: mcpCard) }
@@ -3713,6 +3795,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let msg = updateMessage { footer.addArrangedSubview(label(msg, color: .secondaryLabelColor)) }
         let actions = row(); actions.spacing = 6
         let refresh = button("立即刷新", #selector(onRefresh), prominent: true); refresh.keyEquivalent = "r"; refresh.keyEquivalentModifierMask = .command; refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true; actions.addArrangedSubview(refresh)
+        if !needsPlanConnection {
+            let connect = button("套餐设置", #selector(onConnectPlan)); actions.addArrangedSubview(connect)
+        }
         let login = NSButton(checkboxWithTitle: "开机自启", target: self, action: #selector(onToggleLogin)); login.font = .systemFont(ofSize: 12); login.state = (!preview && isLoginItemEnabled()) ? .on : .off; actions.addArrangedSubview(login); actions.addArrangedSubview(spacer())
         let quit = button("退出", #selector(onQuit)); quit.keyEquivalent = "q"; quit.keyEquivalentModifierMask = .command; quit.widthAnchor.constraint(equalToConstant: 40).isActive = true; actions.addArrangedSubview(quit)
         footer.addArrangedSubview(actions); actions.widthAnchor.constraint(equalToConstant: inner).isActive = true
@@ -4172,6 +4257,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                          dismissAfter: 4)
     }
 
+    private var connectingPlan = false
+
+    @objc private func onConnectPlan() {
+        guard !connectingPlan else { return }
+        if ProcessInfo.processInfo.environment[CredStore.envKey]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            setUpdateMessage("当前由 GLM_API_KEY 指定套餐，请先移除该环境变量再连接", dismissAfter: 6); return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "连接 GLM Coding Plan"
+        alert.informativeText = "粘贴套餐 API Key。验证成功后将安全保存在本机钥匙串，用于刷新用量。"
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "套餐 API Key"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "验证并连接")
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "获取 API Key")
+        let canUnlock = !preview && usage.quotaError == CredStore.keychainUnavailableMessage
+        if canUnlock { alert.addButton(withTitle: "解锁已保存连接") }
+        alert.window.initialFirstResponder = field
+        let response = alert.runModal()
+        if canUnlock && response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 3 {
+            if CredStore.unlockSavedKey() { refresh(tokens: true, manual: true) }
+            else { setUpdateMessage("无法读取已保存的连接，请解锁钥匙串或重新连接", dismissAfter: 8) }
+            return
+        }
+        if preview { setUpdateMessage("预览模式：不连接真实套餐", dismissAfter: 3); return }
+        if response == .alertThirdButtonReturn {
+            if let url = URL(string: "https://bigmodel.cn/coding-plan/personal/overview") { NSWorkspace.shared.open(url) }
+            return
+        }
+        guard response == .alertFirstButtonReturn else { return }
+        let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        field.stringValue = ""
+        guard !key.isEmpty else { setUpdateMessage("请输入套餐 API Key", dismissAfter: 4); return }
+        guard !key.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0) }) else {
+            setUpdateMessage("请只粘贴套餐 API Key", dismissAfter: 4); return
+        }
+        connectingPlan = true
+        setUpdateMessage("正在验证套餐…")
+        Fetcher.fetchQuota(apiKey: key, rawKey: true) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.connectingPlan = false
+                switch GLMPlanConnection.commit(result, key: key, save: GLMPlanKeychain.save) {
+                case .invalid:
+                    self.setUpdateMessage("验证失败，请检查套餐 API Key 和网络后重试", dismissAfter: 8); return
+                case .saveFailed:
+                    self.setUpdateMessage("无法保存到钥匙串，请解锁或允许访问后重试", dismissAfter: 8); return
+                case .connected: break
+                }
+                let changed = self.planCredential != SHA256.hash(data: Data(key.utf8)) || !CredStore.isSavedKeyActive
+                CredStore.useSavedKey(key)
+                if changed {
+                    self.usage = UsageData()
+                    self.fiveHourLastOK = nil; self.weekLastOK = nil
+                    self.tokensTodayLastOK = nil; self.tokens7dLastOK = nil; self.tokens30dLastOK = nil
+                    self.dailyLastOK = nil; self.toolsLastOK = nil
+                    self.fiveHourCardsLastOK = nil; self.weekCardsLastOK = nil
+                    self.subscriptionLastOK = nil; self.planLevelLastOK = nil
+                    self.dailySelectedIndex = nil
+                }
+                self.bindPlanCredential(key)
+                self.lastAttemptAt = Date()
+                self.applyQuota(result)
+                self.setUpdateMessage("套餐已连接，正在刷新", dismissAfter: 5)
+                self.refresh(tokens: true, manual: true)
+            }
+        }
+    }
+
     @objc private func onRefresh() {
         if preview {
             if previewPopover {
@@ -4226,7 +4382,7 @@ func onceMode() {
     // 避免 --once 里多线程直接写同一 struct（wait 超时后边写边读的撕裂窗口）
     let acc = RefreshAccumulator()
     group.enter()
-    Fetcher.fetchQuota(apiKey: key) { r in
+    Fetcher.fetchQuota(apiKey: key, rawKey: CredStore.isSavedKeyActive) { r in
         acc.update { current in
             current.fiveHour = r.fiveHour; current.week = r.week
             current.level = r.level; current.quotaError = r.quotaError
@@ -4240,7 +4396,7 @@ func onceMode() {
     for (label, from) in [("today", dayStart), ("7d", now.addingTimeInterval(-7 * 86400)),
                           ("30d", now.addingTimeInterval(-30 * 86400))] {
         group.enter()
-        Fetcher.fetchModelUsage(apiKey: key, from: from, to: now) { r, _, _, err in
+        Fetcher.fetchModelUsage(apiKey: key, from: from, to: now, includeLocal: !CredStore.isSavedKeyActive, rawKey: CredStore.isSavedKeyActive) { r, _, _, err in
             if let r = r {
                 acc.update { current in
                     switch label {
@@ -4254,12 +4410,12 @@ func onceMode() {
         }
     }
     group.enter()
-    Fetcher.fetchToolUsage(apiKey: key, from: now.addingTimeInterval(-30 * 86400), to: now) { r, _ in
+    Fetcher.fetchToolUsage(apiKey: key, from: now.addingTimeInterval(-30 * 86400), to: now, rawKey: CredStore.isSavedKeyActive) { r, _ in
         if let r = r { acc.update { $0.tools30d = r } }
         group.leave()
     }
     // 重置卡（额度重置卡）+ 套餐到期：与 token 统计同批拉取
-    let resetCredential = CredStore.loadResetCredential()
+    let resetCredential = CredStore.isSavedKeyActive ? (tokens: Optional<(jwt: String, maas: String)>.none, error: "请在 ZCode 中使用重置卡") : CredStore.loadResetCredential()
     if let (jwt, maas) = resetCredential.tokens {
         group.enter()
         Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
@@ -5085,6 +5241,22 @@ enum GLMOfflineRegression {
             let fixtureV1 = "enc:v1:" + b64url(Data(fixtureBox.nonce)) + "." + b64url(fixtureBox.tag) + "." + b64url(fixtureBox.ciphertext)
             try expect(CredStore.decrypt(fixtureV1, secret: fixtureSecret) == "fixture-token", "v1 fixture failed")
             try expect(CredStore.decrypt(fixtureV1, secret: "wrong") == nil, "wrong v1 key accepted")
+            var savedFixture = "old"
+            var calls = 0
+            let saveFixture: (String) -> Bool = { candidate in calls += 1; savedFixture = candidate; return true }
+            let invalidOutcome = GLMPlanConnection.commit(UsageData(), key: "new", save: saveFixture)
+            try expect(invalidOutcome == .invalid && calls == 0 && savedFixture == "old", "invalid key changed saved key")
+            let validQuota = Fetcher.parseQuota(["limits": [
+                ["type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 10, "currentValue": 1, "remaining": 9, "percentage": 10],
+                ["type": "CREDIT_LIMIT", "unit": 6, "number": 1, "usage": 10, "currentValue": 1, "remaining": 9, "percentage": 10]
+            ]], error: nil, now: Date())
+            if validQuota.fiveHour != nil && validQuota.week != nil {
+                try expect(GLMPlanConnection.commit(validQuota, key: "new", save: { _ in false }) == .saveFailed && savedFixture == "old", "failed save changed saved key")
+                try expect(GLMPlanConnection.commit(validQuota, key: "new", save: saveFixture) == .connected && savedFixture == "new", "verified key not saved")
+            } else { throw Failure(description: "quota connection fixture invalid") }
+            let syntheticURL = "https://example.invalid/test"
+            try expect(Fetcher.authRequest(syntheticURL, apiKey: "fixture", rawKey: true)?.value(forHTTPHeaderField: "Authorization") == "fixture", "saved key monitor header changed")
+            try expect(Fetcher.authRequest(syntheticURL, apiKey: "fixture")?.value(forHTTPHeaderField: "Authorization") == "Bearer fixture", "legacy header changed")
             let fixtureV2 = ["oauth:bigmodel:access_token": "enc:v2:os:fixture:opaque", "zcodejwttoken": "enc:v2:os:fixture:opaque"]
             let upgradedPlan = CredStore.resolvePlanCredential(record: fixtureV2)
             try expect(upgradedPlan.key == nil && upgradedPlan.error == CredStore.newCredentialMessage, "v2 plan status missing")
