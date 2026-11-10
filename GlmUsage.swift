@@ -514,6 +514,66 @@ enum GLMPendingResetStore {
     }
 }
 
+// 套餐身份仅来自明确的服务端名称或额度等级；颜色与用量告警相互独立。
+enum GLMPlanTier: Equatable {
+    case free, trial, lite, pro, max, teamStandard, teamAdvanced, unknown
+
+    var title: String? {
+        switch self {
+        case .free: return "Free"
+        case .trial: return "Trial"
+        case .lite: return "Lite"
+        case .pro: return "Pro"
+        case .max: return "Max"
+        case .teamStandard: return "Team Standard"
+        case .teamAdvanced: return "Team Advanced"
+        case .unknown: return nil
+        }
+    }
+    static func subscription(_ name: String?) -> GLMPlanTier {
+        guard let name = name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return .unknown }
+        let normalized = name.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        switch normalized {
+        case "free", "glm coding free", "glm coding plan free": return .free
+        case "start", "trial", "glm coding start", "glm coding trial", "glm coding plan start", "glm coding plan trial": return .trial
+        case "lite", "glm coding lite", "glm coding plan lite", "glm coding lite v1", "glm coding lite v2", "v1 lite", "v2 lite", "glm coding v1 lite", "glm coding v2 lite": return .lite
+        case "pro", "glm coding pro", "glm coding plan pro", "glm coding pro v1", "glm coding pro v2", "v1 pro", "v2 pro", "glm coding v1 pro", "glm coding v2 pro": return .pro
+        case "max", "glm coding max", "glm coding plan max", "glm coding max v1", "glm coding max v2", "v1 max", "v2 max", "glm coding v1 max", "glm coding v2 max": return .max
+        case "team standard", "glm coding team standard", "glm coding plan team standard": return .teamStandard
+        case "team advanced", "glm coding team advanced", "glm coding plan team advanced": return .teamAdvanced
+        default: return .unknown
+        }
+    }
+    static func quota(_ level: String?) -> GLMPlanTier {
+        switch level?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "lite": return .lite
+        case "pro": return .pro
+        case "max": return .max
+        default: return .unknown
+        }
+    }
+    // 订阅等级固定色；不依赖额度、告警或外观模式。
+    var theme: NSColor {
+        let rgb: (CGFloat, CGFloat, CGFloat)
+        switch self {
+        case .free: rgb = (148,155,166)        // #949BA6
+        case .trial: rgb = (22,166,161)       // #16A6A1
+        case .lite: rgb = (40,135,232)        // #2887E8
+        case .pro: rgb = (139,92,246)         // #8B5CF6
+        case .max, .teamStandard: rgb = (226,162,58) // #E2A23A
+        case .teamAdvanced: rgb = (228,107,69) // #E46B45
+        case .unknown: rgb = (148,155,166)
+        }
+        return NSColor(srgbRed: rgb.0/255, green: rgb.1/255, blue: rgb.2/255, alpha: 1)
+    }
+    var foreground: NSColor { theme }
+    static func resolve(subscription: SubscriptionInfo?, subscriptionFresh: Bool, level: String?, levelFresh: Bool) -> GLMPlanTier {
+        let sub = subscriptionFresh ? self.subscription(subscription?.name) : .unknown
+        if sub != .unknown { return sub }
+        return levelFresh ? quota(level) : .unknown
+    }
+}
+
 /// 套餐订阅信息（subscription/list）
 struct SubscriptionInfo {
     var name: String
@@ -1056,10 +1116,28 @@ enum Fetcher {
     static func parseSubscription(_ data: Any?) -> (SubscriptionInfo?, String?) {
         guard let list = data as? [[String: Any]] else { return (nil, "unexpected payload") }
         guard list.allSatisfy({ $0["status"] is String }) else { return (nil, "invalid subscription status") }
-        guard let sub = list.first(where: { ($0["status"] as? String) == "VALID" }) else {
-            return (nil, nil)
+        let now = Date()
+        let valid = list.filter { row in
+            guard (row["status"] as? String)?.uppercased() == "VALID" else { return false }
+            let dates = parseValidDates(row["valid"] as? String ?? "")
+            // inCurrentPeriod 表明 valid 可能描述后续周期，不可用其起点排除当前订阅。
+            if let current = row["inCurrentPeriod"] as? NSNumber, current.intValue == 0 { return false }
+            if (row["inCurrentPeriod"] as? NSNumber)?.intValue != 1, dates.count >= 2, dates[0] > now { return false }
+            if let expiry = parseSubscriptionExpiry(row), expiry < now { return false }
+            return true
         }
-        guard let name = sub["productName"] as? String, !name.isEmpty else {
+        guard !valid.isEmpty else { return (nil, nil) }
+        let current = valid.filter { ($0["inCurrentPeriod"] as? NSNumber)?.intValue == 1 }
+        let candidates = current.isEmpty ? valid : current
+        let ranked = candidates.map { row -> ([String: Any], Date?) in
+            let dates = parseValidDates(row["valid"] as? String ?? "")
+            return (row, dates.first)
+        }.sorted { ($0.1 ?? .distantPast) > ($1.1 ?? .distantPast) }
+        if ranked.count > 1 && (ranked[0].1 == nil || ranked[0].1 == ranked[1].1) {
+            return (nil, "ambiguous active subscriptions")
+        }
+        let sub = ranked[0].0
+        guard let name = sub["productName"] as? String, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return (nil, "invalid subscription name")
         }
         return (SubscriptionInfo(name: name, expireDate: parseSubscriptionExpiry(sub)), nil)
@@ -1899,6 +1977,7 @@ final class GLMPillBackground: NSView {
     var radius: CGFloat = 4
     var backgroundAlpha: CGFloat = 0.12
     var useSecondaryLabel: Bool = true
+    var planTier: GLMPlanTier?
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         // wantsLayer 必须自建：updateLayer 只在 layer-backed 时被调用，
@@ -1913,8 +1992,9 @@ final class GLMPillBackground: NSView {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             layer?.cornerRadius = radius
             layer?.masksToBounds = true
-            let base: NSColor = useSecondaryLabel ? .secondaryLabelColor : .labelColor
-            layer?.backgroundColor = base.withAlphaComponent(backgroundAlpha).cgColor
+            let base: NSColor = planTier?.theme ?? (useSecondaryLabel ? .secondaryLabelColor : .labelColor)
+            let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            layer?.backgroundColor = base.withAlphaComponent(planTier == nil ? backgroundAlpha : (dark ? 0.19 : 0.10)).cgColor
         }
     }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
@@ -2405,6 +2485,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var fiveHourCardsLastOK: Date?
     private var weekCardsLastOK: Date?
     private var subscriptionLastOK: Date?
+    private var planLevelLastOK: Date?
+    private var planCredential: SHA256.Digest?
+    private func bindPlanCredential(_ key: String?) {
+        let identity = key.map { SHA256.hash(data: Data($0.utf8)) }
+        guard identity != planCredential else { return }
+        planCredential = identity
+        usage.subscription = nil; subscriptionLastOK = nil
+        usage.level = nil; planLevelLastOK = nil
+    }
+    private func planCredentialMatches(_ key: String) -> Bool {
+        guard let current = CredStore.loadApiKey() else { bindPlanCredential(nil); return false }
+        bindPlanCredential(current)
+        return SHA256.hash(data: Data(key.utf8)) == planCredential
+    }
     private var dailyLastOK: Date?
     // 每日图选中日（面板每 10s 重建后沿用；nil = 用默认最新有记录日，通常为今日）
     private var dailySelectedIndex: Int?
@@ -2528,7 +2622,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func performQuotaRefresh() {
         lastAttemptAt = Date()
-        guard let key = CredStore.loadApiKey() else {
+        let currentKey = CredStore.loadApiKey()
+        bindPlanCredential(currentKey)
+        guard let key = currentKey else {
             var failed = UsageData()
             failed.fiveHourError = "未找到 ZCode 凭证"; failed.weekError = failed.fiveHourError
             failed.quotaError = failed.fiveHourError
@@ -2536,7 +2632,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         Fetcher.fetchQuota(apiKey: key) { [weak self] data in
-            DispatchQueue.main.async { self?.finishQuota(data) }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard self.planCredentialMatches(key) else {
+                    self.updateUI()
+                    _ = self.quotaGate.finish()
+                    self.refreshQuota(manual: true)
+                    return
+                }
+                self.finishQuota(data)
+            }
         }
     }
 
@@ -2552,13 +2657,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if fresh.week != nil { usage.weekWarning = fresh.weekWarning }
         if fresh.fiveHour != nil || fresh.week != nil { usage.quotaError = nil }
         else if let error = fresh.quotaError { usage.quotaError = error }
-        usage.level = fresh.level ?? usage.level
+        if fresh.quotaError == nil {
+            usage.level = fresh.level
+            planLevelLastOK = now
+        }
         updateUI()
         if quotaGate.finish() { performQuotaRefresh() }
     }
 
     private func performRefresh(tokens: Bool) {
-        guard let key = CredStore.loadApiKey() else {
+        let currentKey = CredStore.loadApiKey()
+        bindPlanCredential(currentKey)
+        guard let key = currentKey else {
             var failed = UsageData()
             let error = "未找到 ZCode 凭证（~/.zcode/v2/credentials.json）"
             failed.quotaError = error
@@ -2676,6 +2786,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
+            guard self.planCredentialMatches(key) else {
+                self.updateUI()
+                _ = self.refreshGate.finish()
+                self.refresh(tokens: true, manual: true)
+                return
+            }
             self.finishRefresh(accumulator.snapshot(), tokens: tokens)
         }
     }
@@ -3517,17 +3633,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         title.lineBreakMode = .byTruncatingTail; title.maximumNumberOfLines = 1
         title.setContentCompressionResistancePriority(.init(751), for: .horizontal)
         titleRow.addArrangedSubview(title)
-        if let planName = usage.subscription?.name, !planName.isEmpty {
-            let pillText = label(planName, size: 10, bold: true, color: .secondaryLabelColor)
+        let tier = GLMPlanTier.resolve(subscription: usage.subscription,
+            subscriptionFresh: !subscriptionStale && subscriptionLastOK != nil && (usage.subscription?.expireDate.map { $0 > Date() } ?? true),
+            level: usage.level, levelFresh: !isStale(planLevelLastOK, hasData: usage.level != nil, after: quotaStaleAfter) && planLevelLastOK != nil)
+        if let planName = tier.title {
+            let pillText = label(planName, size: 10, bold: true, color: tier.foreground)
             pillText.lineBreakMode = .byTruncatingTail; pillText.maximumNumberOfLines = 1
             pillText.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
             let pill = GLMPillBackground(); pill.translatesAutoresizingMaskIntoConstraints = false
+            pill.radius = 9; pill.planTier = tier; pill.toolTip = usage.subscription?.name ?? planName
             pill.addSubview(pillText); pillText.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
-                pillText.topAnchor.constraint(equalTo: pill.topAnchor, constant: 2), pillText.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -2),
-                pillText.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 6), pillText.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -6)])
-            // 超长套餐名截断在 badge 内：上限保证「GLM 用量」标题至少保留可读宽度（≈标题全宽），
-            // title(751) > pillText(750)，两者都超宽时先截 badge，再截标题，绝不溢出容器
+                pill.heightAnchor.constraint(equalToConstant: 18),
+                pillText.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+                pillText.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 7), pillText.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -7)])
             pill.setContentCompressionResistancePriority(.required, for: .horizontal)
             pill.setContentHuggingPriority(.required, for: .horizontal)
             pill.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 44 - 70).isActive = true
@@ -4477,6 +4596,45 @@ enum GLMOfflineRegression {
                 .write(to: URL(fileURLWithPath: storeDir + "/pending-resets.json"))
             try expect(GLMPendingResetStore.load(dir: storeDir, now: now).isEmpty,
                        "corrupt pending reset store was not rejected safely")
+
+            // 身份识别只接受明确名称；订阅优先，未知或过期数据安全回退。
+            let tiers: [(String, GLMPlanTier)] = [("Free", .free), ("Start", .trial), ("Trial", .trial),
+                ("V1 Lite", .lite), ("V2 Lite", .lite), ("V1 Pro", .pro), ("V2 Pro", .pro),
+                ("V1 Max", .max), ("V2 Max", .max), (" lite ", .lite), ("PRO", .pro),
+                ("GLM Coding Max", .max), ("GLM Coding Team Standard", .teamStandard),
+                ("GLM Coding Team Advanced", .teamAdvanced)]
+            for (name, expected) in tiers {
+                try expect(GLMPlanTier.subscription(name) == expected && expected.title != nil, "plan mapping failed: \(name)")
+            }
+            let planColors: [(GLMPlanTier, Int, Int, Int)] = [(.free, 148, 155, 166), (.trial, 22, 166, 161),
+                (.lite, 40, 135, 232), (.pro, 139, 92, 246), (.max, 226, 162, 58),
+                (.teamStandard, 226, 162, 58), (.teamAdvanced, 228, 107, 69)]
+            for (tier, red, green, blue) in planColors {
+                let color = tier.theme.usingColorSpace(.sRGB)!
+                try expect(Int((color.redComponent * 255).rounded()) == red && Int((color.greenComponent * 255).rounded()) == green
+                    && Int((color.blueComponent * 255).rounded()) == blue, "incorrect plan color")
+            }
+            try expect(GLMPlanTier.subscription(nil) == .unknown && GLMPlanTier.subscription("") == .unknown,
+                       "missing subscription inferred as free")
+            try expect(GLMPlanTier.subscription("Team Pro") == .unknown && GLMPlanTier.subscription("GLM Coding Pro Plus") == .unknown,
+                       "ambiguous name mapped to a plan")
+            try expect(GLMPlanTier.quota("MAX") == .max && GLMPlanTier.quota("team standard") == .unknown,
+                       "quota level mapping accepted an unsupported tier")
+            let proSub = SubscriptionInfo(name: "GLM Coding Pro", expireDate: nil)
+            try expect(GLMPlanTier.resolve(subscription: proSub, subscriptionFresh: true, level: "max", levelFresh: true) == .pro,
+                       "subscription did not take precedence")
+            try expect(GLMPlanTier.resolve(subscription: proSub, subscriptionFresh: false, level: "max", levelFresh: true) == .max,
+                       "stale subscription did not fall back to quota")
+            try expect(GLMPlanTier.resolve(subscription: proSub, subscriptionFresh: false, level: "max", levelFresh: false) == .unknown,
+                       "stale plan data remained visible")
+            let ambiguous = Fetcher.parseSubscription([["status": "VALID", "productName": "Pro"], ["status": "VALID", "productName": "Max"]])
+            try expect(ambiguous.0 == nil && ambiguous.1 != nil, "ambiguous subscriptions selected arbitrarily")
+            let chosen = Fetcher.parseSubscription([["status": "VALID", "productName": "Pro", "inCurrentPeriod": 0],
+                ["status": "VALID", "productName": "Max", "inCurrentPeriod": 1]])
+            try expect(chosen.0?.name == "Max", "current subscription was not selected")
+            let unknownTier = GLMPlanTier.resolve(subscription: SubscriptionInfo(name: "Mystery", expireDate: nil),
+                subscriptionFresh: true, level: nil, levelFresh: true)
+            try expect(unknownTier.title == nil, "unknown tier became visible")
 
             let emptySubscription = Fetcher.parseSubscription([["status": "EXPIRED", "productName": "Old"]])
             try expect(emptySubscription.0 == nil && emptySubscription.1 == nil, "no active subscription must be a successful empty result")
