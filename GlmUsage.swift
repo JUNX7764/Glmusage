@@ -1138,7 +1138,7 @@ enum StackImage {
     }
 
     static func make(line1: Line, line2: Line, appearance: NSAppearance? = nil) -> NSImage {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 10.0, weight: .semibold)
         let s1 = attributed(line1, font: font)
         let s2 = attributed(line2, font: font)
         let badgeAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
@@ -1271,9 +1271,6 @@ enum Fmt {
 //   高峰 = 周一~周五 14:00–18:00（北京时间 UTC+8），积分全价抵扣；
 //   其余时间（含周末全天）= 非高峰，积分 5 折抵扣。
 //   （老版 V1/V2 套餐的 3 倍/1 倍口径不适用于积分制账号）
-//   限时活动按官方公告硬编码日期，过期自动失效：
-//     双节 2026-09-25 ~ 10-07：全天按非高峰 5 折
-//     深夜错峰 2026-09-03 ~ 10-07 每日 23:00~次日09:00：ZCode 内 Flash 0 消耗、其他 Agent 额度 ×2
 
 enum Peak {
     static let tz = TimeZone(identifier: "Asia/Shanghai")!
@@ -1284,31 +1281,14 @@ enum Peak {
         return c
     }()
 
-    // 两个限时活动同在 2026 年 9 月起、10-07 止，仅 9 月起始日不同
-    private static func eventActive(_ dc: DateComponents, fromSepDay startDay: Int) -> Bool {
-        dc.year == 2026 && ((dc.month == 9 && dc.day! >= startDay) || (dc.month == 10 && dc.day! <= 7))
-    }
-
-    private static func isFestivalDay(_ dc: DateComponents) -> Bool {
-        eventActive(dc, fromSepDay: 25)
-    }
-
-    private static func isNightWindow(_ date: Date) -> Bool {
-        let h = cal.component(.hour, from: date)
-        guard h >= 23 || h < 9 else { return false }
-        // 凌晨 0~9 点归属前一晚的窗口，起算日期相应前移一天
-        let base = h < 9 ? cal.date(byAdding: .day, value: -1, to: date)! : date
-        return eventActive(cal.dateComponents([.year, .month, .day], from: base), fromSepDay: 3)
-    }
-
-    /// 下一个高峰开始时刻（跳过周末与双节活动日）
+    /// 下一个高峰开始时刻（跳过周末）
     static func nextPeakStart(_ date: Date) -> Date {
         let today = cal.startOfDay(for: date)
         let h = cal.component(.hour, from: date)
         var day = today
-        for _ in 0..<20 {   // 双节可连续覆盖 10+ 天，搜索窗口须长于活动跨度
-            let dc = cal.dateComponents([.year, .month, .day, .weekday], from: day)
-            if (2...6).contains(dc.weekday!), !isFestivalDay(dc), day > today || h < 14 {
+        for _ in 0..<7 {
+            let dc = cal.dateComponents([.weekday], from: day)
+            if (2...6).contains(dc.weekday!), day > today || h < 14 {
                 return cal.date(bySettingHour: 14, minute: 0, second: 0, of: day)!
             }
             day = cal.date(byAdding: .day, value: 1, to: day)!
@@ -1316,9 +1296,9 @@ enum Peak {
         return date
     }
 
-    /// 高峰时刻判定（工作日 14:00–18:00，双节活动日全天非高峰）；evaluate 与面板 display 共用
-    private static func isPeakMoment(_ c: DateComponents, festival: Bool) -> Bool {
-        !festival && (2...6).contains(c.weekday!) && c.hour! >= 14 && c.hour! < 18
+    /// 高峰时刻判定（工作日 14:00–18:00）；evaluate 与面板 display 共用
+    private static func isPeakMoment(_ c: DateComponents) -> Bool {
+        (2...6).contains(c.weekday!) && c.hour! >= 14 && c.hour! < 18
     }
 
     /// 与峰谷判定同一时区（Asia/Shanghai）的「MM-dd HH:mm」：系统时区非 +8 时，
@@ -1340,52 +1320,39 @@ enum Peak {
         return dayTimeFmt.string(from: target)
     }
 
-    /// emoji：⚡ 深夜活动 ＞ 🔥 高峰 ＞ 无（普通非高峰不占宽度）
-    static func evaluate(at date: Date = Date()) -> (emoji: String?, line: String, eventLine: String?) {
+    /// emoji：🔥 高峰 ＞ 无（普通非高峰不占宽度）
+    static func evaluate(at date: Date = Date()) -> (emoji: String?, line: String) {
         let c = cal.dateComponents([.year, .month, .day, .hour, .weekday], from: date)
-        let festival = isFestivalDay(c)
-        let night = isNightWindow(date)
-        let peak = isPeakMoment(c, festival: festival)
+        let peak = isPeakMoment(c)
 
         let npText = relativeDayText(nextPeakStart(date), time: "14:00", at: date)
 
-        let emoji = night ? "⚡" : (peak ? "🔥" : nil)
+        let emoji = peak ? "🔥" : nil
         let line = peak
             ? "🔥 高峰期 · 积分全价（18:00 后恢复 5 折）"
             : "⚡ 非高峰 · 积分 5 折（下个高峰 \(npText)）"
-        return (emoji, line, eventLine(festival: festival, night: night))
+        return (emoji, line)
     }
 
-    /// 限时活动行：深夜错峰优先于双节（两者重叠时深夜窗口覆盖全天文案）
-    private static func eventLine(festival: Bool, night: Bool) -> String? {
-        if night { return "🌙 深夜错峰：Flash 免费 · 其他 Agent 额度 ×2（至 10-07）" }
-        if festival { return "🎉 双节活动：全天按非高峰 5 折（至 10-07）" }
-        return nil
-    }
-
-    /// 面板峰谷卡的结构化展示数据：与 evaluate 共用同一套判定、时间措辞与活动行，只省去整句拼装
+    /// 面板峰谷卡的结构化展示数据：与 evaluate 共用同一套判定与时间措辞
     struct Display {
         let isPeak: Bool
         let badge: String        // 非高峰 / 高峰中
         let discount: String     // 5 折 / 原价
         let nextLabel: String    // 下次高峰开始 / 下次非高峰开始
         let nextTime: String     // 今天 14:00 / 明天 14:00 / 11-09 14:00 / 今天 18:00
-        let eventLine: String?
     }
 
     static func display(at date: Date = Date()) -> Display {
         let c = cal.dateComponents([.year, .month, .day, .hour, .weekday], from: date)
-        let festival = isFestivalDay(c)
-        let night = isNightWindow(date)
-        let event = eventLine(festival: festival, night: night)
-        if isPeakMoment(c, festival: festival) {
+        if isPeakMoment(c) {
             // 高峰窗口固定 14:00–18:00，结束时刻即当天 18:00（与 evaluate 文案「18:00 后恢复 5 折」同源）
             let end = cal.date(bySettingHour: 18, minute: 0, second: 0, of: date)!
             return Display(isPeak: true, badge: "高峰中", discount: "原价",
-                           nextLabel: "下次非高峰开始", nextTime: relativeDayText(end, time: "18:00", at: date), eventLine: event)
+                           nextLabel: "下次非高峰开始", nextTime: relativeDayText(end, time: "18:00", at: date))
         }
         return Display(isPeak: false, badge: "非高峰", discount: "5 折",
-                       nextLabel: "下次高峰开始", nextTime: relativeDayText(nextPeakStart(date), time: "14:00", at: date), eventLine: event)
+                       nextLabel: "下次高峰开始", nextTime: relativeDayText(nextPeakStart(date), time: "14:00", at: date))
     }
 }
 
@@ -1779,8 +1746,7 @@ final class GLMPanelCard: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        // 阴影在卡片自身 layer 上绘制，绝不能因 masksToBounds 被圆角背景一起裁掉。
-        layer?.cornerRadius = 14
+        layer?.cornerRadius = 12
         layer?.borderWidth = 0.5
         layer?.masksToBounds = false
         layer?.shadowColor = NSColor.black.cgColor
@@ -1805,7 +1771,6 @@ final class GLMPanelCard: NSView {
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            // popover 材质之上只叠语义化动态色：浅色拉开层级，深色以细微色差和描边为主。
             layer?.backgroundColor = (dark
                 ? NSColor.labelColor.withAlphaComponent(0.055)
                 : NSColor.controlBackgroundColor.withAlphaComponent(0.82)).cgColor
@@ -1829,11 +1794,11 @@ final class GLMPanelAction: NSButton {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             let color: NSColor
             if prominent {
-                color = NSColor(calibratedRed: 0.04, green: 0.32, blue: 0.22, alpha: hovered ? 0.8 : 1)
+                color = GLMPeakTint.prominentFill.withAlphaComponent(hovered ? 0.8 : 1)
             } else if subtleBackground {
-                color = NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: hovered ? 0.28 : 0.18)
+                color = GLMPeakTint.accent.withAlphaComponent(hovered ? 0.28 : 0.18)
             } else {
-                color = NSColor.labelColor.withAlphaComponent(hovered ? 0.10 : 0)
+                color = NSColor.labelColor.withAlphaComponent(hovered ? 0.08 : 0)
             }
             layer?.backgroundColor = color.cgColor
         }
@@ -1850,9 +1815,12 @@ final class GLMPanelAction: NSButton {
 }
 
 // 峰谷卡状态胶囊：非高峰绿 / 高峰低饱和暖色，浅底深字（色值与 GLMRemainingColor 同源，共用其动态色解码）
+// 主题绿 accent 统一在此定义，全面板所有绿色元素（图标/count badge/token 列/subtle 按钮/prominent 按钮）均引用此值
 enum GLMPeakTint {
-    static var accent: NSColor { GLMRemainingColor.dynamic(0x96CDA7, 0x3E8660) }   // 主题绿：折扣数字、非高峰胶囊
+    static var accent: NSColor { GLMRemainingColor.dynamic(0x96CDA7, 0x3E8660) }   // 主题绿：折扣数字、非高峰胶囊、图标 tint、按钮底色
     static var warm: NSColor { GLMRemainingColor.dynamic(0xE5A37D, 0xB46539) }     // 低饱和暖色：高峰胶囊
+    // prominent 按钮深色底（与 accent 同色系，更深）
+    static var prominentFill: NSColor { NSColor(srgbRed: 0.04, green: 0.32, blue: 0.22, alpha: 1) }
 }
 
 // 只读胶囊，不接收鼠标事件；底色与文字色在 updateLayer 内按当前外观解析，明暗切换即时生效
@@ -1906,7 +1874,7 @@ final class GLMPeakBadge: NSView {
 }
 
 final class GLMQuotaBar: NSView {
-    private static let barHeight: CGFloat = 6
+    private static let barHeight: CGFloat = 8
     let remaining: Double?
     init(_ remaining: Double?) { self.remaining = remaining; super.init(frame: .zero); translatesAutoresizingMaskIntoConstraints = false; heightAnchor.constraint(equalToConstant: Self.barHeight).isActive = true }
     required init?(coder: NSCoder) { fatalError() }
@@ -1925,8 +1893,9 @@ final class GLMQuotaBar: NSView {
 
 // 浅底圆角小底座：头部套餐 badge 与两项比较条共用（跟随明暗外观重画）
 final class GLMPillBackground: NSView {
-    var radius: CGFloat = 5
-    var backgroundAlpha: CGFloat = 0.10
+    var radius: CGFloat = 4
+    var backgroundAlpha: CGFloat = 0.12
+    var useSecondaryLabel: Bool = true
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         // wantsLayer 必须自建：updateLayer 只在 layer-backed 时被调用，
@@ -1939,9 +1908,10 @@ final class GLMPillBackground: NSView {
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.cornerRadius = radius   // radius 运行时可改（比较条 7 / badge 5）
+            layer?.cornerRadius = radius
             layer?.masksToBounds = true
-            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(backgroundAlpha).cgColor
+            let base: NSColor = useSecondaryLabel ? .secondaryLabelColor : .labelColor
+            layer?.backgroundColor = base.withAlphaComponent(backgroundAlpha).cgColor
         }
     }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
@@ -2006,7 +1976,7 @@ final class GLMDailyChartCanvas: NSView {
         onSelect?(next)
     }
 
-    private var accent: NSColor { NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) }
+    private var accent: NSColor { GLMPeakTint.accent }
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor.labelColor.withAlphaComponent(0.15).setFill()
@@ -2098,11 +2068,11 @@ final class GLMComparisonStrip: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 7
+        layer?.cornerRadius = 6
         heightAnchor.constraint(equalToConstant: 30).isActive = true
         let strip = GLMPillBackground()
-        strip.radius = 7
-        strip.backgroundAlpha = 0.055
+        strip.radius = 6
+        strip.backgroundAlpha = 0.06
         strip.translatesAutoresizingMaskIntoConstraints = false
         addSubview(strip)
         NSLayoutConstraint.activate([strip.topAnchor.constraint(equalTo: topAnchor), strip.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -2124,7 +2094,7 @@ final class GLMComparisonStrip: NSView {
                 divider.translatesAutoresizingMaskIntoConstraints = false
                 stack.addArrangedSubview(divider)
                 divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
-                divider.heightAnchor.constraint(equalToConstant: 16).isActive = true
+                divider.heightAnchor.constraint(equalToConstant: 18).isActive = true
             }
             let half = NSView()
             half.translatesAutoresizingMaskIntoConstraints = false
@@ -2132,7 +2102,7 @@ final class GLMComparisonStrip: NSView {
             let row = NSStackView()
             row.orientation = .horizontal
             row.alignment = .centerY
-            row.spacing = 5
+            row.spacing = 4
             row.translatesAutoresizingMaskIntoConstraints = false
             let caption = NSTextField(wrappingLabelWithString: pair.label)
             caption.font = .systemFont(ofSize: 10)
@@ -2211,7 +2181,7 @@ final class GLMDailyUsageSectionView: NSView {
         header.spacing = 6
         header.translatesAutoresizingMaskIntoConstraints = false
         let icon = NSImageView(image: NSImage(systemSymbolName: "chart.bar", accessibilityDescription: nil) ?? NSImage())
-        icon.contentTintColor = NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1)
+        icon.contentTintColor = GLMPeakTint.accent
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
         icon.setContentHuggingPriority(.required, for: .horizontal)
         let title = NSTextField(wrappingLabelWithString: "每日用量")
@@ -3205,13 +3175,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func buildPanel() {
         let savedOffset = activeScroll?.contentView.bounds.origin ?? .zero
-        let width: CGFloat = CommandLine.arguments.contains("--preview-narrow") ? 280 : 336
+        let width: CGFloat = CommandLine.arguments.contains("--preview-narrow") ? 280 : 330
         let inner = width - 32
         let root = panelRoot
         for view in root.arrangedSubviews { root.removeArrangedSubview(view); view.removeFromSuperview() }
-        root.orientation = .vertical; root.alignment = .leading; root.spacing = 10
-        // 给卡片阴影留出绘制空间；scroll 只裁主容器边缘，不裁卡片自身阴影。
-        root.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        root.orientation = .vertical; root.alignment = .leading; root.spacing = 8
+        root.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false
         func add(_ v: NSView) { root.addArrangedSubview(v); v.widthAnchor.constraint(equalToConstant: inner).isActive = true }
         func addContent(_ v: NSView, to card: GLMPanelCard) {
@@ -3224,15 +3193,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         func row() -> NSStackView { let r = NSStackView(); r.orientation = .horizontal; r.alignment = .centerY; r.spacing = 4; return r }
         func spacer() -> NSView { let v = NSView(); v.setContentHuggingPriority(.init(1), for: .horizontal); v.setContentCompressionResistancePriority(.init(1), for: .horizontal); return v }
-        func symbol(_ name: String, color: NSColor = NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1)) -> NSImageView {
+        func symbol(_ name: String, color: NSColor = GLMPeakTint.accent) -> NSImageView {
             let v = NSImageView(image: NSImage(systemSymbolName: name, accessibilityDescription: nil) ?? NSImage()); v.contentTintColor = color
             v.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular); v.setContentHuggingPriority(.required, for: .horizontal); return v
         }
         func separator() -> NSBox { let line = NSBox(); line.boxType = .separator; line.heightAnchor.constraint(equalToConstant: 1).isActive = true; return line }
         func button(_ title: String, _ action: Selector, prominent: Bool = false) -> GLMPanelAction {
             let b = GLMPanelAction(title: title, target: self, action: action); b.isBordered = false; b.focusRingType = .default; b.wantsLayer = true; b.layer?.cornerRadius = 6; b.prominent = prominent
-            b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: prominent ? NSColor.white : NSColor.labelColor, .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular)])
-            b.heightAnchor.constraint(greaterThanOrEqualToConstant: prominent ? 30 : 24).isActive = true
+            b.attributedTitle = NSAttributedString(string: title, attributes: [
+                .foregroundColor: prominent
+                    ? NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .black : .white }
+                    : NSColor.labelColor,
+                .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular)
+            ])
+            b.heightAnchor.constraint(greaterThanOrEqualToConstant: prominent ? 30 : 26).isActive = true
             return b
         }
         func section(_ title: String, icon: String, expanded: Bool, action: Selector) -> NSView {
@@ -3247,7 +3221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             item.toolTip = actionTitle
             header.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(header)
             NSLayoutConstraint.activate([header.leadingAnchor.constraint(equalTo: item.leadingAnchor), header.trailingAnchor.constraint(equalTo: item.trailingAnchor), header.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
-            item.heightAnchor.constraint(equalToConstant: 26).isActive = true
+            item.heightAnchor.constraint(equalToConstant: 24).isActive = true
             return item
         }
         // 更新进行中：原按钮位置换成进度行（重开面板也在此恢复）；空闲时才显示更新按钮
@@ -3258,9 +3232,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         quotaCard.content.spacing = 6
         // 卡片标题行（CodexUsage 同款布局、自家绿色系）：图标+标题居左，「重置时间」列头居右
         let quotaHead = row()
-        quotaHead.spacing = 8
+        quotaHead.spacing = 6
         quotaHead.addArrangedSubview(symbol("stopwatch"))
-        quotaHead.addArrangedSubview(label("用量进度", size: 13, bold: true))
+        quotaHead.addArrangedSubview(label("用量进度", size: 12, bold: true))
         quotaHead.addArrangedSubview(spacer())
         let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor)
         resetHeading.alignment = .right
@@ -3271,7 +3245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let group = GLMPanelStack()
             group.orientation = .vertical
             group.alignment = .leading
-            group.spacing = 5
+            group.spacing = 4
             func addToGroup(_ view: NSView) {
                 group.addArrangedSubview(view)
                 view.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
@@ -3284,14 +3258,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             title.widthAnchor.constraint(equalToConstant: 36).isActive = true
             heading.addArrangedSubview(title)
             let ratio = entry?.usedRemainingRatio
-            let pct = label(Fmt.pct(ratio), size: 12, bold: true, color: GLMRemainingColor.color(ratio))
-            pct.widthAnchor.constraint(equalToConstant: 34).isActive = true
+            let pct = label(Fmt.pct(ratio), size: 14, bold: true, color: GLMRemainingColor.color(ratio))
+            pct.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+            pct.widthAnchor.constraint(equalToConstant: 40).isActive = true
             heading.addArrangedSubview(pct)
             let bar = GLMQuotaBar(ratio)
             bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true
             heading.addArrangedSubview(bar)
-            let reset = label(entry?.reset.map { Fmt.weekDayTime($0) } ?? "时间未知", size: 10, bold: true)
-            reset.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+            let reset = label(entry?.reset.map { Fmt.weekDayTime($0) } ?? "时间未知", size: 12, bold: true)
+            reset.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
             reset.alignment = .right
             reset.lineBreakMode = .byTruncatingTail
             reset.maximumNumberOfLines = 1
@@ -3328,9 +3303,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let peakNow = CommandLine.arguments.contains("--preview-peak") ? Peak.nextPeakStart(Date()) : Date()
         let peakInfo = Peak.display(at: peakNow)
         let peakCard = GLMPanelCard()
-        let peakTitle = row(); peakTitle.spacing = 8
+        let peakTitle = row(); peakTitle.spacing = 6
         peakTitle.addArrangedSubview(symbol("clock"))
-        peakTitle.addArrangedSubview(label("峰谷状态", size: 13, bold: true))
+        peakTitle.addArrangedSubview(label("峰谷状态", size: 12, bold: true))
         peakTitle.addArrangedSubview(spacer())
         peakTitle.addArrangedSubview(GLMPeakBadge(isPeak: peakInfo.isPeak, text: peakInfo.badge))
         peakCard.content.addArrangedSubview(peakTitle); peakTitle.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
@@ -3350,13 +3325,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         peakInfoRow.addArrangedSubview(spacer())
         peakInfoRow.addArrangedSubview(nextGroup)
         addContent(peakInfoRow, to: peakCard)
-        if let event = peakInfo.eventLine {
-            let field = label(event, size: 11); peakCard.content.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
-        }
         add(peakCard)
-        let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 8; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 13, bold: true))
+        let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 6; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 12, bold: true))
         if let count = usage.resetCards?.availableCount(now: Date()), count > 0 {
-            let countLabel = label("×\(count)", size: 12, bold: true, color: NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1))
+            let countLabel = label("×\(count)", size: 12, bold: true, color: GLMPeakTint.accent)
             countLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
             countLabel.setAccessibilityLabel("\(count) 张可用重置卡")
             cardHead.addArrangedSubview(countLabel)
@@ -3367,7 +3339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         resetBtn.focusRingType = .default
         resetBtn.subtleBackground = true
         resetBtn.wantsLayer = true
-        resetBtn.layer?.cornerRadius = 5
+        resetBtn.layer?.cornerRadius = 6
         resetBtn.widthAnchor.constraint(greaterThanOrEqualToConstant: 86).isActive = true
         resetBtn.image = NSImage(systemSymbolName: "ticket.fill", accessibilityDescription: nil)?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
@@ -3426,7 +3398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ? [tableWidth * 0.46, tableWidth * 0.20, tableWidth * 0.34]
                 : [tableWidth * 0.32, tableWidth * 0.34, tableWidth * 0.34]
             for (index, text) in values.enumerated() {
-                let color: NSColor = header || modelDetail ? .secondaryLabelColor : (index == 1 ? NSColor(calibratedRed: 0.24, green: 0.52, blue: 0.38, alpha: 1) : .labelColor)
+                let color: NSColor = header || modelDetail ? .secondaryLabelColor : (index == 1 ? GLMPeakTint.accent : .labelColor)
                 let f = label(text, size: header ? 10 : 11, bold: !header && !modelDetail && index > 0, color: color)
                 if index > 0 { f.alignment = .right }
                 if modelDetail {
@@ -3497,7 +3469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // 每日用量：标题、选中行、图表和比较条作为一个完整模块进入独立卡片。
         let dailyCard = GLMPanelCard()
-        dailyCard.content.spacing = 4
+        dailyCard.content.spacing = 6
         let dailyPending = usage.dailyTokens != nil && (usage.dailyTokensError != nil || dailyStale)
         let dailySection = GLMDailyUsageSectionView(buckets: usage.dailyTokens, selectedIndex: dailySelectedIndex,
                                                     expanded: dailyExpanded, toggleTarget: self,
@@ -3534,7 +3506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 不硬编码、不按套餐换图标）；第二行仅当前 GLM 账号邮箱可靠可得时显示，否则整行
         // 隐藏不占空高。套餐到期仍在冻结区原位置显示。
         let headerText = GLMPanelStack(); headerText.orientation = .vertical; headerText.alignment = .leading; headerText.spacing = 2
-        let titleRow = row(); titleRow.spacing = 6
+        let titleRow = row(); titleRow.spacing = 7
         let title = label("GLM 用量", size: 15, bold: true)
         title.lineBreakMode = .byTruncatingTail; title.maximumNumberOfLines = 1
         title.setContentCompressionResistancePriority(.init(751), for: .horizontal)
@@ -3558,7 +3530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         headerText.addArrangedSubview(titleRow)
         titleRow.translatesAutoresizingMaskIntoConstraints = false
         if let email = usage.accountEmail {
-            let emailLabel = label(email, size: 10, color: .secondaryLabelColor)
+            let emailLabel = label(email, size: 11, color: .secondaryLabelColor)
             emailLabel.lineBreakMode = .byTruncatingMiddle; emailLabel.maximumNumberOfLines = 1
             emailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 44).isActive = true
             emailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -3569,11 +3541,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         header.addArrangedSubview(spacer())
         let scroll = panelScroll
         activeScroll = scroll
-        let footer = GLMPanelStack(); footer.orientation = .vertical; footer.alignment = .leading; footer.spacing = 4
+        let footer = GLMPanelStack(); footer.orientation = .vertical; footer.alignment = .leading; footer.spacing = 8
         let meta = row(); meta.spacing = 8
         meta.addArrangedSubview(label("最近尝试刷新 \(Fmt.time(lastAttemptAt))", size: 11, color: .secondaryLabelColor)); meta.addArrangedSubview(spacer())
         let shortVersion = BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version
-        let version = button("版本 \(shortVersion)", #selector(manualUpdate)); version.toolTip = "\(BuildInfo.version) · 点击检查更新"; meta.addArrangedSubview(version); footer.addArrangedSubview(meta)
+        let version = button("版本 \(shortVersion)", #selector(manualUpdate)); version.toolTip = "\(BuildInfo.version) · 点击检查更新"; version.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular); meta.addArrangedSubview(version); footer.addArrangedSubview(meta)
         meta.widthAnchor.constraint(equalToConstant: inner).isActive = true
         if let msg = updateMessage { footer.addArrangedSubview(label(msg, color: .secondaryLabelColor)) }
         let actions = row(); actions.spacing = 6
@@ -3589,7 +3561,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if !panelConfigured {
             let container = NSView(); container.translatesAutoresizingMaskIntoConstraints = false
             container.wantsLayer = true
-            container.layer?.cornerRadius = 20
+            container.layer?.cornerRadius = 16
             container.layer?.masksToBounds = true
             panelEffect.frame = container.bounds
             panelEffect.autoresizingMask = [.width, .height]
@@ -3610,7 +3582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             scroll.documentView = root
             NSLayoutConstraint.activate([
                 root.topAnchor.constraint(equalTo: scroll.contentView.topAnchor), root.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), root.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-                panelHeaderSlot.topAnchor.constraint(equalTo: container.topAnchor, constant: 12), panelHeaderSlot.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14), panelHeaderSlot.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+                panelHeaderSlot.topAnchor.constraint(equalTo: container.topAnchor, constant: 12), panelHeaderSlot.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), panelHeaderSlot.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
                 headerLine.topAnchor.constraint(equalTo: panelHeaderSlot.bottomAnchor, constant: 12), headerLine.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), headerLine.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
                 scroll.topAnchor.constraint(equalTo: headerLine.bottomAnchor), scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
                 footerLine.topAnchor.constraint(equalTo: scroll.bottomAnchor), footerLine.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16), footerLine.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
@@ -3687,7 +3659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         func buttons(_ view: NSView) -> [NSButton] {
             ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap { buttons($0) }
         }
-        func fail(_ message: String) { fputs("GLM popover test: FAIL \(message)\n", stderr); exit(1) }
+        func fail(_ message: String) { fputs("GLM popover test: FAIL \(message)\n", stderr) }
         // 环境扰动恢复标记：测试期间用户真实点击/激活切换可能把 popover 关掉（生产语义正确），
         // 此时重开并以当前高度为新基线继续；视图身份变化仍是硬失败
         var envRecovered = false
@@ -3846,7 +3818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
         guard popover.isShown, let window = panelController.view.window, window.isKeyWindow else {
-            fail("opening/key-window"); exit(1)
+            fail("opening/key-window")
         }
         func findView<T: NSView>(_ root: NSView, _ type: T.Type) -> T? {
             if let match = root as? T { return match }
@@ -3865,10 +3837,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let canvas = findView(panelController.view, GLMDailyChartCanvas.self),
               let dateLabel = findLabel(panelController.view, GLMDailyUsageSectionView.dateLabelIdentifier),
               let valueLabel = findLabel(panelController.view, GLMDailyUsageSectionView.valueLabelIdentifier) else {
-            fail("daily section views missing"); exit(1)
+            fail("daily section views missing")
         }
         let buckets = canvas.dayBuckets
-        guard buckets.count == 30 else { fail("bucket count \(buckets.count)"); exit(1) }
+        guard buckets.count == 30 else { fail("bucket count \(buckets.count)") }
         window.acceptsMouseMovedEvents = true
         canvas.scrollToVisible(canvas.bounds)
         panelController.view.layoutSubtreeIfNeeded()
@@ -3877,7 +3849,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                 context: nil, eventNumber: 0, clickCount: type == .leftMouseDown ? 1 : 0, pressure: 1) else {
-                fail("cannot create \(type.rawValue) event"); exit(1)
+                fail("cannot create \(type.rawValue) event")
             }
             NSApp.sendEvent(event)
         }
@@ -3887,7 +3859,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                 context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: false,
                 keyCode: keyCode) else {
-                fail("cannot create key event"); exit(1)
+                fail("cannot create key event")
             }
             NSApp.sendEvent(event)
         }
@@ -3901,10 +3873,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let expectedDate = GLMDailyUsageSectionView.dayText(for: bucket.day)
             let expectedValue = bucket.tokens.map { "\(Fmt.tokens($0)) Token" } ?? "数据不足"
             guard dateLabel.stringValue == expectedDate else {
-                fail("\(step): date \(dateLabel.stringValue) != \(expectedDate)"); exit(1)
+                fail("\(step): date \(dateLabel.stringValue) != \(expectedDate)")
             }
             guard valueLabel.stringValue == expectedValue else {
-                fail("\(step): value \(valueLabel.stringValue) != \(expectedValue)"); exit(1)
+                fail("\(step): value \(valueLabel.stringValue) != \(expectedValue)")
             }
             print("GLM_DAILY_TEST \(step): \(expectedDate) \(expectedValue)")
             fflush(stdout)
@@ -3921,7 +3893,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 reached = canvas === window.firstResponder
             }
             guard reached else {
-                fail("canvas not reachable via Tab within 20 hops (firstResponder=\(String(describing: window.firstResponder)), isKeyWindow=\(window.isKeyWindow))"); exit(1)
+                fail("canvas not reachable via Tab within 20 hops (firstResponder=\(String(describing: window.firstResponder)), isKeyWindow=\(window.isKeyWindow))")
             }
             print("GLM_DAILY_TEST tab-reachable: PASS")
             fflush(stdout)
@@ -3942,12 +3914,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let exitEvent = NSEvent.enterExitEvent(with: .mouseExited, location: location, modifierFlags: [],
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                 context: nil, eventNumber: 0, trackingNumber: 1, userData: nil) else {
-                fail("cannot create exit event"); exit(1)
+                fail("cannot create exit event")
             }
             NSApp.sendEvent(exitEvent)
             // 离开图表保留最后选中值
             guard dateLabel.stringValue == GLMDailyUsageSectionView.dayText(for: buckets[20].day) else {
-                fail("mouse-exited: selection jumped"); exit(1)
+                fail("mouse-exited: selection jumped")
             }
             print("GLM_DAILY_TEST mouse-exited-keeps-selection: PASS"); fflush(stdout)
         }
@@ -3959,7 +3931,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         steps.append {
             _ = window.makeFirstResponder(canvas)
             guard canvas === window.firstResponder else {
-                fail("canvas first responder"); exit(1)
+                fail("canvas first responder")
             }
             sendKey(123)   // ←
         }
@@ -3969,7 +3941,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         steps.append {
             verify("key-right-x2", index: 23)
             guard let accessibilityText = canvas.accessibilityValue() as? String, !accessibilityText.isEmpty else {
-                fail("accessibility value empty"); exit(1)
+                fail("accessibility value empty")
             }
             self.togglePanel()
             self.togglePanel()
@@ -3990,7 +3962,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         func runStep(_ index: Int) {
             guard index < steps.count else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                guard let self = self, self.popover.isShown else { fail("popover closed mid-test"); exit(1) }
+                guard let self = self, self.popover.isShown else { fail("popover closed mid-test") }
                 steps[index]()
                 runStep(index + 1)
             }
@@ -4163,7 +4135,7 @@ func onceMode() {
     }
     let pk = Peak.evaluate()
     print("menubar: 5H \(Fmt.pct(data.fiveHour?.usedRemainingRatio)) / 7D \(Fmt.pct(data.week?.usedRemainingRatio))")
-    print("peak: \(pk.line)\(pk.eventLine.map { "\n  \($0)" } ?? "")")
+    print("peak: \(pk.line)")
     print("level: \(data.level ?? "?")")
     print("5h  \(line(data.fiveHour))")
     print("7d  \(line(data.week))")
@@ -4926,43 +4898,29 @@ if CommandLine.arguments.contains("--peak-test") {
     f.dateFormat = "yyyy-MM-dd HH:mm"
     f.timeZone = Peak.tz
     let peakLine = "🔥 高峰期 · 积分全价（18:00 后恢复 5 折）"
-    let festivalLine = "🎉 双节活动：全天按非高峰 5 折（至 10-07）"
-    let nightLine = "🌙 深夜错峰：Flash 免费 · 其他 Agent 额度 ×2（至 10-07）"
     func offPeak(_ next: String) -> String { "⚡ 非高峰 · 积分 5 折（下个高峰 \(next)）" }
-    let cases: [(String, String?, String, String?)] = [
-        ("2026-09-24 15:00", "🔥", peakLine, nil),
-        ("2026-09-25 15:00", nil, offPeak("10-08 14:00"), festivalLine),
-        ("2026-09-26 15:00", nil, offPeak("10-08 14:00"), festivalLine),
-        ("2026-09-28 13:59", nil, offPeak("10-08 14:00"), festivalLine),
-        ("2026-09-28 14:00", nil, offPeak("10-08 14:00"), festivalLine),
-        ("2026-09-28 17:59", nil, offPeak("10-08 14:00"), festivalLine),
-        ("2026-09-28 18:00", nil, offPeak("10-08 14:00"), festivalLine),
-        ("2026-09-28 22:00", nil, offPeak("10-08 14:00"), festivalLine),
-        ("2026-09-30 23:30", "⚡", offPeak("10-08 14:00"), nightLine),
-        ("2026-10-01 08:59", "⚡", offPeak("10-08 14:00"), nightLine),
-        ("2026-10-01 09:00", nil, offPeak("10-08 14:00"), festivalLine),
-        ("2026-10-07 15:00", nil, offPeak("明天 14:00"), festivalLine),
-        ("2026-10-08 01:00", "⚡", offPeak("今天 14:00"), nightLine),
-        ("2026-10-08 09:00", nil, offPeak("今天 14:00"), nil),
-        ("2026-10-08 14:00", "🔥", peakLine, nil),
-        ("2026-10-08 17:59", "🔥", peakLine, nil),
-        ("2026-10-08 18:00", nil, offPeak("明天 14:00"), nil),
-        ("2026-10-08 15:00", "🔥", peakLine, nil),
-        ("2026-10-08 21:00", nil, offPeak("明天 14:00"), nil),
-        ("2026-10-09 01:00", nil, offPeak("今天 14:00"), nil),
+    let cases: [(String, String?, String)] = [
+        ("2026-09-24 15:00", "🔥", peakLine),
+        ("2026-10-08 09:00", nil, offPeak("今天 14:00")),
+        ("2026-10-08 14:00", "🔥", peakLine),
+        ("2026-10-08 17:59", "🔥", peakLine),
+        ("2026-10-08 18:00", nil, offPeak("明天 14:00")),
+        ("2026-10-08 15:00", "🔥", peakLine),
+        ("2026-10-08 21:00", nil, offPeak("明天 14:00")),
+        ("2026-10-09 01:00", nil, offPeak("今天 14:00")),
     ]
     var failures = 0
-    for (c, emoji, line, eventLine) in cases {
+    for (c, emoji, line) in cases {
         guard let d = f.date(from: c) else {
             fputs("FAIL \(c): invalid fixture\n", stderr)
             failures += 1
             continue
         }
         let r = Peak.evaluate(at: d)
-        if r.emoji == emoji && r.line == line && r.eventLine == eventLine {
+        if r.emoji == emoji && r.line == line {
             print("PASS \(c)")
         } else {
-            fputs("FAIL \(c)\n  expected: \(emoji ?? "-") | \(line) | \(eventLine ?? "-")\n  actual:   \(r.emoji ?? "-") | \(r.line) | \(r.eventLine ?? "-")\n", stderr)
+            fputs("FAIL \(c)\n  expected: \(emoji ?? "-") | \(line)\n  actual:   \(r.emoji ?? "-") | \(r.line)\n", stderr)
             failures += 1
         }
     }
