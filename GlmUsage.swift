@@ -159,7 +159,6 @@ struct ModelUsage {
     var totalTokens: Double
     var totalCalls: Double
     var byModel: [(name: String, tokens: Double)]
-    var isEmpty: Bool { totalTokens == 0 && totalCalls == 0 }
 }
 
 /// Token 板块按模型明细：按用量降序、过滤 0，平局按名称排序保证稳定
@@ -167,14 +166,6 @@ enum TokenModelList {
     static func visible(_ models: [(name: String, tokens: Double)]) -> [(name: String, tokens: Double)] {
         models.filter { $0.tokens > 0 }
             .sorted { $0.tokens != $1.tokens ? $0.tokens > $1.tokens : $0.name < $1.name }
-    }
-
-    /// 旧式 NSMenu fallback 保留树形文本；主面板使用独立对齐的列。
-    static func render(_ models: [(name: String, tokens: Double)]) -> [String] {
-        let visible = visible(models)
-        return visible.enumerated().map { i, m in
-            (i == visible.count - 1 ? "└ " : "├ ") + "\(m.name) \(Fmt.tokens(m.tokens))"
-        }
     }
 }
 
@@ -587,7 +578,7 @@ struct UsageData {
     var tokensToday: ModelUsage?
     var tokens7d: ModelUsage?
     var tokens30d: ModelUsage?
-    var dailyTokens: [GLMDayBucket]?   // 每日用量：近 30 完整自然日桶（缺失日=nil≠0；未过真实接口 Gate 前生产恒为 nil）
+    var dailyTokens: [GLMDayBucket]?   // 每日用量：近 30 自然日桶含今日部分累计（缺失日=nil≠0；Gate 已于 2026-11-06 验收开启）
     var dailyTokensError: String?      // 仅用于 freshness 保留旧值，界面不显示技术错误
     var accountEmail: String?          // 头部可选邮箱（仅现有凭据内可靠可得；绝不写 status.json/日志）
     var tools30d: ToolUsage?
@@ -936,9 +927,10 @@ enum Fetcher {
     }
 
     /// 同一响应 → 每日桶。三分语义：
-    /// - buckets 非 nil：Gate 开启且解析/聚合成功；
-    /// - buckets nil + parseFailed=false：Gate 未确认（生产正常空态「暂不可用」，非错误、不提示待更新）；
-    /// - buckets nil + parseFailed=true：Gate 开启但响应无字段/解析失败 → 上层按失败保留旧值并给简短「待更新」，
+    /// - buckets 非 nil：解析/聚合成功；
+    /// - buckets nil + parseFailed=false：Gate 关闭时的正常空态「暂不可用」
+    ///   （Gate 已于 2026-11-06 验收开启，此分支当前不可达，保留作 Gate 翻转时的语义文档）；
+    /// - buckets nil + parseFailed=true：响应无字段/解析失败 → 上层按失败保留旧值并给简短「待更新」，
     ///   不得静默拿旧图冒充新数据，也不显示技术细节。
     static func dailyBuckets(from data: [String: Any], windowStart: Date, now: Date) -> (buckets: [GLMDayBucket]?, parseFailed: Bool) {
         guard GLMDailyUsage.productionGateConfirmed else { return (nil, false) }
@@ -2181,7 +2173,7 @@ final class GLMComparisonStrip: NSView {
             }
             let half = NSView()
             half.translatesAutoresizingMaskIntoConstraints = false
-            half.toolTip = index == 0 ? "最新完整日与前一日比较" : "最近 7 个完整日与此前 7 个完整日比较"
+            half.toolTip = index == 0 ? "今日（未结束）与前一日比较" : "最近 7 天（含今日）与此前 7 天比较"
             let row = NSStackView()
             row.orientation = .horizontal
             row.alignment = .centerY
@@ -2224,7 +2216,7 @@ final class GLMComparisonStrip: NSView {
 }
 
 // 「每日用量」整块：标题行 + 选中行 + 柱图 + 刻度 + 比较条。
-// buckets=nil（未过真实接口 Gate 或无数据）显示明确空态：暂不可用 + 两项数据不足，
+// buckets=nil（无数据）显示明确空态：暂不可用 + 两项数据不足，
 // 不画假柱、不补零、不写开发说明。
 final class GLMDailyUsageSectionView: NSView {
     static let dateLabelIdentifier = NSUserInterfaceItemIdentifier("GLMDailyDateLabel")
@@ -2845,7 +2837,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if refreshGate.finish() { performRefresh(tokens: true) }
     }
 
-    /// 菜单栏图标 + 下拉菜单的统一渲染入口；菜单打开期间延迟重建到关闭时
+    /// 菜单栏图标 + 面板的统一渲染入口（每次数据合并后调用）
     private func updateUI() {
         renderBar()
         rebuildPanel()
@@ -3000,7 +2992,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             "line1": line1,
             "line2": line2,
             "peak": peakLine,
-            "updatedAt": Fmt.iso8601.string(from: lastAttemptAt),
+            "updatedAt": Fmt.iso8601.string(from: now),
             "lastAttemptAt": Fmt.iso8601.string(from: lastAttemptAt),
             "version": BuildInfo.version,
             "updateAvailable": UpdateChecker.shared.available,
@@ -3255,8 +3247,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         } else if CommandLine.arguments.contains("--preview-updating") {
             UpdateProgressController.shared.simulateForPreview(phase: .downloading, fraction: 62)
         }
-        // 每日用量预览：合成 30 个完整自然日桶（今日未走完不进图，与生产 frame 规则一致）。
-        // 生产界面因真实接口 Gate 未确认恒为空态；预览仅展示目标体验，不代表接口已验证。
+        // 每日用量预览：合成 30 个自然日桶（今日部分累计进图，与生产 frame 规则一致）。
+        // 预览仅展示目标体验；生产数据来自真实接口（Gate 已于 2026-11-06 验收）。
         usage.dailyTokens = CommandLine.arguments.contains("--preview-daily-unavailable")
             ? nil : previewDailyBuckets()
         // 头部邮箱预览（假数据；生产邮箱只来自现有凭据库且不可得即隐藏）
