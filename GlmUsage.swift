@@ -3583,10 +3583,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let inner = width - 32
         let root = panelRoot
         for view in root.arrangedSubviews { root.removeArrangedSubview(view); view.removeFromSuperview() }
-        root.orientation = .vertical; root.alignment = .leading; root.spacing = 8
+        root.orientation = .vertical; root.alignment = .centerX; root.spacing = 8
         root.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false
-        func add(_ v: NSView) { root.addArrangedSubview(v); v.widthAnchor.constraint(equalToConstant: inner).isActive = true }
+        func add(_ v: NSView) { root.addArrangedSubview(v); v.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32).isActive = true }
         func addContent(_ v: NSView, to card: GLMPanelCard) {
             card.content.addArrangedSubview(v)
             v.widthAnchor.constraint(equalTo: card.content.widthAnchor).isActive = true
@@ -4587,6 +4587,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let scroll = view as? NSScrollView, scroll.documentView is NSTextView { return scroll }
             for child in view.subviews { if let result = textScroll(child) { return result } }; return nil
         }
+        panelController.view.layoutSubtreeIfNeeded()
+        panelScroll.layoutSubtreeIfNeeded()
+        let cards = panelRoot.arrangedSubviews.compactMap { $0 as? GLMPanelCard }
+        guard !cards.isEmpty else { fail("missing cards") }
+        for card in cards {
+            let frame = panelController.view.convert(card.bounds, from: card)
+            let left = frame.minX
+            let right = panelController.view.bounds.width - frame.maxX
+            guard abs(left - 16) < 1, abs(right - 16) < 1 else { fail("card margins: left=\(left) right=\(right), expected 16") }
+        }
         updateConfirmation = ("v99.0.0", Array(repeating: "- 版本更新说明，测试较长内容可以滚动查看。", count: 50).joined(separator: "\n"))
         buildPanel(); panelController.view.layoutSubtreeIfNeeded()
         guard let scroll = textScroll(panelRoot), let document = scroll.documentView, document.frame.height > scroll.contentView.bounds.height else { fail("long notes not scrollable") }
@@ -4608,7 +4618,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let expected = style.effective(liquidSupported: Self.supportsLiquidGlass, reduceTransparency: NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)
             guard backgroundStyle == style, panelBackground.isHidden == (expected != .solid), panelEffect.isHidden == (expected != .classicMaterial) else { fail("background \(style.rawValue)") }
         }
-        print("GLM update preview: PASS (scroll, refresh, cancel, preview install, close, backgrounds)"); exit(0)
+        print("GLM update preview: PASS (centered cards, scroll, refresh, cancel, preview install, close, backgrounds)"); exit(0)
     }
 
     private static var supportsLiquidGlass: Bool {
