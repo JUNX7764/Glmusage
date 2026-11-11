@@ -2074,10 +2074,6 @@ final class GLMPanelCard: NSView {
         wantsLayer = true
         layer?.cornerRadius = 12
         layer?.borderWidth = 0.5
-        layer?.masksToBounds = false
-        layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowRadius = 11
-        layer?.shadowOffset = CGSize(width: 0, height: -2)
         content.orientation = .vertical
         content.alignment = .leading
         content.spacing = 6
@@ -2096,12 +2092,8 @@ final class GLMPanelCard: NSView {
 
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            layer?.backgroundColor = (dark
-                ? NSColor.labelColor.withAlphaComponent(0.055)
-                : NSColor.controlBackgroundColor.withAlphaComponent(0.82)).cgColor
-            layer?.borderColor = NSColor.labelColor.withAlphaComponent(dark ? 0.14 : 0.09).cgColor
-            layer?.shadowOpacity = dark ? 0.03 : 0.06
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.09).cgColor
         }
     }
 
@@ -3992,7 +3984,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         header.addArrangedSubview(headerText); headerText.translatesAutoresizingMaskIntoConstraints = false
         headerText.widthAnchor.constraint(equalToConstant: inner - 76).isActive = true
         header.addArrangedSubview(spacer())
-        let backgroundButton = NSButton(image: NSImage(systemSymbolName: "square.on.square", accessibilityDescription: "背景样式") ?? NSImage(), target: self, action: #selector(showBackgroundStyleMenu(_:)))
+        let backgroundButton = NSButton(image: NSImage(systemSymbolName: "paintpalette", accessibilityDescription: "背景样式") ?? NSImage(), target: self, action: #selector(showBackgroundStyleMenu(_:)))
         backgroundButton.isBordered = false; backgroundButton.contentTintColor = .secondaryLabelColor
         backgroundButton.toolTip = "背景样式"; backgroundButton.setAccessibilityLabel("背景样式")
         backgroundButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
@@ -5398,6 +5390,24 @@ enum GLMOfflineRegression {
             try expect(GLMPanelBackgroundStyle.parse(nil) == .solid && GLMPanelBackgroundStyle.parse("bad") == .solid, "background default")
             try expect(GLMPanelBackgroundStyle.liquidGlass.effective(liquidSupported: false, reduceTransparency: false) == .classicMaterial, "background legacy fallback")
             try expect(GLMPanelBackgroundStyle.liquidGlass.effective(liquidSupported: true, reduceTransparency: true) == .solid, "background transparency fallback")
+            let surfaceCard = GLMPanelCard()
+            var previousFill: CGColor?
+            for name in [NSAppearance.Name.aqua, .darkAqua] {
+                surfaceCard.appearance = NSAppearance(named: name)
+                surfaceCard.updateLayer()
+                guard let fill = surfaceCard.layer?.backgroundColor,
+                      let border = surfaceCard.layer?.borderColor else {
+                    throw Failure(description: "panel card colors missing")
+                }
+                try expect(abs(fill.alpha - 0.035) < 0.001 && abs(border.alpha - 0.09) < 0.001,
+                           "panel card opacity changed for \(name.rawValue)")
+                try expect(surfaceCard.layer?.borderWidth == 0.5 && surfaceCard.layer?.shadowOpacity == 0,
+                           "panel card border or shadow changed")
+                if let previousFill = previousFill {
+                    try expect(fill != previousFill, "panel card color did not respond to appearance")
+                }
+                previousFill = fill
+            }
             // 更新检查与脚本都只认附件完整的 Release；最新空 Release 不遮挡最近可安装版本
             let completeRelease: [String: Any] = [
                 "tag_name": "v1.0.11", "draft": false, "prerelease": false,
