@@ -260,11 +260,21 @@ enum CredStore {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if envValue?.isEmpty == false { return nil }   // env 覆盖凭据源 → 隐藏
         guard let obj = credentialRecord(), preferredApiKey(record: obj) == nil else { return nil }
-        let oauthToken = decrypt(obj["oauth:bigmodel:access_token"] ?? "")
-        let rawUserInfo = obj["oauth:bigmodel:user_info"] ?? ""
-        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:") ? decrypt(rawUserInfo) : rawUserInfo)
-        return resolveAccountEmail(envValue: envValue, credentialKeyCandidates: 0,
+        return zcodeAccountEmail(record: obj)
+    }
+
+    // 手动连接的 Key 可能属于另一个账号：仅把邮箱作为 ZCode 登录身份展示，不能归属给套餐。
+    // 不请求网络、不交互式访问钥匙串；读取失败即隐藏，不复用旧邮箱。
+    static func zcodeAccountEmail(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> String? {
+        let oauthToken = decrypt(record["oauth:bigmodel:access_token"] ?? "", secret: secret, systemKey: systemKey)
+        let rawUserInfo = record["oauth:bigmodel:user_info"] ?? ""
+        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:") ? decrypt(rawUserInfo, secret: secret, systemKey: systemKey) : rawUserInfo)
+        return resolveAccountEmail(envValue: nil, credentialKeyCandidates: 0,
                                    oauthAccessToken: oauthToken, userInfoJSON: userInfoJSON)
+    }
+    static func loadZCodeAccountEmail() -> String? {
+        guard let record = credentialRecord() else { return nil }
+        return zcodeAccountEmail(record: record)
     }
 
     /// 宽松但足够的邮箱格式校验（x@y.z，总长 ≤254），防止把昵称/用户 ID 当邮箱展示
@@ -785,6 +795,7 @@ struct UsageData {
     var dailyTokens: [GLMDayBucket]?   // 每日用量：近 30 自然日桶含今日部分累计（缺失日=nil≠0；Gate 已于 2026-11-06 验收开启）
     var dailyTokensError: String?      // 仅用于 freshness 保留旧值，界面不显示技术错误
     var accountEmail: String?          // 头部可选邮箱（仅现有凭据内可靠可得；绝不写 status.json/日志）
+    var accountEmailIsZCode = false     // 手动套餐连接时只表示 ZCode 身份，不代表套餐 Key 的身份
     var tools30d: ToolUsage?
     var resetCards: ResetCards?        // 重置卡（额度重置卡）可用列表
     var resetCardsError: String?
@@ -3001,12 +3012,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 头部可选邮箱：读现有凭据库（本地文件、无网络），不可得 → nil → 整行隐藏。
             // 双保险：本方法在 preview 下不会被调用（启动即 return），此处再显式断开
             // 预览路径与凭据读取的关联，防止未来重构把凭据读取带进假数据预览。
-            let accountEmail = (preview || savedConnection) ? nil : CredStore.loadAccountEmail()
-            let previousEmail = usage.accountEmail
+            let accountEmail = preview ? nil : (savedConnection ? CredStore.loadZCodeAccountEmail() : CredStore.loadAccountEmail())
+            let previousEmail = usage.accountEmailIsZCode ? nil : usage.accountEmail
             accumulator.update { current in
-                // 凭据库瞬时读取失败（文件 busy/锁）会读到 nil：沿用上轮邮箱避免头部整行闪烁；
-                // 退出登录后同样读到 nil，旧值保留到下次成功读取或重启（展示侧五重门禁兜底）
-                current.accountEmail = savedConnection ? nil : (accountEmail ?? previousEmail)
+                // 独立 ZCode 身份不缓存旧值，登出或切换账号后不可继续展示上次邮箱。
+                current.accountEmail = savedConnection ? accountEmail : (accountEmail ?? previousEmail)
+                current.accountEmailIsZCode = savedConnection && accountEmail != nil
             }
             wg.enter()
             Fetcher.fetchToolUsage(apiKey: key, from: now.addingTimeInterval(-30 * 86400), to: now, rawKey: savedConnection) { r, err in
@@ -3087,6 +3098,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             usage.dailyTokens = daily.value; dailyLastOK = daily.lastOK; usage.dailyTokensError = daily.error
             // 头部可选邮箱（本地凭据读取结果，无网络语义；nil → 隐藏整行）
             usage.accountEmail = fresh.accountEmail
+            usage.accountEmailIsZCode = fresh.accountEmailIsZCode
 
             let hasCardBatch = fresh.resetCards != nil
             let fiveCards = GLMFreshness.apply(fresh: fresh.resetCards?.fiveHour, failure: fresh.fiveHourCardsError,
@@ -3545,6 +3557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ? nil : previewDailyBuckets()
         // 头部邮箱预览（假数据；生产邮箱只来自现有凭据库且不可得即隐藏）
         if CommandLine.arguments.contains("--preview-email") {
+            usage.accountEmailIsZCode = CommandLine.arguments.contains("--preview-email-zcode")
             usage.accountEmail = CommandLine.arguments.contains("--preview-email-long")
                 ? "long-username.glm.account@example-mail.cn" : "preview@example.com"
         }
@@ -3970,7 +3983,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         headerText.addArrangedSubview(titleRow)
         titleRow.translatesAutoresizingMaskIntoConstraints = false
         if let email = usage.accountEmail {
-            let emailLabel = label(email, size: 11, color: .secondaryLabelColor)
+            let emailLabel = label(usage.accountEmailIsZCode ? "ZCode · \(email)" : email, size: 11, color: .secondaryLabelColor)
             emailLabel.lineBreakMode = .byTruncatingMiddle; emailLabel.maximumNumberOfLines = 1
             emailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 76).isActive = true
             emailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -5585,6 +5598,12 @@ enum GLMOfflineRegression {
                     .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
             }
             let fixtureV1 = "enc:v1:" + b64url(Data(fixtureBox.nonce)) + "." + b64url(fixtureBox.tag) + "." + b64url(fixtureBox.ciphertext)
+            let fixtureInfoBox = try AES.GCM.seal(Data(userEmailJSON.utf8), using: fixtureKey)
+            let fixtureInfo = "enc:v1:" + b64url(Data(fixtureInfoBox.nonce)) + "." + b64url(fixtureInfoBox.tag) + "." + b64url(fixtureInfoBox.ciphertext)
+            let zcodeRecord = ["oauth:bigmodel:access_token": fixtureV1, "oauth:bigmodel:user_info": fixtureInfo]
+            try expect(CredStore.zcodeAccountEmail(record: zcodeRecord, secret: fixtureSecret) == "user@example.com", "ZCode email fixture unavailable")
+            try expect(CredStore.zcodeAccountEmail(record: ["oauth:bigmodel:user_info": fixtureInfo], secret: fixtureSecret) == nil, "ZCode email accepted without login token")
+            try expect(CredStore.zcodeAccountEmail(record: zcodeRecord, secret: "wrong") == nil, "ZCode email accepted without correct key")
             try expect(CredStore.decrypt(fixtureV1, secret: fixtureSecret) == "fixture-token", "v1 fixture failed")
             try expect(CredStore.decrypt(fixtureV1, secret: "wrong") == nil, "wrong v1 key accepted")
             var savedFixture = "old"
@@ -5613,6 +5632,12 @@ enum GLMOfflineRegression {
             try expect(CredStore.decryptV2OS(fixtureV2OS, osKey: Data((1..<33).map { UInt8($0) })) == nil, "wrong v2 os key accepted")
             try expect(CredStore.decryptV2OS("enc:v2:os:deadbeef:nonsense.nonsense.nonsense", osKey: v2Key) == nil, "bad v2 digest accepted")
             try expect(CredStore.decrypt("enc:v2:os:fixture:opaque", systemKey: Data()) == nil, "v2 malformed must fail")
+            let v2InfoBox = try AES.GCM.seal(Data(userEmailJSON.utf8), using: SymmetricKey(data: v2Key))
+            let v2Info = "enc:v2:os:" + CredStore.sha256HexPrefix(v2Key, 24) + ":"
+                + b64url(Data(v2InfoBox.nonce)) + "." + b64url(v2InfoBox.tag) + "." + b64url(v2InfoBox.ciphertext)
+            let zcodeV2Record = ["oauth:bigmodel:access_token": fixtureV2OS, "oauth:bigmodel:user_info": v2Info]
+            try expect(CredStore.zcodeAccountEmail(record: zcodeV2Record, systemKey: v2Key) == "user@example.com", "v2 ZCode email unavailable")
+            try expect(CredStore.zcodeAccountEmail(record: zcodeV2Record, systemKey: Data(repeating: 9, count: 32)) == nil, "v2 email accepted wrong key")
             let fixtureV2 = ["oauth:bigmodel:access_token": fixtureV2OS, "zcodejwttoken": fixtureV2OS]
             let upgradedPlan = CredStore.resolvePlanCredential(record: fixtureV2, systemKey: v2Key)
             try expect(upgradedPlan.key == "fixture-token", "v2 os plan credential failed")
