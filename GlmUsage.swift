@@ -3983,7 +3983,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         headerText.addArrangedSubview(titleRow)
         titleRow.translatesAutoresizingMaskIntoConstraints = false
         if let email = usage.accountEmail {
-            let emailLabel = label(usage.accountEmailIsZCode ? "ZCode · \(email)" : email, size: 11, color: .secondaryLabelColor)
+            let emailLabel = label(email, size: 11, color: .secondaryLabelColor)
             emailLabel.lineBreakMode = .byTruncatingMiddle; emailLabel.maximumNumberOfLines = 1
             emailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 76).isActive = true
             emailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)

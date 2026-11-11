@@ -116,4 +116,4 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 面板背景默认纯色；液态玻璃需 macOS 26+，旧系统回退经典毛玻璃，系统开启降低透明度时显示纯色。`--preview --preview-background=solid|classicMaterial|liquidGlass` 可使用假数据预览；`--preview --preview-update-notes` 预览更新确认，不执行真实更新。版本说明来自所选可安装 Release，确认前不下载。
 
-手动套餐连接时，如 ZCode 登录资料可在后台读取且含有效邮箱，标题以「ZCode · 邮箱」标识来源；此邮箱不证明与套餐 API Key 属于同一账号。读取失败时隐藏，不保留该来源的旧邮箱；不新增网络请求。
+手动套餐连接时，如 ZCode 登录资料可在后台读取且含有效邮箱，标题直接显示该邮箱；此邮箱不证明与套餐 API Key 属于同一账号。读取失败时隐藏，不保留该来源的旧邮箱；不新增网络请求。
