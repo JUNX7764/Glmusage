@@ -8,11 +8,16 @@ import LocalAuthentication
 
 // MARK: - 凭证读取（复用 ZCode 本地加密凭证库）
 //
-// ZCode 把订阅 API key 加密存在 ~/.zcode/v2/credentials.json（"enc:v1:" 前缀）：
-// AES-256-GCM，密钥 = SHA256(secret)，secret 取环境变量 ZCODE_CREDENTIAL_SECRET，
-// 未设置时用确定性 fallback "zcode-credential-fallback:<platform>:<homedir>:<username>"
-// （与 ZCode 客户端 zcode.cjs 内置逻辑一致）。密文格式 iv.tag.ciphertext，均为 base64url。
-// 本应用只读取、绝不写入该文件；key 仅存在于内存。
+// ZCode 把订阅 API key 加密存在 ~/.zcode/v2/credentials.json，同一文件并存两代格式：
+// - "enc:v1:"：AES-256-GCM，密钥 = SHA256(secret)，secret 取环境变量 ZCODE_CREDENTIAL_SECRET，
+//   未设置时用确定性 fallback "zcode-credential-fallback:<platform>:<homedir>:<username>"
+//   （与 ZCode 客户端 zcode.cjs 内置逻辑一致）。密文格式 iv.tag.ciphertext，均为 base64url。
+// - "enc:v2:os:<sha256(key)前24hex>:<nonce.tag.ciphertext>"（2026-11-11 起 ZCode 自动迁移至此）：
+//   AES-256-GCM，密钥（32 字节，base64url 文本）托管在 login keychain，条目 service 为
+//   "ZCode Credential Encryption"、account 为 credentials.json 路径的 SHA-256 hex；
+//   首次读取由系统弹一次钥匙串授权（点「始终允许」后永久免弹窗）。
+//   "enc:v2:env:" 走 ZCode 进程环境派生密钥，本应用无法获取，保持不支持。
+// 本应用只读取、绝不写入该文件；key 仅存在于内存，不写日志或诊断状态。
 
 // Only this app's dedicated item is accessed; background reads must never prompt.
 enum GLMPlanKeychain {
@@ -56,12 +61,74 @@ enum GLMPlanKeychain {
     }
 }
 
+// ZCode 新版凭据（enc:v2:os:）的加密密钥托管在 login keychain。授权一次后进程可静默
+// 读取；读取结果仅进程内缓存，绝不落盘。后台路径一律 non-interactive（与 GLMPlanKeychain
+// 同一红线：background reads must never prompt），交互式读取只在用户显式解锁时发生。
+enum ZCodeSystemKey {
+    static let service = "ZCode Credential Encryption"
+    private static let lock = NSLock()
+    private static var cached: Data?
+
+    static func accountHex(forPath path: String) -> String {
+        SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static var isUnlocked: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cached != nil
+    }
+
+    static func cache(_ key: Data) {
+        lock.lock(); cached = key; lock.unlock()
+    }
+
+    /// 单次 keychain 查询。interactive=true 时允许系统弹授权框（仅用户显式解锁路径）。
+    static func valueData(interactive: Bool) -> Data? {
+        var q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrService as String: service,
+                                kSecAttrAccount as String: accountHex(forPath: CredStore.credPath),
+                                kSecReturnData as String: true,
+                                kSecMatchLimit as String: kSecMatchLimitOne]
+        if !interactive {
+            let context = LAContext(); context.interactionNotAllowed = true
+            q[kSecUseAuthenticationContext as String] = context
+        }
+        var wasAllowed: DarwinBoolean = true
+        let restoreInteraction = !interactive && SecKeychainGetUserInteractionAllowed(&wasAllowed) == errSecSuccess
+        if restoreInteraction { SecKeychainSetUserInteractionAllowed(false) }
+        defer { if restoreInteraction { SecKeychainSetUserInteractionAllowed(wasAllowed.boolValue) } }
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
+              let raw = result as? Data,
+              let text = String(data: raw, encoding: .utf8), !text.isEmpty else { return nil }
+        return CredStore.base64urlDecode(text)
+    }
+
+    /// 后台读取：优先进程内缓存，miss 时 non-interactive 查询（成功才缓存；失败不缓存，
+    /// 下一轮刷新会重试，用户授权后自动恢复）。
+    static func shared() -> Data? {
+        lock.lock(); let hit = cached; lock.unlock()
+        if let hit { return hit }
+        guard let fresh = valueData(interactive: false) else { return nil }
+        cache(fresh)
+        return fresh
+    }
+}
+
 enum CredStore {
     static let credPath = NSHomeDirectory() + "/.zcode/v2/credentials.json"
     // 允许用环境变量直接提供 key（调试 / 无 ZCode 凭证库的场景）
     static let envKey = "GLM_API_KEY"
     static let newCredentialMessage = "ZCode 新版登录暂不支持"
+    // enc:v2:os: 凭据存在但系统密钥未授权（用户拒绝/未弹框）——可恢复，引导解锁。
+    static let v2LockedMessage = "ZCode 凭据待授权，点击「连接套餐」解锁"
     static let missingPlanMessage = "未找到或无法读取 ZCode 凭证"
+
+    // v2 凭据解密失败的错误分类（仅读进程内缓存，不触 keychain，self-test 可覆盖）：
+    // 注入过密钥或已解锁仍解不开 → ZCode 又改格式（不可恢复）；否则视为密钥待授权（可恢复）。
+    static func v2FailureMessage(systemKey: Data?) -> String {
+        systemKey != nil || ZCodeSystemKey.isUnlocked ? newCredentialMessage : v2LockedMessage
+    }
 
     static let keychainUnavailableMessage = "已保存的套餐连接暂不可用，请重新连接"
     // A single non-interactive lookup per process avoids repeated Keychain prompts/work.
@@ -97,12 +164,16 @@ enum CredStore {
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: String]
     }
 
-    static func resolvePlanCredential(envValue: String? = nil, record: [String: String], secret: String? = nil) -> (key: String?, error: String) {
+    static func resolvePlanCredential(envValue: String? = nil, record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> (key: String?, error: String) {
         if let value = envValue, !value.trimmingCharacters(in: .whitespaces).isEmpty { return (value, "") }
         // 纯 OAuth 登录时使用 access_token 作为监控接口的 Bearer 凭证。
         let selected = preferredApiKey(record: record) ?? record["oauth:bigmodel:access_token"] ?? ""
-        if selected.hasPrefix("enc:v2:") { return (nil, newCredentialMessage) }
-        if let key = decrypt(selected, secret: secret) { return (key, "") }
+        if selected.hasPrefix("enc:v2:env:") { return (nil, newCredentialMessage) }
+        if let key = decrypt(selected, secret: secret, systemKey: systemKey), !key.isEmpty { return (key, "") }
+        if selected.hasPrefix("enc:v2:") {
+            // 首选候选不可静默降级到其他账号的凭据：区分「待授权」（可恢复）与「格式再升级」（不可恢复）
+            return (nil, v2FailureMessage(systemKey: systemKey))
+        }
         return (nil, missingPlanMessage)
     }
 
@@ -128,14 +199,17 @@ enum CredStore {
         resolveResetCredential(record: credentialRecord() ?? [:])
     }
 
-    static func resolveResetCredential(record: [String: String], secret: String? = nil) -> (tokens: (jwt: String, maas: String)?, error: String) {
+    static func resolveResetCredential(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> (tokens: (jwt: String, maas: String)?, error: String) {
         let jwtValue = record["zcodejwttoken"] ?? ""
         let maasValue = record["oauth:bigmodel:access_token"] ?? ""
-        if jwtValue.hasPrefix("enc:v2:") || maasValue.hasPrefix("enc:v2:") { return (nil, newCredentialMessage) }
-        guard let jwt = decrypt(jwtValue, secret: secret)?.trimmingCharacters(in: .whitespacesAndNewlines),
+        if jwtValue.hasPrefix("enc:v2:env:") || maasValue.hasPrefix("enc:v2:env:") { return (nil, newCredentialMessage) }
+        guard let jwt = decrypt(jwtValue, secret: secret, systemKey: systemKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !jwt.isEmpty,
-              let maas = decrypt(maasValue, secret: secret)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let maas = decrypt(maasValue, secret: secret, systemKey: systemKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !maas.isEmpty else {
+            if jwtValue.hasPrefix("enc:v2:") || maasValue.hasPrefix("enc:v2:") {
+                return (nil, v2FailureMessage(systemKey: systemKey))
+            }
             return (nil, "未找到或无法读取 ZCode 登录凭证")
         }
         return ((jwt, maas), "")
@@ -173,7 +247,7 @@ enum CredStore {
         guard let obj = credentialRecord(), preferredApiKey(record: obj) == nil else { return nil }
         let oauthToken = decrypt(obj["oauth:bigmodel:access_token"] ?? "")
         let rawUserInfo = obj["oauth:bigmodel:user_info"] ?? ""
-        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:v1:") ? decrypt(rawUserInfo) : rawUserInfo)
+        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:") ? decrypt(rawUserInfo) : rawUserInfo)
         return resolveAccountEmail(envValue: envValue, credentialKeyCandidates: 0,
                                    oauthAccessToken: oauthToken, userInfoJSON: userInfoJSON)
     }
@@ -183,7 +257,11 @@ enum CredStore {
         value.count <= 254 && value.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$"#, options: .regularExpression) != nil
     }
 
-    static func decrypt(_ s: String, secret: String? = nil) -> String? {
+    static func decrypt(_ s: String, secret: String? = nil, systemKey: Data? = nil) -> String? {
+        if s.hasPrefix("enc:v2:os:") {
+            guard let key = systemKey ?? ZCodeSystemKey.shared() else { return nil }
+            return decryptV2OS(s, osKey: key)
+        }
         guard s.hasPrefix("enc:v1:") else { return nil }
         let parts = s.dropFirst("enc:v1:".count)
             .split(separator: ".")
@@ -199,6 +277,39 @@ enum CredStore {
         return String(data: box, encoding: .utf8)
     }
 
+    // enc:v2:os 的解密纯函数（systemKey 由调用方注入，self-test 可离线覆盖）。
+    // 格式（与 zcode.cjs encrypt/open 逐字节一致）：
+    //   "enc:v2:os:" + SHA256(key)hex前24位 + ":" + base64url(nonce) + "." + base64url(tag16) + "." + base64url(ct)
+    static func decryptV2OS(_ s: String, osKey: Data) -> String? {
+        let segs = s.dropFirst("enc:v2:".count).split(separator: ":", maxSplits: 2).map(String.init)
+        guard segs.count == 3, segs[0] == "os",
+              segs[1] == sha256HexPrefix(osKey, 24),
+              let sealParts = segs[2].split(separator: ".").map({ base64urlDecode(String($0)) }) as? [Data?],
+              sealParts.count == 3, let nonce = sealParts[0], let tag = sealParts[1], let ct = sealParts[2],
+              nonce.count == 12, tag.count == 16 else { return nil }
+        guard let box = try? AES.GCM.open(
+            AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: nonce), ciphertext: ct, tag: tag),
+            using: SymmetricKey(data: osKey)) else { return nil }
+        return String(data: box, encoding: .utf8)
+    }
+
+    static func sha256HexPrefix(_ data: Data, _ chars: Int) -> String {
+        String(SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined().prefix(chars))
+    }
+
+    // 用户显式解锁：交互式读取 ZCode 系统密钥（触发系统授权框），成功即缓存。
+    static func unlockZCodeKey() -> Bool {
+        guard let key = ZCodeSystemKey.valueData(interactive: true) else { return false }
+        ZCodeSystemKey.cache(key)
+        return true
+    }
+
+    /// 凭据文件中是否有关键条目仍是 enc:v2:os:（决定启动时是否引导一次钥匙串授权）。
+    static var needsV2Unlock: Bool {
+        guard let record = credentialRecord() else { return false }
+        return record.values.contains { $0.hasPrefix("enc:v2:os:") }
+    }
+
     private static func resolveSecret() -> String {
         if let env = ProcessInfo.processInfo.environment["ZCODE_CREDENTIAL_SECRET"]?
             .trimmingCharacters(in: .whitespacesAndNewlines), !env.isEmpty {
@@ -210,7 +321,8 @@ enum CredStore {
         return "zcode-credential-fallback:\(platform):\(NSHomeDirectory()):\(username)"
     }
 
-    private static func base64urlDecode(_ s: String) -> Data? {
+    // ZCodeSystemKey 读取 keychain 值时复用同一 base64url 解码
+    static func base64urlDecode(_ s: String) -> Data? {
         var t = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         t += String(repeating: "=", count: (4 - t.count % 4) % 4)
         return Data(base64Encoded: t)
@@ -2666,6 +2778,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.reconcileBarAppearance()
         }
         appearancePollTimer?.tolerance = 1
+        // ZCode 新版凭据（enc:v2:os）的密钥首次需要钥匙串授权：启动稳定后引导一次。
+        // 成功即全量刷新（重置卡/自动额度立即恢复）；拒绝则依赖刷新结果里的待授权
+        // 提示行与「连接套餐 → 解锁凭据」手动入口。后台刷新路径保持 non-interactive。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self = self, !self.preview else { return }
+            guard CredStore.needsV2Unlock, !ZCodeSystemKey.isUnlocked else { return }
+            if CredStore.unlockZCodeKey() { self.refresh(tokens: true, manual: true) }
+        }
         refresh(tokens: true)
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -2833,8 +2953,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 wg.leave()
             }
-            // 重置卡（额度重置卡）：ZCode 登录态 token 缺失/过期时优雅降级为错误提示
-            let resetCredential = savedConnection ? (tokens: Optional<(jwt: String, maas: String)>.none, error: "套餐连接不支持重置卡，请在 ZCode 中使用") : CredStore.loadResetCredential()
+            // 重置卡（额度重置卡）：ZCode 登录态 token 缺失/过期/待授权时优雅降级为错误提示；
+            // 与「套餐连接」相互独立——连接的 API Key 供监控接口，登录态 token 供重置卡
+            let resetCredential = CredStore.loadResetCredential()
             if let (jwt, maas) = resetCredential.tokens {
                 wg.enter()
                 Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
@@ -3207,7 +3328,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func beginUseReset(_ type: ResetCardType) {
         guard !resetUseInFlight else { return }
         if preview { setUpdateMessage("预览模式：不执行真实重置卡操作", dismissAfter: 3); return }
-        guard !CredStore.isSavedKeyActive else { setUpdateMessage("请在 ZCode 中使用重置卡", dismissAfter: 4); return }
         let credential = CredStore.loadResetCredential()
         guard let (jwt, maas) = credential.tokens else {
             setUpdateMessage("使用\(type.displayName)失败：\(credential.error)", dismissAfter: 5); return
@@ -3450,12 +3570,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if UpdateProgressController.shared.isActive { add(UpdateProgressRowView()) }
         else if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
 
-        let needsPlanConnection = [CredStore.newCredentialMessage, CredStore.keychainUnavailableMessage, CredStore.missingPlanMessage]
+        let needsPlanConnection = [CredStore.newCredentialMessage, CredStore.keychainUnavailableMessage,
+                                   CredStore.v2LockedMessage, CredStore.missingPlanMessage]
             .contains { $0 == usage.quotaError }
+        let resetNeedsUnlock = usage.resetCardsError == CredStore.v2LockedMessage
         let resetLoginUnsupported = usage.resetCardsError == CredStore.newCredentialMessage
-        if needsPlanConnection {
+        if needsPlanConnection || resetNeedsUnlock {
             let instruction = usage.quotaError == CredStore.keychainUnavailableMessage
-                ? "请解锁已保存的套餐连接" : "使用套餐 API Key 恢复自动刷新"
+                ? "请解锁已保存的套餐连接"
+                : (usage.quotaError == CredStore.v2LockedMessage || resetNeedsUnlock
+                    ? "ZCode 凭据需钥匙串授权，恢复自动用量与重置卡"
+                    : "使用套餐 API Key 恢复自动刷新")
             add(label(instruction, color: .systemOrange))
             add(button("连接套餐", #selector(onConnectPlan), prominent: true))
         }
@@ -4274,13 +4399,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         alert.addButton(withTitle: "验证并连接")
         alert.addButton(withTitle: "取消")
         alert.addButton(withTitle: "获取 API Key")
-        let canUnlock = !preview && usage.quotaError == CredStore.keychainUnavailableMessage
-        if canUnlock { alert.addButton(withTitle: "解锁已保存连接") }
+        // 解锁入口覆盖两类钥匙串条目：本应用的已保存连接、ZCode 新版凭据的系统密钥
+        let canUnlock = !preview && (usage.quotaError == CredStore.keychainUnavailableMessage
+            || usage.quotaError == CredStore.v2LockedMessage || usage.resetCardsError == CredStore.v2LockedMessage)
+        if canUnlock { alert.addButton(withTitle: "解锁凭据") }
+        if canUnlock {
+            alert.informativeText = "粘贴套餐 API Key，或选「解锁凭据」恢复自动读取（首次会弹钥匙串授权，请点「始终允许」）。"
+        }
         alert.window.initialFirstResponder = field
         let response = alert.runModal()
         if canUnlock && response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 3 {
-            if CredStore.unlockSavedKey() { refresh(tokens: true, manual: true) }
-            else { setUpdateMessage("无法读取已保存的连接，请解锁钥匙串或重新连接", dismissAfter: 8) }
+            let savedOK = CredStore.unlockSavedKey()
+            let systemOK = CredStore.unlockZCodeKey()
+            if savedOK || systemOK { refresh(tokens: true, manual: true) }
+            else { setUpdateMessage("钥匙串解锁被拒绝，可稍后重试", dismissAfter: 8) }
             return
         }
         if preview { setUpdateMessage("预览模式：不连接真实套餐", dismissAfter: 3); return }
@@ -4414,8 +4546,8 @@ func onceMode() {
         if let r = r { acc.update { $0.tools30d = r } }
         group.leave()
     }
-    // 重置卡（额度重置卡）+ 套餐到期：与 token 统计同批拉取
-    let resetCredential = CredStore.isSavedKeyActive ? (tokens: Optional<(jwt: String, maas: String)>.none, error: "请在 ZCode 中使用重置卡") : CredStore.loadResetCredential()
+    // 重置卡（额度重置卡）+ 套餐到期：与 token 统计同批拉取（登录态 token 与连接 key 相互独立）
+    let resetCredential = CredStore.loadResetCredential()
     if let (jwt, maas) = resetCredential.tokens {
         group.enter()
         Fetcher.fetchResetCards(jwt: jwt, maas: maas) { r in
@@ -5257,13 +5389,28 @@ enum GLMOfflineRegression {
             let syntheticURL = "https://example.invalid/test"
             try expect(Fetcher.authRequest(syntheticURL, apiKey: "fixture", rawKey: true)?.value(forHTTPHeaderField: "Authorization") == "fixture", "saved key monitor header changed")
             try expect(Fetcher.authRequest(syntheticURL, apiKey: "fixture")?.value(forHTTPHeaderField: "Authorization") == "Bearer fixture", "legacy header changed")
-            let fixtureV2 = ["oauth:bigmodel:access_token": "enc:v2:os:fixture:opaque", "zcodejwttoken": "enc:v2:os:fixture:opaque"]
-            let upgradedPlan = CredStore.resolvePlanCredential(record: fixtureV2)
-            try expect(upgradedPlan.key == nil && upgradedPlan.error == CredStore.newCredentialMessage, "v2 plan status missing")
-            try expect(CredStore.decrypt("enc:v2:os:fixture:opaque", secret: fixtureSecret) == nil, "v2 must not be decrypted")
+            // v2 os 解密（2026-11-11 ZCode 自动迁移的新凭据格式，密钥托管 login keychain）：
+            // 全部走注入密钥的纯函数路径，不触真实 keychain。
+            let v2Key = Data((0..<32).map { UInt8($0) })
+            let v2Box = try AES.GCM.seal(Data("fixture-token".utf8), using: SymmetricKey(data: v2Key))
+            let fixtureV2OS = "enc:v2:os:" + CredStore.sha256HexPrefix(v2Key, 24) + ":"
+                + b64url(Data(v2Box.nonce)) + "." + b64url(v2Box.tag) + "." + b64url(v2Box.ciphertext)
+            try expect(CredStore.decryptV2OS(fixtureV2OS, osKey: v2Key) == "fixture-token", "v2 os roundtrip failed")
+            try expect(CredStore.decryptV2OS(fixtureV2OS, osKey: Data((1..<33).map { UInt8($0) })) == nil, "wrong v2 os key accepted")
+            try expect(CredStore.decryptV2OS("enc:v2:os:deadbeef:nonsense.nonsense.nonsense", osKey: v2Key) == nil, "bad v2 digest accepted")
+            try expect(CredStore.decrypt("enc:v2:os:fixture:opaque", systemKey: Data()) == nil, "v2 malformed must fail")
+            let fixtureV2 = ["oauth:bigmodel:access_token": fixtureV2OS, "zcodejwttoken": fixtureV2OS]
+            let upgradedPlan = CredStore.resolvePlanCredential(record: fixtureV2, systemKey: v2Key)
+            try expect(upgradedPlan.key == "fixture-token", "v2 os plan credential failed")
+            let upgradedReset = CredStore.resolveResetCredential(record: fixtureV2, systemKey: v2Key)
+            try expect(upgradedReset.tokens?.jwt == "fixture-token" && upgradedReset.tokens?.maas == "fixture-token", "v2 os reset credential failed")
+            let opaqueV2 = ["oauth:bigmodel:access_token": "enc:v2:os:fixture:opaque", "zcodejwttoken": "enc:v2:os:fixture:opaque"]
+            // 已授权仍解不开（ZCode 再改格式）→ 升级提示；密钥未授权 → 待授权提示
+            try expect(CredStore.resolvePlanCredential(record: opaqueV2, systemKey: Data()).error == CredStore.newCredentialMessage, "v2 plan status missing")
+            try expect(CredStore.resolveResetCredential(record: opaqueV2, systemKey: Data()).error == CredStore.newCredentialMessage, "v2 reset status missing")
+            try expect(CredStore.v2FailureMessage(systemKey: nil) == CredStore.v2LockedMessage, "v2 locked classification wrong")
+            try expect(CredStore.v2FailureMessage(systemKey: Data()) == CredStore.newCredentialMessage, "v2 upgraded classification wrong")
             try expect(CredStore.resolvePlanCredential(envValue: "fixture-api-key", record: fixtureV2).key == "fixture-api-key", "API override lost")
-            let upgradedReset = CredStore.resolveResetCredential(record: fixtureV2)
-            try expect(upgradedReset.tokens == nil && upgradedReset.error == CredStore.newCredentialMessage, "v2 reset status missing")
             let legacy = ["oauth:bigmodel:access_token": fixtureV1, "zcodejwttoken": fixtureV1]
             try expect(CredStore.resolvePlanCredential(record: legacy, secret: fixtureSecret).key == "fixture-token", "legacy OAuth fallback failed")
             try expect(CredStore.resolveResetCredential(record: legacy, secret: fixtureSecret).tokens?.jwt == "fixture-token", "legacy reset credential failed")
@@ -5271,7 +5418,7 @@ enum GLMOfflineRegression {
             try expect(CredStore.resolvePlanCredential(record: ["oauth:bigmodel:user_info": "enc:v2:os:fixture:opaque"]).error != CredStore.newCredentialMessage, "unrelated v2 misclassified")
             try expect(CredStore.resolvePlanCredential(record: ["coding-plan:api-key": "enc:v2:env:fixture:opaque"]).error == CredStore.newCredentialMessage, "v2 env not detected")
             let mixed = ["coding-plan:api-key:bigmodel": "enc:v2:os:fixture:opaque", "coding-plan:api-key:zai": fixtureV1, "oauth:bigmodel:access_token": fixtureV1]
-            let mixedPlan = CredStore.resolvePlanCredential(record: mixed, secret: fixtureSecret)
+            let mixedPlan = CredStore.resolvePlanCredential(record: mixed, secret: fixtureSecret, systemKey: Data())
             try expect(mixedPlan.key == nil && mixedPlan.error == CredStore.newCredentialMessage, "v2 account silently fell back")
             let preferredLegacy = ["coding-plan:api-key:bigmodel": fixtureV1, "coding-plan:api-key:zai": "enc:v2:os:fixture:opaque"]
             try expect(CredStore.resolvePlanCredential(record: preferredLegacy, secret: fixtureSecret).key == "fixture-token", "lower-priority v2 hid usable legacy API key")
