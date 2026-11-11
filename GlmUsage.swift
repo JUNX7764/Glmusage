@@ -59,6 +59,11 @@ enum GLMPlanKeychain {
         item[kSecValueData as String] = data
         return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
     }
+
+    // 仅「断开连接」入口调用：用户显式放弃已保存的连接，回退凭据库自动读取。
+    static func delete() {
+        SecItemDelete(query() as CFDictionary)
+    }
 }
 
 // ZCode 新版凭据（enc:v2:os:）的加密密钥托管在 login keychain。授权一次后进程可静默
@@ -134,6 +139,11 @@ enum CredStore {
     // A single non-interactive lookup per process avoids repeated Keychain prompts/work.
     private static var savedKey: GLMPlanKeychain.ReadResult = GLMPlanKeychain.read()
     static func useSavedKey(_ key: String) { savedKey = .key(key) }
+    // 断开已保存连接：删除钥匙串条目并回到凭据库自动读取路径（用户显式操作）。
+    static func forgetSavedKey() {
+        GLMPlanKeychain.delete()
+        savedKey = .missing
+    }
     static func unlockSavedKey() -> Bool {
         let result = GLMPlanKeychain.read(interactive: true)
         if case .key = result { savedKey = result; return true }
@@ -143,6 +153,11 @@ enum CredStore {
         let env = ProcessInfo.processInfo.environment[envKey]?.trimmingCharacters(in: .whitespacesAndNewlines)
         if env?.isEmpty == false { return false }
         if case .key = savedKey { return true }
+        return false
+    }
+    // 条目存在但当前二进制不在 ACL（更新后签名指纹变化）→ 交互式解锁可恢复
+    static var savedKeyNeedsUnlock: Bool {
+        if case .unavailable = savedKey { return true }
         return false
     }
     static func loadApiKey() -> String? {
@@ -2778,13 +2793,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.reconcileBarAppearance()
         }
         appearancePollTimer?.tolerance = 1
-        // ZCode 新版凭据（enc:v2:os）的密钥首次需要钥匙串授权：启动稳定后引导一次。
-        // 成功即全量刷新（重置卡/自动额度立即恢复）；拒绝则依赖刷新结果里的待授权
-        // 提示行与「连接套餐 → 解锁凭据」手动入口。后台刷新路径保持 non-interactive。
+        // 凭据钥匙串授权引导：更新后二进制签名指纹变化会使已授权条目重新上锁，且 ZCode
+        // 新版凭据（enc:v2:os）首次也需要授权。启动稳定后交互式解锁一次（系统授权框，
+        // 请点「始终允许」）；拒绝则依赖面板提示行与「解锁凭据」按钮。preview/CLI 不触发。
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self = self, !self.preview else { return }
-            guard CredStore.needsV2Unlock, !ZCodeSystemKey.isUnlocked else { return }
-            if CredStore.unlockZCodeKey() { self.refresh(tokens: true, manual: true) }
+            let savedLocked = CredStore.savedKeyNeedsUnlock
+            let systemLocked = CredStore.needsV2Unlock && !ZCodeSystemKey.isUnlocked
+            guard savedLocked || systemLocked else { return }
+            var unlocked = false
+            if savedLocked { unlocked = CredStore.unlockSavedKey() || unlocked }
+            if systemLocked { unlocked = CredStore.unlockZCodeKey() || unlocked }
+            if unlocked { self.refresh(tokens: true, manual: true) }
         }
         refresh(tokens: true)
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
@@ -3575,14 +3595,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .contains { $0 == usage.quotaError }
         let resetNeedsUnlock = usage.resetCardsError == CredStore.v2LockedMessage
         let resetLoginUnsupported = usage.resetCardsError == CredStore.newCredentialMessage
+        // 待授权（可恢复）→ 按钮直接解锁（不经过填 Key 弹窗）；凭据缺失/格式升级 → 才需要填 Key 连接
+        let unlockable = usage.quotaError == CredStore.keychainUnavailableMessage
+            || usage.quotaError == CredStore.v2LockedMessage || resetNeedsUnlock
         if needsPlanConnection || resetNeedsUnlock {
             let instruction = usage.quotaError == CredStore.keychainUnavailableMessage
-                ? "请解锁已保存的套餐连接"
+                ? "钥匙串连接待解锁，点击恢复自动读取"
                 : (usage.quotaError == CredStore.v2LockedMessage || resetNeedsUnlock
-                    ? "ZCode 凭据需钥匙串授权，恢复自动用量与重置卡"
+                    ? "ZCode 凭据需钥匙串授权，点击解锁恢复自动用量与重置卡"
                     : "使用套餐 API Key 恢复自动刷新")
             add(label(instruction, color: .systemOrange))
-            add(button("连接套餐", #selector(onConnectPlan), prominent: true))
+            if unlockable {
+                add(button("解锁凭据", #selector(onUnlockCredentials), prominent: true))
+            } else {
+                add(button("连接套餐", #selector(onConnectPlan), prominent: true))
+            }
         }
         let quotaCard = GLMPanelCard()
         quotaCard.content.spacing = 6
@@ -4384,6 +4411,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private var connectingPlan = false
 
+    /// 待授权场景的直接入口：一键交互式解锁自建连接与 ZCode 系统密钥（系统授权框），
+    /// 不经过填 Key 弹窗。任一成功即全量刷新。
+    @objc private func onUnlockCredentials() {
+        guard !preview else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let savedOK = CredStore.unlockSavedKey()
+        let systemOK = CredStore.unlockZCodeKey()
+        if savedOK || systemOK {
+            setUpdateMessage("凭据已解锁，正在恢复自动读取", dismissAfter: 4)
+            refresh(tokens: true, manual: true)
+        } else {
+            setUpdateMessage("钥匙串解锁被拒绝，可重试或用「套餐设置」连接", dismissAfter: 8)
+        }
+    }
+
     @objc private func onConnectPlan() {
         guard !connectingPlan else { return }
         if ProcessInfo.processInfo.environment[CredStore.envKey]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
@@ -4406,6 +4448,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if canUnlock {
             alert.informativeText = "粘贴套餐 API Key，或选「解锁凭据」恢复自动读取（首次会弹钥匙串授权，请点「始终允许」）。"
         }
+        // 已连接时可放弃手动连接，回退到 ZCode 凭据库自动读取（enc:v2 解密可用后的推荐模式）
+        let canDisconnect = !preview && CredStore.isSavedKeyActive
+        if canDisconnect { alert.addButton(withTitle: "断开连接，改用自动读取") }
         alert.window.initialFirstResponder = field
         let response = alert.runModal()
         if canUnlock && response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 3 {
@@ -4413,6 +4458,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let systemOK = CredStore.unlockZCodeKey()
             if savedOK || systemOK { refresh(tokens: true, manual: true) }
             else { setUpdateMessage("钥匙串解锁被拒绝，可稍后重试", dismissAfter: 8) }
+            return
+        }
+        if canDisconnect && response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 4 {
+            CredStore.forgetSavedKey()
+            setUpdateMessage("已断开连接，改用 ZCode 凭据自动读取", dismissAfter: 5)
+            refresh(tokens: true, manual: true)
             return
         }
         if preview { setUpdateMessage("预览模式：不连接真实套餐", dismissAfter: 3); return }
