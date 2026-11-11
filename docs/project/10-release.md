@@ -24,7 +24,7 @@ python3 -m unittest discover -s tests -p '*_test.py'
 bash -n build.sh scripts/update.sh scripts/release.sh
 ```
 
-确认工作区干净、HEAD 已推送且版本号符合变更类型后，执行 `scripts/release.sh vX.Y.Z`。
+准备 `release-notes/vX.Y.Z.md`，以用户可感知的语言说明本次变化；空文件或已有 Release 说明不一致会阻止发布。确认工作区干净、HEAD 已推送且版本号符合变更类型后，执行 `scripts/release.sh vX.Y.Z`。
 
 脚本自动完成远端与身份检查、标签创建、构建、二进制自检、Peak 测试、ad-hoc 签名验证、DMG / ZIP 打包与校验、SHA256 生成以及 Release 创建或补全。
 

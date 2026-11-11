@@ -21,7 +21,7 @@ GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当前
 | `Fetcher` | 智谱额度、模型、工具、订阅和 ZCode 重置卡请求 |
 | `GLMStartPlanUsage` | 只读 ZCode 请求用量表，将赠送用量按周期、模型和自然日补入现有统计 |
 | `Peak` | 高峰、非高峰和限时活动的本地时段计算 |
-| `UpdateChecker` | 检查 GitHub Release 和更新资产 |
+| `UpdateChecker` | 检查 GitHub Release 和更新资产，保留同一版本的更新说明 |
 | `UpdateProgressController` | 后台更新、进度恢复和错误展示 |
 | `AppDelegate` | 原生 Popover、刷新调度、重置卡操作、自启和状态聚合 |
 | `GLMOfflineRegression` | 使用临时目录和假数据的离线自检 |
@@ -59,3 +59,5 @@ GitHub Release → 可安装版本选择 → ZIP / SHA256 下载 → 身份、�
 - Peak 活动日期是带时效的配置，必须可测试并在过期后自动失效。
 - 离线 mock、真实接口验证和真实安装验收是不同证据。
 - 当前没有 CI 强制发布门禁，也没有完整系统版本兼容性矩阵。
+
+面板支持纯色、经典毛玻璃和 macOS 26+ 液态玻璃；用户选择保存在本机，系统降低透明度时临时显示纯色。更新前在面板中展示说明并确认，确认时核对版本和说明未变化。

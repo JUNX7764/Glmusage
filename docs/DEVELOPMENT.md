@@ -18,7 +18,7 @@
 
 ## 构建
 
-需要 macOS 13 或更新版本、Apple Silicon 和 Xcode Command Line Tools；未安装 CLT 时先执行 `xcode-select --install`。
+运行需要 macOS 13 或更新版本及 Apple Silicon；构建需要 macOS 26 或更新的 SDK 和 Xcode Command Line Tools；未安装 CLT 时先执行 `xcode-select --install`。
 
 ```bash
 ./build.sh
@@ -113,3 +113,5 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 - `--once` 会读取真实登录态并联网，只能在明确安排网络验收时执行。
 - macOS 13 部署目标不等同于已在 macOS 13、14、15 或干净用户环境完成实机验收。
 - 真实更新验收必须记录旧版版本、目标版本、安装路径、是否从面板点击，以及重启和回滚结果。
+
+面板背景默认纯色；液态玻璃需 macOS 26+，旧系统回退经典毛玻璃，系统开启降低透明度时显示纯色。`--preview --preview-background=solid|classicMaterial|liquidGlass` 可使用假数据预览；`--preview --preview-update-notes` 预览更新确认，不执行真实更新。版本说明来自所选可安装 Release，确认前不下载。

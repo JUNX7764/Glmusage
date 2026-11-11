@@ -1899,7 +1899,7 @@ enum UpdateCheck {
 
     /// GitHub 按创建时间倒序返回 Release；空 Release 或附件上传不完整时跳过，
     /// 与 update.sh 选择同一个「最近可安装版本」，避免提示后下载 404。
-    static func latestDownloadableTag(in releases: [[String: Any]]) -> String? {
+    static func latestDownloadableRelease(in releases: [[String: Any]]) -> (tag: String, notes: String)? {
         for release in releases {
             guard let tag = release["tag_name"] as? String, normalized(tag) != nil,
                   release["draft"] as? Bool != true, release["prerelease"] as? Bool != true
@@ -1907,10 +1907,23 @@ enum UpdateCheck {
             let assets = release["assets"] as? [[String: Any]] ?? []
             let names = Set(assets.compactMap { $0["name"] as? String })
             if names.contains("GlmUsage.zip") && names.contains("GlmUsage.zip.sha256") {
-                return tag
+                return (tag, release["body"] as? String ?? "")
             }
         }
         return nil
+    }
+    static func latestDownloadableTag(in releases: [[String: Any]]) -> String? {
+        latestDownloadableRelease(in: releases)?.tag
+    }
+    static func displayNotes(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "本版本暂未提供详细更新说明" }
+        return trimmed.components(separatedBy: .newlines).map { line in
+            var value = line
+            if let range = value.range(of: #"^#{1,6}\s+"#, options: .regularExpression) { value.removeSubrange(range) }
+            if let range = value.range(of: #"^\s*[-*]\s+"#, options: .regularExpression) { value.replaceSubrange(range, with: "• ") }
+            return value.replacingOccurrences(of: "**", with: "")
+        }.joined(separator: "\n")
     }
 }
 
@@ -1920,6 +1933,7 @@ final class UpdateChecker {
     static let shared = UpdateChecker()
     private(set) var available = false
     private(set) var targetTag: String?
+    private(set) var releaseNotes = ""
     private var etag: String?
     private var lastCheck: Date?
     private var inFlight = false
@@ -1955,12 +1969,15 @@ final class UpdateChecker {
                           let releases = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
                     self.lastError = nil
                     self.hasValidResult = true
-                    if let tag = UpdateCheck.latestDownloadableTag(in: releases) {
+                    if let release = UpdateCheck.latestDownloadableRelease(in: releases) {
+                        let tag = release.tag
+                        self.releaseNotes = release.notes
                         self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
                         self.targetTag = self.available ? tag : nil
                     } else {
                         self.available = false
                         self.targetTag = nil
+                        self.releaseNotes = ""
                     }
                     if let e = http?.value(forHTTPHeaderField: "ETag"), !e.isEmpty { self.etag = e }
                 } else { self.lastError = "检查失败，请稍后重试" }
@@ -1975,8 +1992,21 @@ final class UpdateChecker {
 
 final class GLMPanelStack: NSStackView { override var isFlipped: Bool { true } }
 
+enum GLMPanelBackgroundStyle: String, CaseIterable {
+    case solid, liquidGlass, classicMaterial
+    static let defaultsKey = "panelBackgroundStyle"
+    var title: String {
+        switch self { case .solid: return "纯色"; case .liquidGlass: return "液态玻璃"; case .classicMaterial: return "经典毛玻璃" }
+    }
+    static func parse(_ raw: String?) -> Self { Self(rawValue: raw ?? "") ?? .solid }
+    func effective(liquidSupported: Bool, reduceTransparency: Bool) -> Self {
+        if reduceTransparency { return .solid }
+        return self == .liquidGlass && !liquidSupported ? .classicMaterial : self
+    }
+}
+
 final class GLMPanelBackground: NSView {
-    var opacity: CGFloat = 0.9 { didSet { needsDisplay = true } }
+    var opacity: CGFloat = 1 { didSet { needsDisplay = true } }
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
@@ -2650,6 +2680,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let panelFooterSlot = NSView()
     private let panelEffect = NSVisualEffectView()
     private let panelBackground = GLMPanelBackground()
+    private var backgroundStyle = GLMPanelBackgroundStyle.parse(UserDefaults.standard.string(forKey: GLMPanelBackgroundStyle.defaultsKey))
+    private var backgroundObserver: NSObjectProtocol?
+    private var updateConfirmation: (tag: String, notes: String)?
     private var globalClickMonitor: Any?
     private var localClickMonitor: Any?
     private var panelConfigured = false
@@ -2710,6 +2743,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 恢复上次「结果未知」遗留的幂等 key：跨重启防重复扣卡
         pendingResetKeys = GLMPendingResetStore.load(dir: Self.supportDir)
+        if preview, let argument = CommandLine.arguments.first(where: { $0.hasPrefix("--preview-background=") }) {
+            backgroundStyle = GLMPanelBackgroundStyle.parse(String(argument.dropFirst("--preview-background=".count)))
+        }
+        if preview && CommandLine.arguments.contains("--preview-update-notes") {
+            updateConfirmation = ("v99.0.0", "## 新增\n- 面板背景可自由切换\n\n## 优化\n- 更新前可查看本次变化")
+        }
+        backgroundObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main) { [weak self] _ in self?.applyBackgroundStyle() }
         NSLog("[GlmUsage] launched, creating status item")
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
@@ -2757,6 +2797,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.testDailyInteraction() }
                     }
                 }
+            }
+            if CommandLine.arguments.contains("--preview-update-test") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in self?.testUpdatePreview() }
             }
             if let i = CommandLine.arguments.firstIndex(of: "--preview-screenshot"), CommandLine.arguments.count > i + 1 {
                 let shotPath = CommandLine.arguments[i + 1]
@@ -3253,7 +3296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 历史上此处还构造过一个 NSMenu（menu delegate 从未接线、从未展示，文案需人肉与面板同步）；
     // 2026-11-08 review 确认死代码后整段切除。面板打开时的刷新与更新检查在 togglePanel 内完成。
     private func rebuildPanel() {
-        buildPanel()
+        if updateConfirmation == nil || !panelConfigured { buildPanel() }
     }
 
     @objc private func togglePanel() {
@@ -3262,9 +3305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if !preview { refresh(tokens: false); checkForUpdate() }
         rebuildPanel()
         if let button = statusItem.button {
-            let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-            panelBackground.opacity = reduceTransparency ? 1 : 0.9
-            panelEffect.isHidden = reduceTransparency
+            applyBackgroundStyle()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             if popover.isShown { installClickMonitors() }
         }
@@ -3302,6 +3343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        updateConfirmation = nil
         removeClickMonitors()
         if previewPopover && CommandLine.arguments.contains("--preview-trace") {
             print("GLM_POPOVER_TRACE closed")
@@ -3588,7 +3630,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // 更新进行中：原按钮位置换成进度行（重开面板也在此恢复）；空闲时才显示更新按钮
         if UpdateProgressController.shared.isActive { add(UpdateProgressRowView()) }
-        else if UpdateChecker.shared.available && !preview { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
+        else if let confirmation = updateConfirmation { add(makeUpdateConfirmation(tag: confirmation.tag, notes: confirmation.notes, width: inner)) }
+        else if (UpdateChecker.shared.available && !preview) || (preview && CommandLine.arguments.contains("--preview-update-notes")) { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
 
         let needsPlanConnection = [CredStore.newCredentialMessage, CredStore.keychainUnavailableMessage,
                                    CredStore.v2LockedMessage, CredStore.missingPlanMessage]
@@ -3921,7 +3964,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 pillText.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 7), pillText.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -7)])
             pill.setContentCompressionResistancePriority(.required, for: .horizontal)
             pill.setContentHuggingPriority(.required, for: .horizontal)
-            pill.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 44 - 70).isActive = true
+            pill.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 76 - 70).isActive = true
             titleRow.addArrangedSubview(pill)
         }
         headerText.addArrangedSubview(titleRow)
@@ -3929,13 +3972,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let email = usage.accountEmail {
             let emailLabel = label(email, size: 11, color: .secondaryLabelColor)
             emailLabel.lineBreakMode = .byTruncatingMiddle; emailLabel.maximumNumberOfLines = 1
-            emailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 44).isActive = true
+            emailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: inner - 76).isActive = true
             emailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             headerText.addArrangedSubview(emailLabel)
         }
         header.addArrangedSubview(headerText); headerText.translatesAutoresizingMaskIntoConstraints = false
-        headerText.widthAnchor.constraint(equalToConstant: inner - 44).isActive = true
+        headerText.widthAnchor.constraint(equalToConstant: inner - 76).isActive = true
         header.addArrangedSubview(spacer())
+        let backgroundButton = NSButton(image: NSImage(systemSymbolName: "square.on.square", accessibilityDescription: "背景样式") ?? NSImage(), target: self, action: #selector(showBackgroundStyleMenu(_:)))
+        backgroundButton.isBordered = false; backgroundButton.contentTintColor = .secondaryLabelColor
+        backgroundButton.toolTip = "背景样式"; backgroundButton.setAccessibilityLabel("背景样式")
+        backgroundButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        backgroundButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        header.addArrangedSubview(backgroundButton)
         let scroll = panelScroll
         activeScroll = scroll
         let footer = GLMPanelStack(); footer.orientation = .vertical; footer.alignment = .leading; footer.spacing = 8
@@ -3973,6 +4022,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             panelBackground.autoresizingMask = [.width, .height]
             panelBackground.wantsLayer = true
             container.addSubview(panelBackground)
+            applyBackgroundStyle()
             let headerLine = separator(); let footerLine = separator()
             for v in [panelHeaderSlot, headerLine, scroll, footerLine, panelFooterSlot] { v.translatesAutoresizingMaskIntoConstraints = false; container.addSubview(v) }
             scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
@@ -4530,24 +4580,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         UpdateChecker.shared.check { [weak self] in self?.updateUI() }
     }
 
-    @objc private func onUpdateApp() {
-        // App Translocation：从下载目录直接运行的应用被挂载到只读位置，原地更新必然失败，
-        // 在发起更新前拦截并给出安装指引，而不是让脚本在暂存阶段报错。
-        if Bundle.main.bundleURL.path.contains("/AppTranslocation/") {
-            let alert = NSAlert()
-            alert.messageText = "无法原地更新"
-            alert.informativeText = "GlmUsage 正在从临时位置运行（App Translocation），无法原地替换。\n请退出应用，把 GlmUsage.app 拖入「应用程序」文件夹后从那里打开。"
-            alert.addButton(withTitle: "好")
-            alert.runModal()
-            return
+    private func testUpdatePreview() {
+        func fail(_ message: String) -> Never { fputs("GLM update preview: FAIL \(message)\n", stderr); exit(1) }
+        func buttons(_ view: NSView) -> [NSButton] { ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap { buttons($0) } }
+        func textScroll(_ view: NSView) -> NSScrollView? {
+            if let scroll = view as? NSScrollView, scroll.documentView is NSTextView { return scroll }
+            for child in view.subviews { if let result = textScroll(child) { return result } }; return nil
         }
-        guard let script = Bundle.main.path(forResource: "update", ofType: "sh") else {
-            NSWorkspace.shared.open(UpdateCheck.releasesPage); return
+        updateConfirmation = ("v99.0.0", Array(repeating: "- 版本更新说明，测试较长内容可以滚动查看。", count: 50).joined(separator: "\n"))
+        buildPanel(); panelController.view.layoutSubtreeIfNeeded()
+        guard let scroll = textScroll(panelRoot), let document = scroll.documentView, document.frame.height > scroll.contentView.bounds.height else { fail("long notes not scrollable") }
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: document.frame.height - scroll.contentView.bounds.height))
+        guard scroll.contentView.bounds.origin.y > 0 else { fail("scroll did not move") }
+        rebuildPanel()
+        guard textScroll(panelRoot) === scroll, scroll.contentView.bounds.origin.y > 0 else { fail("refresh lost notes position") }
+        guard let cancel = buttons(panelRoot).first(where: { $0.title == "取消" }) else { fail("missing cancel") }
+        cancel.performClick(nil)
+        guard updateConfirmation == nil, !UpdateProgressController.shared.isActive else { fail("cancel started update") }
+        updateConfirmation = ("v99.0.0", "测试"); buildPanel()
+        guard let install = buttons(panelRoot).first(where: { $0.title == "下载并安装" }) else { fail("missing install") }
+        install.performClick(nil)
+        guard updateConfirmation == nil, !UpdateProgressController.shared.isActive else { fail("preview started update") }
+        updateConfirmation = ("v99.0.0", "测试"); popoverDidClose(Notification(name: NSPopover.didCloseNotification))
+        guard updateConfirmation == nil else { fail("close retained confirmation") }
+        for style in GLMPanelBackgroundStyle.allCases where style != .liquidGlass || Self.supportsLiquidGlass {
+            let item = NSMenuItem(); item.representedObject = style.rawValue; selectBackgroundStyle(item)
+            let expected = style.effective(liquidSupported: Self.supportsLiquidGlass, reduceTransparency: NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)
+            guard backgroundStyle == style, panelBackground.isHidden == (expected != .solid), panelEffect.isHidden == (expected != .classicMaterial) else { fail("background \(style.rawValue)") }
+        }
+        print("GLM update preview: PASS (scroll, refresh, cancel, preview install, close, backgrounds)"); exit(0)
+    }
+
+    private static var supportsLiquidGlass: Bool {
+        if #available(macOS 26.0, *) { return true }; return false
+    }
+    private func applyBackgroundStyle() {
+        let style = backgroundStyle.effective(liquidSupported: Self.supportsLiquidGlass,
+            reduceTransparency: NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)
+        panelBackground.isHidden = style != .solid
+        panelEffect.isHidden = style != .classicMaterial
+    }
+    @objc private func showBackgroundStyleMenu(_ sender: NSButton) {
+        let menu = NSMenu(); menu.autoenablesItems = false
+        for style in GLMPanelBackgroundStyle.allCases {
+            let unavailable = style == .liquidGlass && !Self.supportsLiquidGlass
+            let item = NSMenuItem(title: unavailable ? "液态玻璃（需 macOS 26+）" : style.title, action: #selector(selectBackgroundStyle(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = style.rawValue; item.state = style == backgroundStyle ? .on : .off; item.isEnabled = !unavailable
+            menu.addItem(item)
+        }
+        let hadMonitors = localClickMonitor != nil || globalClickMonitor != nil
+        if hadMonitors { removeClickMonitors() }
+        menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.maxX, y: -6), in: sender)
+        if hadMonitors && popover.isShown { installClickMonitors() }
+    }
+    @objc private func selectBackgroundStyle(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let style = GLMPanelBackgroundStyle(rawValue: raw), style != .liquidGlass || Self.supportsLiquidGlass else { return }
+        backgroundStyle = style
+        if !preview { UserDefaults.standard.set(style.rawValue, forKey: GLMPanelBackgroundStyle.defaultsKey) }
+        applyBackgroundStyle()
+    }
+    private func makeUpdateConfirmation(tag: String, notes: String, width: CGFloat) -> NSView {
+        let content = GLMPanelStack(); content.orientation = .vertical; content.alignment = .leading; content.spacing = 7
+        func add(_ view: NSView) { content.addArrangedSubview(view); view.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true }
+        func textLabel(_ value: String, size: CGFloat, bold: Bool = false) -> NSTextField {
+            let label = NSTextField(wrappingLabelWithString: value); label.font = .systemFont(ofSize: size, weight: bold ? .semibold : .regular); return label
+        }
+        add(textLabel("发现新版本 \(tag)", size: 13, bold: true))
+        let current = textLabel("当前版本 \(BuildInfo.version)", size: 11); current.textColor = .secondaryLabelColor; add(current)
+        add(textLabel("本次更新", size: 12, bold: true))
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: width - 20, height: 100))
+        text.isEditable = false; text.isSelectable = true; text.drawsBackground = false
+        text.font = .systemFont(ofSize: 12); text.textColor = .labelColor
+        text.textContainerInset = NSSize(width: 3, height: 3); text.textContainer?.widthTracksTextView = true
+        text.isVerticallyResizable = true; text.isHorizontallyResizable = false
+        text.string = UpdateCheck.displayNotes(notes)
+        let scroll = NSScrollView(); scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.documentView = text
+        scroll.borderType = .bezelBorder
+        let measured = (text.string as NSString).boundingRect(with: NSSize(width: width - 28, height: 10000), options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: NSFont.systemFont(ofSize: 12)]).height
+        scroll.heightAnchor.constraint(equalToConstant: min(134, max(48, ceil(measured) + 18))).isActive = true; add(scroll)
+        let notice = textLabel("安装完成后，应用将自动重启。", size: 11); notice.textColor = .secondaryLabelColor; add(notice)
+        let actions = NSStackView(); actions.orientation = .horizontal; actions.alignment = .centerY; actions.spacing = 5
+        let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal); actions.addArrangedSubview(spacer)
+        actions.addArrangedSubview(NSButton(title: "取消", target: self, action: #selector(cancelUpdateConfirmation)))
+        actions.addArrangedSubview(NSButton(title: "下载并安装", target: self, action: #selector(confirmUpdate)))
+        add(actions)
+        return content
+    }
+    @objc private func cancelUpdateConfirmation() { updateConfirmation = nil; buildPanel() }
+    @objc private func onUpdateApp() {
+        if preview && CommandLine.arguments.contains("--preview-update-notes") {
+            updateConfirmation = ("v99.0.0", "## 新增\n- 面板背景可自由切换\n\n## 优化\n- 更新前可查看本次变化")
+            buildPanel(); return
         }
         guard let tag = UpdateChecker.shared.targetTag else { return }
-        // 用户决策（2026-11-08）：更新不弹二次确认——横幅点击即走下载/校验/重启流程，
-        // 面板内原位进度行就是过程反馈；与「使用重置卡」（消耗性写操作）的确认语义区分开
-        UpdateProgressController.shared.start(script: script, tag: tag, appPath: Bundle.main.bundleURL.path)
+        updateConfirmation = (tag, UpdateChecker.shared.releaseNotes)
+        buildPanel()
+    }
+    @objc private func confirmUpdate() {
+        guard let confirmation = updateConfirmation else { return }
+        updateConfirmation = nil
+        if preview { buildPanel(); return }
+        guard confirmation.tag == UpdateChecker.shared.targetTag, confirmation.notes == UpdateChecker.shared.releaseNotes, UpdateChecker.shared.available else {
+            setUpdateMessage("版本信息已变化，请重新查看更新说明", dismissAfter: 8); buildPanel(); return
+        }
+        if Bundle.main.bundleURL.path.contains("/AppTranslocation/") {
+            let alert = NSAlert(); alert.messageText = "无法原地更新"
+            alert.informativeText = "GlmUsage 正在从临时位置运行，无法原地替换。请退出应用，把 GlmUsage.app 拖入「应用程序」文件夹后从那里打开。"
+            alert.addButton(withTitle: "好"); alert.runModal(); buildPanel(); return
+        }
+        guard let script = Bundle.main.path(forResource: "update", ofType: "sh") else {
+            NSWorkspace.shared.open(UpdateCheck.releasesPage); buildPanel(); return
+        }
+        UpdateProgressController.shared.start(script: script, tag: confirmation.tag, appPath: Bundle.main.bundleURL.path)
+        buildPanel()
     }
 
     @objc private func onQuit() { NSApp.terminate(nil) }
@@ -5225,6 +5370,11 @@ enum GLMOfflineRegression {
             try expect(!UpdateCheck.canCompare(local: "v1.2.0", remote: "unknown"), "invalid remote version accepted")
             try expect(UpdateCheck.canCompare(local: "v1.2.0-3-g123", remote: "v1.3.0"), "valid release comparison rejected")
 
+            try expect(UpdateCheck.displayNotes("  ") == "本版本暂未提供详细更新说明", "empty notes fallback")
+            try expect(UpdateCheck.displayNotes("## 新增\n- **功能**") == "新增\n• 功能", "notes formatting")
+            try expect(GLMPanelBackgroundStyle.parse(nil) == .solid && GLMPanelBackgroundStyle.parse("bad") == .solid, "background default")
+            try expect(GLMPanelBackgroundStyle.liquidGlass.effective(liquidSupported: false, reduceTransparency: false) == .classicMaterial, "background legacy fallback")
+            try expect(GLMPanelBackgroundStyle.liquidGlass.effective(liquidSupported: true, reduceTransparency: true) == .solid, "background transparency fallback")
             // 更新检查与脚本都只认附件完整的 Release；最新空 Release 不遮挡最近可安装版本
             let completeRelease: [String: Any] = [
                 "tag_name": "v1.0.11", "draft": false, "prerelease": false,
@@ -5243,6 +5393,9 @@ enum GLMOfflineRegression {
                        "release without SHA256 accepted")
             try expect(UpdateCheck.latestDownloadableTag(in: [emptyRelease]) == nil,
                        "release without assets accepted")
+            var notedRelease = completeRelease; notedRelease["body"] = "测试说明"
+            let selectedRelease = UpdateCheck.latestDownloadableRelease(in: [emptyRelease, notedRelease])
+            try expect(selectedRelease?.tag == "v1.0.11" && selectedRelease?.notes == "测试说明", "notes belong to selected release")
             var prerelease = completeRelease
             prerelease["prerelease"] = true
             try expect(UpdateCheck.latestDownloadableTag(in: [prerelease, completeRelease]) == "v1.0.11",
