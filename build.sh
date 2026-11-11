@@ -50,8 +50,17 @@ esac
 cp "$DIR/scripts/update.sh" "$APP/Contents/Resources/update.sh"
 chmod +x "$APP/Contents/Resources/update.sh"
 
-echo "== ad-hoc 签名 =="
-codesign --force --deep --sign - "$APP"
+echo "== 签名 =="
+# 优先用本机稳定身份 local-codesign（自签代码签名证书，密钥在 login keychain）：
+# 钥匙串 ACL 按签名身份判定，证书不变则 app 更新后已授权条目继续可用；
+# ad-hoc 签名的 DR 绑定单次构建 cdhash，每次编译都会使钥匙串授权失效（2026-11-11 实测）。
+# 证书缺失（新机器/CI）时回退 ad-hoc，构建永不因此失败。
+if security find-identity -v -p codesigning 2>/dev/null | grep -q 'local-codesign'; then
+  codesign --force --deep --sign "local-codesign" "$APP"
+else
+  echo "   (未找到 local-codesign 证书，回退 ad-hoc；更新后需重新授权钥匙串)"
+  codesign --force --deep --sign - "$APP"
+fi
 codesign --verify --deep --strict "$APP"
 
 echo "== 完成: ${APP}（版本 ${VERSION_DESCRIBE}）=="
