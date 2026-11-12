@@ -30,7 +30,16 @@ fi
 echo "== 编译 Swift 源码 =="
 # 必须显式指定部署目标：本机 CLT 默认 target 是 macosx28.0（比当前系统 macOS 27 新），
 # 缺省编译出的二进制 minos=28.0 会被 LaunchServices 拒绝（"不能与此版本 macOS 配合使用"）。
-swiftc -O -target arm64-apple-macos13.0 -o "$DIR/GlmUsage-bin" "$DIR/GlmUsage.swift"
+BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+cp "$DIR/GlmUsage.swift" "$BUILD_DIR/main.swift"
+swiftc -O -target arm64-apple-macos13.0 -o "$DIR/GlmUsage-bin" \
+    "$BUILD_DIR/main.swift" \
+    "$DIR/Sources/GLMQuotaCycleHistory.swift" \
+    "$DIR/Sources/GLMQuotaCycleContext.swift" \
+    "$DIR/Sources/GLMQuotaCycleStore.swift" \
+    "$DIR/Sources/GLMQuotaCycleCoordinator.swift" \
+    "$DIR/Sources/GLMQuotaCycleHistoryView.swift"
 
 echo "== 打包 .app =="
 rm -rf "$APP"
