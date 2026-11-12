@@ -164,14 +164,35 @@ enum CredStore {
         loadPlanCredential().key
     }
 
-    static func loadPlanCredential() -> (key: String?, error: String) {
-        let envValue = ProcessInfo.processInfo.environment[envKey]
-        if let value = envValue, !value.trimmingCharacters(in: .whitespaces).isEmpty { return (value, "") }
-        switch savedKey {
-        case .key(let key): return (key, "")
-        case .unavailable: return (nil, keychainUnavailableMessage)
-        case .missing: return resolvePlanCredential(record: credentialRecord() ?? [:])
+    struct TypedPlanCredential {
+        let key: String?
+        let error: String
+        let mode: GLMQuotaHistoryContext.Mode?
+        var context: GLMQuotaHistoryContext? {
+            guard let key, let mode else { return nil }
+            return mode == .apiKey ? .apiKey(key) : .oauth
         }
+    }
+    static func loadPlanCredential() -> (key: String?, error: String) {
+        let result = loadPlanCredentialTyped()
+        return (result.key, result.error)
+    }
+    static func loadPlanCredentialTyped() -> TypedPlanCredential {
+        let envValue = ProcessInfo.processInfo.environment[envKey]
+        if let value = envValue, !value.trimmingCharacters(in: .whitespaces).isEmpty {
+            return .init(key: value, error: "", mode: .apiKey)
+        }
+        switch savedKey {
+        case .key(let key): return .init(key: key, error: "", mode: .apiKey)
+        case .unavailable: return .init(key: nil, error: keychainUnavailableMessage, mode: nil)
+        case .missing: return resolvePlanCredentialTyped(record: credentialRecord() ?? [:])
+        }
+    }
+    static func resolvePlanCredentialTyped(envValue: String? = nil, record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> TypedPlanCredential {
+        let result = resolvePlanCredential(envValue: envValue, record: record, secret: secret, systemKey: systemKey)
+        guard result.key != nil else { return .init(key: nil, error: result.error, mode: nil) }
+        let mode: GLMQuotaHistoryContext.Mode = (envValue?.trimmingCharacters(in: .whitespaces).isEmpty == false || preferredApiKey(record: record) != nil) ? .apiKey : .oauth
+        return .init(key: result.key, error: result.error, mode: mode)
     }
 
     private static func credentialRecord() -> [String: String]? {
@@ -2668,6 +2689,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 重置卡使用：进行中防重入；结果未知（网络/5xx）时按类型保留同一幂等 key，重试不重复扣卡
     private var resetUseInFlight = false
     private var pendingResetKeys: [String: GLMPendingResetStore.Entry] = [:]
+    private var historyResetAttempts: [String: (token: GLMQuotaCaptureToken, baseline: UUID?, attributable: Bool)] = [:]
     // 自诊断与幂等 key 持久化目录（与 status.json 同目录；key 文件不含任何凭据）
     private static let supportDir = NSHomeDirectory() + "/Library/Application Support/GlmUsage"
 
@@ -2699,8 +2721,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var updateMessageDismissal: DispatchWorkItem?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
-    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
-    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
@@ -2726,11 +2748,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var weekCardsLastOK: Date?
     private var subscriptionLastOK: Date?
     private var planLevelLastOK: Date?
+    private var historyCoordinator: GLMQuotaCycleCoordinator?
+    private var historyContext: GLMQuotaHistoryContext?
+    private var historySnapshot: GLMQuotaCycleSnapshot?
+    private var historyBrowser = GLMQuotaHistoryBrowser()
+    private var historyExpanded = true
+    private weak var historyCanvasForFocus: GLMQuotaHistoryCanvas?
+    private func bindHistoryContext(_ context: GLMQuotaHistoryContext?) {
+        guard historyContext != context else { return }
+        historyContext = context
+        if let context, historyCoordinator != nil {
+            historySnapshot = GLMQuotaCycleSnapshot(state: GLMQuotaCycleState(), isVolatile: context.partition == nil,
+                                                    isProtected: false, isUnsaved: false, isLoading: true)
+        } else { historySnapshot = nil }
+        historyBrowser = GLMQuotaHistoryBrowser()
+        historyCoordinator?.activate(context)
+    }
     private var planCredential: SHA256.Digest?
     private func bindPlanCredential(_ key: String?) {
         let identity = key.map { SHA256.hash(data: Data($0.utf8)) }
         guard identity != planCredential else { return }
         planCredential = identity
+        bindHistoryContext(nil)
         usage.subscription = nil; subscriptionLastOK = nil
         usage.level = nil; planLevelLastOK = nil
     }
@@ -2745,7 +2784,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 恢复上次「结果未知」遗留的幂等 key：跨重启防重复扣卡
-        pendingResetKeys = GLMPendingResetStore.load(dir: Self.supportDir)
+        if !preview {
+            pendingResetKeys = GLMPendingResetStore.load(dir: Self.supportDir)
+            historyCoordinator = GLMQuotaCycleCoordinator(root: URL(fileURLWithPath: Self.supportDir, isDirectory: true).appendingPathComponent("quota-history", isDirectory: true)) { [weak self] snapshot in
+                guard let self = self else { return }
+                self.historySnapshot = snapshot
+                self.rebuildPanel()
+            }
+        }
         if preview, let argument = CommandLine.arguments.first(where: { $0.hasPrefix("--preview-background=") }) {
             backgroundStyle = GLMPanelBackgroundStyle.parse(String(argument.dropFirst("--preview-background=".count)))
         }
@@ -2763,13 +2809,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.animates = false
         // 仅离线 GUI 回归进程：改用 applicationDefined，避免测试期间的真实鼠标点击
         // （用户正在用机）把 transient Popover 关掉造成几何断言误报；生产与普通预览不变
-        if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") {
+        if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") {
             popover.behavior = .applicationDefined
         }
         if preview {
             if CommandLine.arguments.contains("--preview-dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
             // 几何测试需保留展开模型所需的高度余量；每日图交互由独立测试覆盖。
-            if CommandLine.arguments.contains("--preview-popover-test") { dailyExpanded = false }
+            if CommandLine.arguments.contains("--preview-popover-test") { dailyExpanded = false; historyExpanded = false }
+            if CommandLine.arguments.contains("--preview-quota-history-test") { try? FileManager.default.removeItem(atPath: "/tmp/glm_quota_history_test_result.txt") }
             installPreviewData()
             rebuildPanel()
             statusItem.button?.title = "GLM 预览"
@@ -2788,7 +2835,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 previewWindow?.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
             }
-            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
+            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self = self else { return }
                     self.togglePanel()
@@ -2798,6 +2845,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                     if CommandLine.arguments.contains("--preview-daily-test") {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.testDailyInteraction() }
+                    }
+                    if CommandLine.arguments.contains("--preview-quota-history-test") {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.testHistoryInteraction() }
                     }
                 }
             }
@@ -2885,8 +2935,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func performQuotaRefresh() {
         lastAttemptAt = Date()
-        let credential = CredStore.loadPlanCredential()
+        let credential = CredStore.loadPlanCredentialTyped()
         bindPlanCredential(credential.key)
+        bindHistoryContext(credential.context)
         guard let key = credential.key else {
             var failed = UsageData()
             failed.fiveHourError = credential.error; failed.weekError = failed.fiveHourError
@@ -2895,14 +2946,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         let savedConnection = CredStore.isSavedKeyActive
+        let startedAt = Date()
+        let historyToken = historyCoordinator?.capture(requestStartedAt: startedAt)
         Fetcher.fetchQuota(apiKey: key, rawKey: savedConnection) { [weak self] data in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                guard self.planCredentialMatches(key) && savedConnection == CredStore.isSavedKeyActive else {
+                let current = CredStore.loadPlanCredentialTyped()
+                self.bindPlanCredential(current.key)
+                self.bindHistoryContext(current.context)
+                guard current.key.map({ SHA256.hash(data: Data($0.utf8)) }) == SHA256.hash(data: Data(key.utf8)),
+                      current.context == credential.context, savedConnection == CredStore.isSavedKeyActive else {
                     self.updateUI()
                     if self.quotaGate.finish() { self.performQuotaRefresh() }
                     else { self.refreshQuota(manual: true) }
                     return
+                }
+                if let historyToken, let observation = GLMHistoryAdapter.observation(data, requestStartedAt: startedAt, observedAt: Date()) {
+                    self.historyCoordinator?.observe(observation, token: historyToken)
                 }
                 self.finishQuota(data)
             }
@@ -3416,19 +3476,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         resetUseInFlight = true
         // 上次结果未知则复用同一幂等 key（服务器按 key 幂等，重试不会重复扣卡）
         let key: String
+        let isNew: Bool
         if let existing = pendingResetKeys[type.rawValue] {
-            key = existing.key
+            key = existing.key; isNew = false
         } else {
             let fresh = UUID().uuidString
             pendingResetKeys[type.rawValue] = .init(key: fresh, createdAt: Date())
             persistPendingResetKeys()
-            key = fresh
+            key = fresh; isNew = true
+        }
+        let livePlan = CredStore.loadPlanCredentialTyped()
+        bindPlanCredential(livePlan.key)
+        bindHistoryContext(livePlan.context)
+        let operationHash = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+        let createdAt = pendingResetKeys[type.rawValue]!.createdAt
+        if isNew, let token = historyCoordinator?.capture(requestStartedAt: createdAt) {
+            let attributable = livePlan.key.map { token.context.mayAttributeReset(planCredential: $0, resetCredential: maas) } ?? false
+            historyResetAttempts[operationHash] = (token, historySnapshot?.state.current?.id, attributable)
+        } else if historyResetAttempts[operationHash] == nil,
+                  let token = historyCoordinator?.capture(requestStartedAt: createdAt) {
+            // Pending from an earlier process has no provable baseline or attribution.
+            historyResetAttempts[operationHash] = (token, nil, false)
+        }
+        let attempt = historyResetAttempts[operationHash]
+        if let attempt {
+            historyCoordinator?.record(.init(operationHash: operationHash, originalRequestedAt: createdAt,
+                responseAt: nil, isWeek: type == .week, result: .requested,
+                baselineCycleID: attempt.baseline, attributionProven: attempt.attributable), token: attempt.token)
         }
         rebuildPanel()
         Fetcher.useResetCard(jwt: jwt, maas: maas, resetType: type, idempotencyKey: key) { [weak self] outcome in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.resetUseInFlight = false
+                if let attempt {
+                    let current = CredStore.loadPlanCredentialTyped()
+                    self.bindPlanCredential(current.key)
+                    self.bindHistoryContext(current.context)
+                    let stillAttributable = current.key.map { attempt.token.context.mayAttributeReset(planCredential: $0, resetCredential: maas) } ?? false
+                    if outcome.used && type == .week { self.historyCoordinator?.advanceEpoch(ifCurrent: attempt.token) }
+                    self.historyCoordinator?.record(.init(operationHash: operationHash, originalRequestedAt: createdAt,
+                        responseAt: Date(), isWeek: type == .week, result: GLMHistoryAdapter.operationResult(outcome),
+                        baselineCycleID: attempt.baseline, attributionProven: attempt.attributable && stillAttributable), token: attempt.token)
+                    if outcome.used || !outcome.retryable { self.historyResetAttempts.removeValue(forKey: operationHash) }
+                }
                 if outcome.used {
                     self.pendingResetKeys.removeValue(forKey: type.rawValue)
                     self.persistPendingResetKeys()
@@ -3461,6 +3552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
     @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildPanel() }
     @objc private func toggleDaily() { dailyExpanded.toggle(); rebuildPanel() }
+    @objc private func toggleHistory() { historyExpanded.toggle(); rebuildPanel() }
     // 版本点击等临时状态行；dismissAfter 到点后自动清除（与 CodexUsage 一致）
     private func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
         updateMessageDismissal?.cancel()
@@ -3485,6 +3577,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func installPreviewData() {
+        if CommandLine.arguments.contains("--preview-quota-history") {
+            let stateName = CommandLine.arguments.first(where: { $0.hasPrefix("--preview-quota-history-state=") }).map { String($0.dropFirst("--preview-quota-history-state=".count)) } ?? "long"
+            var history = GLMQuotaCycleState()
+            let count = stateName == "empty" ? 0 : stateName == "short" ? 1 : 13
+            let base = Date(timeIntervalSince1970: 1_799_000_000)
+            for i in 0..<count {
+                let at = base.addingTimeInterval(Double(i) * 604800)
+                let observation = GLMQuotaObservation(requestStartedAt: at, observedAt: at.addingTimeInterval(1),
+                    limitCredits: 10000, reportedUsedCredits: Double((i * 733) % 10000),
+                    remainingCredits: Double(10000 - ((i * 733) % 10000)), resetAt: at.addingTimeInterval(604800), planLevel: "PRO")
+                var record = GLMQuotaCycleRecord(observation, startKind: i == 0 ? .firstObserved : .observedTransition)
+                if i == count - 1 { history.current = record }
+                else {
+                    record.end = [.natural, .redeemed, .unknownChange, .gap, .specificationChanged][i % 5]
+                    history.closed.append(record)
+                }
+            }
+            if stateName == "long", let current = history.current {
+                let last = current.lastObservation
+                let candidate = GLMQuotaObservation(requestStartedAt: last.observedAt.addingTimeInterval(10), observedAt: last.observedAt.addingTimeInterval(11), limitCredits: last.limitCredits, reportedUsedCredits: 1000, remainingCredits: 9000, resetAt: last.resetAt.addingTimeInterval(1000), planLevel: last.planLevel)
+                history.pending = GLMQuotaCycleCandidate(baselineID: current.id, first: candidate, reason: .unknownChange)
+            }
+            historySnapshot = GLMQuotaCycleSnapshot(state: history, isVolatile: stateName == "volatile", isProtected: stateName == "protected", isUnsaved: stateName == "unsaved")
+        }
         let now = Date()
         let newZCode = CommandLine.arguments.contains("--preview-new-zcode")
         let empty = CommandLine.arguments.contains("--preview-empty")
@@ -3919,6 +4035,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         addContent(dailySection, to: dailyCard)
         add(dailyCard)
 
+        let historyCard = GLMPanelCard()
+        historyCard.content.spacing = 3
+        let historyHeader = section("额度周期回顾", icon: "chart.bar", expanded: historyExpanded, action: #selector(toggleHistory))
+        addContent(historyHeader, to: historyCard)
+        var historyCanvas: GLMQuotaHistoryCanvas?
+        if historyExpanded {
+            let state = historySnapshot?.state ?? GLMQuotaCycleState()
+            let records = state.closed + (state.current.map { [$0] } ?? [])
+            var historyNotes: [String] = []
+            if historySnapshot?.isLoading == true { historyNotes.append("加载历史中") }
+            if historySnapshot?.isProtected == true { historyNotes.append("历史文件受保护") }
+            else if historySnapshot?.isUnsaved == true { historyNotes.append("历史未保存") }
+            if historySnapshot?.isVolatile == true { historyNotes.append("仅保留本次运行") }
+            if state.operations.values.contains(where: { $0.isWeek && $0.result == .confirmedUsed && !$0.attributionProven }) { historyNotes.append("本机用卡归属未确认") }
+            if state.current.map({ $0.expectedResetAt < Date() && state.pending == nil }) == true { historyNotes.append("等待窗口更新") }
+            let status: String? = historyNotes.isEmpty ? nil : historyNotes.joined(separator: " · ")
+            let historyView = GLMQuotaHistorySectionView(records: records, browser: historyBrowser, accent: GLMPeakTint.accent, pending: state.pending != nil, status: status) { [weak self] browser, needsRebuild in
+                guard let self = self else { return }
+                self.historyBrowser = browser
+                if needsRebuild {
+                    let focused = self.historyCanvasForFocus?.window?.firstResponder === self.historyCanvasForFocus
+                    self.rebuildPanel()
+                    if focused, let canvas = self.historyCanvasForFocus { canvas.window?.makeFirstResponder(canvas) }
+                }
+            }
+            historyCanvas = historyView.canvas
+            historyCanvasForFocus = historyView.canvas
+            addContent(historyView, to: historyCard)
+        }
+        add(historyCard)
+
         let mcpCard = GLMPanelCard()
         mcpCard.content.spacing = 4
         let mcpSection = section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP))
@@ -3926,12 +4073,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 键盘可达（PRD §6.2 支持键盘切换日期）：把柱图接进 key view loop——
         // 「用量情况」标题 → 柱图 → 「MCP 工具」标题为显式顺序，其余环节按几何自动；
         // Full Keyboard Access 下 Tab 即可到达柱图，左右方向键切换日期
-        if dailyExpanded {
-            usageSection.nextKeyView = dailySection.chartCanvas
-            dailySection.chartCanvas.nextKeyView = mcpSection
-        } else {
-            usageSection.nextKeyView = mcpSection   // 折叠时柱图不在视图层级，直接桥接相邻板块
-        }
+        let afterUsage: NSView = dailyExpanded ? dailySection.chartCanvas : historyHeader
+        usageSection.nextKeyView = afterUsage
+        if dailyExpanded { dailySection.chartCanvas.nextKeyView = historyHeader }
+        if let canvas = historyCanvas { historyHeader.nextKeyView = canvas; canvas.nextKeyView = mcpSection }
+        else { historyHeader.nextKeyView = mcpSection }
         if mcpExpanded {
             if let t = usage.tools30d { addContent(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor), to: mcpCard) }
             else { addContent(label("暂无数据", color: .secondaryLabelColor), to: mcpCard) }
@@ -4050,7 +4196,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         install(footer, in: panelFooterSlot)
         root.layoutSubtreeIfNeeded(); footer.layoutSubtreeIfNeeded()
         let maxHeight = (statusItem.button?.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
-        let rawHeight = min(maxHeight * 0.82, max(250, root.fittingSize.height + footer.fittingSize.height + 78))
+        // --preview-screenshot（预览窗口）不受屏幕高度截断：离线预览矩阵需完整渲染
+        // scroll 以下的底部卡片（额度周期回顾/MCP）；窗口可超屏，离屏缓存渲染不受影响。
+        let screenshotFull = CommandLine.arguments.contains("--preview-screenshot") && !previewPopover
+        let rawHeight = screenshotFull
+            ? max(250, root.fittingSize.height + footer.fittingSize.height + 78)
+            : min(maxHeight * 0.82, max(250, root.fittingSize.height + footer.fittingSize.height + 78))
         // 量化为偶数点：Popover 顶部锚定状态栏，高度奇偶变化会让 AppKit 重新取整 ±1pt
         // （面板加每日用量后高度更常变化，回归曾抓到 anchor 漂移）；偶数高度保持取整稳定
         let height = (rawHeight / 2).rounded(.down) * 2
@@ -4114,7 +4265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         func buttons(_ view: NSView) -> [NSButton] {
             ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap { buttons($0) }
         }
-        func fail(_ message: String) { fputs("GLM popover test: FAIL \(message)\n", stderr) }
+        func fail(_ message: String) -> Never { fputs("GLM popover test: FAIL \(message)\n", stderr); exit(1) }
         // 环境扰动恢复标记：测试期间用户真实点击/激活切换可能把 popover 关掉（生产语义正确），
         // 此时重开并以当前高度为新基线继续；视图身份变化仍是硬失败
         var envRecovered = false
@@ -4237,6 +4388,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
         run(0)
+    }
+
+    // Test-only AppKit event dispatch. The isolated preview never loads real credentials or history.
+    private func testHistoryInteraction() {
+        let resultFile = "/tmp/glm_quota_history_test_result.txt"
+        func fail(_ message: String) -> Never {
+            fputs("GLM history test: FAIL \(message)\n", stderr)
+            try? "FAIL \(message)".write(toFile: resultFile, atomically: true, encoding: .utf8)
+            exit(1)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        if panelController.view.window?.isKeyWindow != true {
+            popover.performClose(nil); RunLoop.current.run(until: Date().addingTimeInterval(0.3)); togglePanel()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        guard let window = panelController.view.window, window.isKeyWindow, let initial = historyCanvasForFocus,
+              let snapshot = historySnapshot else { fail("key window or fixture unavailable; keyboard unverified") }
+        let records = snapshot.state.closed + (snapshot.state.current.map { [$0] } ?? [])
+        guard records.count >= 13 else { fail("13-cycle fixture unavailable") }
+        initial.scrollToVisible(initial.bounds); panelController.view.layoutSubtreeIfNeeded(); window.acceptsMouseMovedEvents = true
+        func mouse(_ type: NSEvent.EventType, _ view: NSView, _ point: NSPoint) {
+            guard let event = NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: type == .leftMouseDown ? 1 : 0, pressure: 1) else { fail("mouse event") }
+            NSApp.sendEvent(event)
+        }
+        func key(_ code: UInt16, _ text: String = "") {
+            guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                characters: text, charactersIgnoringModifiers: text, isARepeat: false, keyCode: code) else { fail("key event") }
+            NSApp.sendEvent(event)
+        }
+        var reached = window.firstResponder === initial
+        for _ in 0..<30 where !reached { key(48, "\t"); reached = window.firstResponder === initial }
+        guard reached else { fail("history canvas not reachable with Tab") }
+        let columns = GLMQuotaHistoryGeometry.columns(width: initial.bounds.width, height: initial.bounds.height, count: initial.records.count)
+        guard columns.count == 6 else { fail("six columns not laid out") }
+        let point = NSPoint(x: columns[0].maxX - 0.5, y: initial.bounds.midY)
+        mouse(.mouseMoved, initial, point)
+        guard initial.hover == initial.records[0].id else { fail("hover column edge") }
+        mouse(.leftMouseDown, initial, point); mouse(.leftMouseUp, initial, point)
+        guard historyBrowser.selectedCycleID == initial.records[0].id else { fail("click selection") }
+        mouse(.mouseMoved, initial, NSPoint(x: columns[1].midX, y: initial.bounds.midY))
+        guard initial.hover == initial.records[1].id else { fail("hover changes temporary selection") }
+        key(123)
+        guard historyBrowser.selectedCycleID == records[6].id,
+              let afterPage = historyCanvasForFocus, afterPage !== initial,
+              window.firstResponder === afterPage else { fail("cross-page left/focus") }
+        key(124)
+        guard historyBrowser.selectedCycleID == records[7].id else { fail("cross-page right") }
+        key(124)
+        guard historyBrowser.selectedCycleID == records[8].id else { fail("repeated keyboard focus") }
+        func findButton(_ view: NSView, title: String? = nil, action: Selector? = nil) -> NSButton? {
+            if let button = view as? NSButton, (title == nil || button.title == title), (action == nil || button.action == action) { return button }
+            for child in view.subviews { if let found = findButton(child, title: title, action: action) { return found } }
+            return nil
+        }
+        func clickButton(_ button: NSButton) {
+            button.scrollToVisible(button.bounds); panelController.view.layoutSubtreeIfNeeded()
+            let center = NSPoint(x: button.bounds.midX, y: button.bounds.midY)
+            mouse(.leftMouseDown, button, center); mouse(.leftMouseUp, button, center)
+        }
+        guard let older = findButton(panelController.view, title: "‹") else { fail("older button missing") }
+        clickButton(older)
+        guard historyBrowser.pageAnchorID != nil else { fail("older page click") }
+        guard let more = findButton(panelController.view, title: "更早") else { fail("earlier button missing") }
+        clickButton(more)
+        guard historyBrowser.loadedLimit >= 24, historyBrowser.visibleRange(records).lowerBound == 0 else { fail("earlier page click") }
+        let selectedBeforeCollapse = historyBrowser.selectedCycleID
+        guard let fold = findButton(panelController.view, action: #selector(toggleHistory)) else { fail("fold button missing") }
+        clickButton(fold)
+        guard !historyExpanded else { fail("collapse") }
+        guard let unfold = findButton(panelController.view, action: #selector(toggleHistory)) else { fail("unfold button missing") }
+        clickButton(unfold)
+        guard historyExpanded && historyBrowser.selectedCycleID == selectedBeforeCollapse else { fail("reopen preserves selection") }
+        print("GLM history test: PASS (tab, hover, click, paging, earlier, fold, cross-page and repeated keyboard)")
+        try? "PASS".write(toFile: resultFile, atomically: true, encoding: .utf8)
+        exit(0)
     }
 
     // 离线回归：每日用量交互（合成数据）。鼠标事件经 NSApp.sendEvent 真实派发
@@ -4842,6 +5072,19 @@ func onceMode() {
     exit(0)
 }
 
+enum GLMHistoryAdapter {
+    static func operationResult(_ outcome: ResetUseOutcome) -> GLMQuotaOperationResult {
+        outcome.used ? .confirmedUsed : (outcome.retryable ? .unknown : .rejected)
+    }
+    static func observation(_ fresh: UsageData, requestStartedAt: Date, observedAt: Date) -> GLMQuotaObservation? {
+        guard fresh.weekError == nil, fresh.weekWarning == nil, let week = fresh.week, let reset = week.reset else { return nil }
+        let observation = GLMQuotaObservation(requestStartedAt: requestStartedAt, observedAt: observedAt,
+            limitCredits: week.limit, reportedUsedCredits: week.used, remainingCredits: week.remaining,
+            resetAt: reset, planLevel: fresh.level)
+        return observation.isValid ? observation : nil
+    }
+}
+
 enum GLMOfflineRegression {
     struct Failure: Error, CustomStringConvertible {
         let description: String
@@ -4858,6 +5101,25 @@ enum GLMOfflineRegression {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
             let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+            try expect(GLMHistoryAdapter.operationResult(.init(used: true, error: nil, retryable: false)) == .confirmedUsed &&
+                       GLMHistoryAdapter.operationResult(.init(used: false, error: nil, retryable: true)) == .unknown &&
+                       GLMHistoryAdapter.operationResult(.init(used: false, error: nil, retryable: false)) == .rejected,
+                       "reset evidence mapping must preserve existing protocol")
+            let typedFixture = CredStore.resolvePlanCredentialTyped(envValue: "fixture-key", record: [:])
+            try expect(typedFixture.key == "fixture-key" && typedFixture.mode == .apiKey,
+                       "environment credential must be an API Key")
+            let fakeWeek = LimitEntry(label: "7D", isFiveHour: false, limit: 10000, used: 4300,
+                                      remaining: 5700, usedRatio: 0.43, reset: now.addingTimeInterval(1000))
+            var historyFresh = UsageData()
+            try expect(GLMHistoryAdapter.observation(historyFresh, requestStartedAt: now, observedAt: now) == nil,
+                       "missing fresh week must not sample")
+            historyFresh.week = fakeWeek; historyFresh.weekWarning = "fixture warning"
+            try expect(GLMHistoryAdapter.observation(historyFresh, requestStartedAt: now, observedAt: now) == nil,
+                       "warning week must not sample")
+            historyFresh.weekWarning = nil
+            try expect(GLMHistoryAdapter.observation(historyFresh, requestStartedAt: now, observedAt: now)?.remainingCredits == 5700,
+                       "valid week not captured")
 
             try expect(GLMNumber.finite(nil) == nil, "missing numeric value became zero")
             try expect(GLMNumber.finite(true) == nil, "boolean numeric value was accepted")
@@ -5649,6 +5911,11 @@ enum GLMOfflineRegression {
             try expect(CredStore.zcodeAccountEmail(record: zcodeV2Record, systemKey: v2Key) == "user@example.com", "v2 ZCode email unavailable")
             try expect(CredStore.zcodeAccountEmail(record: zcodeV2Record, systemKey: Data(repeating: 9, count: 32)) == nil, "v2 email accepted wrong key")
             let fixtureV2 = ["oauth:bigmodel:access_token": fixtureV2OS, "zcodejwttoken": fixtureV2OS]
+            try expect(CredStore.resolvePlanCredentialTyped(record: fixtureV2, systemKey: v2Key).mode == .oauth,
+                       "OAuth credential source incorrectly persisted")
+            let typedAPIRecord = ["coding-plan:api-key:bigmodel": fixtureV2OS, "oauth:bigmodel:access_token": fixtureV2OS]
+            try expect(CredStore.resolvePlanCredentialTyped(record: typedAPIRecord, systemKey: v2Key).mode == .apiKey,
+                       "API candidate source incorrectly treated as OAuth")
             let upgradedPlan = CredStore.resolvePlanCredential(record: fixtureV2, systemKey: v2Key)
             try expect(upgradedPlan.key == "fixture-token", "v2 os plan credential failed")
             let upgradedReset = CredStore.resolveResetCredential(record: fixtureV2, systemKey: v2Key)
