@@ -1,0 +1,27 @@
+# 周额度周期回顾
+
+> 当前实现说明，2026-11-12。真实长期跨周与真实用卡行为尚未在本次任务中联网验证。
+
+## 范围与显示
+
+每日用量和 MCP 工具之间的卡片展示 7 天额度观测段，而非自然周。每页最多六段，最初可浏览最近十二段，点击「更早」再扩展；选择与历史页在本进程内保留。灰柱是各段自己的 100% 上限，绿柱为 `(limit - remaining) / limit`；详情显示真实积分，不使用 Token 或不同轮次积分之和。首次观测不是已知的真实起点；结束段的余额是最后一次观测而非确定到期余额。
+
+独立额度请求的周窗口必须成功、无警告、包含有效积分和重置时间，才进入历史；失败不拿旧 UI 值补样本。系统时间回拨、过期请求、旧连接或用卡前 epoch 的回调不推进历史。仅有 5 小时额度不算周样本。
+
+## 窗口判定
+
+同一窗口按原始额度更新；reset 两秒以内视为抖动。疑似新窗口先记录候选，10–180 秒内另一独立请求确认；窗口变化但原因不足时保持待确认。正常截止、无法归因的早期变化、观测缺口和额度规格变化分开标记；缺口不补造轮次。一次已绑定且确认成功的周卡操作，也要等消费后额度样本确认才拆分；5 小时卡不拆周。旧截止已到而接口仍返回旧窗口时继续等待。
+
+周卡依据沿用既有 `code == 0 && used == true` 结果，记录原操作时间、哈希和已知基线；unknown/失败不会生成轮次，历史逻辑不会发起用卡请求。仅当套餐监控使用与 ZCode 用卡相同的 OAuth token 且操作前后连接未切换，才可归因为主动用周卡；API Key 连接无法据邮箱或时间接近推断同账号。重启后的归属证明不恢复；旧 pending 没有基线时只留未归属操作。
+
+## 分区和持久化
+
+API Key 使用域隔离 SHA-256 的 64 位分区，路径为 `~/Library/Application Support/GlmUsage/quota-history/<partition>/history-v1.json`。更换 Key 不合并；OAuth 回退仅保留进程内历史。JSON 不包含 API Key、OAuth token、邮箱或原幂等 key；历史文件不写入 status.json。根目录及分区目录权限 0700，文件 0600；同目录独占临时文件写完后原子替换。已有损坏文件或未来 schema 保留并保护，不用新状态覆盖；普通写失败则继续使用内存并显示未保存，后续尝试可恢复。首次、数值和候选/操作变化立即保存，纯时间推进最多每五分钟一次心跳。
+
+源码入口：`Sources/GLMQuotaCycleHistory.swift`、`GLMQuotaCycleContext.swift`、`GLMQuotaCycleStore.swift`、`GLMQuotaCycleCoordinator.swift`、`GLMQuotaCycleHistoryView.swift`。额度适配与现有用卡协议接线位于 `GlmUsage.swift`。纯模型回归运行 `python3 -m unittest discover -s tests -p 'quota_cycle_history_test.py' -v`；GUI 假数据入口和完整回归命令见 `docs/DEVELOPMENT.md`。
+
+## 已知限制（如实标注）
+
+- **投递防过期**：`GLMQuotaCycleSnapshot` 不携带连接标识；防过期完全依赖 Coordinator 的 generation 检查（生产路径 `deliveryQueue` 为主队列且 activation 自增同步于调用线程，检查与投递同队列串行执行）。测试以自定义 deliveryQueue 注入时由 harness 保证语义。非主队列 delivery 在生产中不使用。
+- **存储符号检查**：`GLMQuotaCycleStore.location()` 的 lstat 仅覆盖检查时刻；`load` 读取会跟随符号链接，检查与读取之间存在 TOCTOU 窗口。写侧为 `O_EXCL` 临时文件 + `rename` 原子替换（rename 替换目标 symlink 本身），不扩大窗口。威胁模型是误配置/意外符号链接与普通数据损坏，不承诺对抗已拥有本机用户权限的活跃攻击者。
+- **未验证范围**：真实账号跨周长期采样、真实网络接口、真实用卡与消费协议线上联动未经本任务验证（离线假数据与 fixture 覆盖）；完整边界见 `docs/verification/2026-11-12-quota-cycle-history.md`。

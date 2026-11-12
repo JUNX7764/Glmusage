@@ -1,7 +1,7 @@
 # GlmUsage 开发与维护
 
 > **当前工程事实源**。构建、测试、发布、接口或权限行为变化时，应在同一个提交中更新本文。
-> 最后核对：2026-11-11。
+> 最后核对：2026-11-12。
 
 ## 文档入口与效力
 
@@ -24,12 +24,13 @@
 ./build.sh
 ```
 
-`build.sh` 会重建项目内的 `GlmUsage.app` 并执行 ad-hoc 签名验证。拆分源码时必须保留合法 top-level 入口并同步调整构建脚本。
+`build.sh` 重建项目内的 `GlmUsage.app`，优先使用本机 `local-codesign` 身份，缺失时回退 ad-hoc，再验证签名。脚本复制入口到临时 `main.swift`，与 `Sources/` 中的周期回顾模块一起编译；临时目录由脚本清理。
 
 ## 原理与数据边界
 
-- **凭据**：优先使用 `GLM_API_KEY`，其次使用用户在 GlmUsage 面板中连接的套餐 API Key，最后回退到 ZCode `~/.zcode/v2/credentials.json` 中的 `enc:v1` 凭据。旧格式可使用 `ZCODE_CREDENTIAL_SECRET` 参与密钥派生。用户主动连接时先查询额度验证，成功后存入 GlmUsage 的 macOS 钥匙串条目。ZCode `enc:v2` 登录态的重置卡在 ZCode 内管理。API Key 与 OAuth token 不写入仓库、日志或诊断状态。
+- **凭据**：优先使用 `GLM_API_KEY`，其次使用用户在 GlmUsage 面板中连接的套餐 API Key，最后回退到 ZCode `~/.zcode/v2/credentials.json` 中支持的凭据。`enc:v1` 可使用 `ZCODE_CREDENTIAL_SECRET` 参与密钥派生；`enc:v2:os` 依赖系统钥匙串授权，`enc:v2:env` 不支持。用户主动连接时先查询额度验证，成功后存入 GlmUsage 的 macOS 钥匙串条目。重置卡使用 ZCode 双 token；可读取已授权的 `enc:v2:os` 登录态。API Key 与 OAuth token 不写入仓库、日志或诊断状态。
 - **额度与用量**：通过智谱监控接口查询 5 小时、7 天额度、模型 Token / 调用数和 MCP 工具次数。
+- **额度周期回顾**：只采集独立额度刷新通道中无警告、带有效 reset 的新鲜周额度；周期、证据、连接分区和存储边界见 `docs/project/17-quota-cycle-history.md`。
 - **Start Plan 用量**：只读 `~/.zcode/cli/db/db.sqlite` 的 `model_usage`，按请求时间将国内 Start Plan 的 Token 与调用数补入今天、近 7 天、近 30 天、模型明细和每日趋势。同名模型忽略大小写合并，保留官方显示名。使用 `provider_total_tokens`，缺失时回退 `computed_total_tokens`，缓存输入已计入总数；仅纳入已结束且 Token 大于零的请求，实际重试的额外消耗保留。使用系统 SQLite3，无第三方依赖。
 - **补统计边界**：赠送余额接口只提供额度桶累计值，不能用于拆分历史周期。补统计覆盖本机已记录的请求，其他设备的赠送用量不可得。缺少数据库或旧版无请求表时沿用服务端统计；现有表读取失败则保留上次完整合并值并提示待更新。手动连接或环境变量提供 API Key 时使用该 Key 的服务端统计，避免混入其他 ZCode 账号的本机用量。预览与自检使用假数据。
 - **订阅**：通过 `/api/biz/subscription/list` 获取有效套餐与到期时间；明确无有效订阅时清除旧套餐数据，普通失败保留旧值并提示。
@@ -62,6 +63,11 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 # 每日用量交互回归（悬停/键盘/Tab 可达/零日缺失读取；与上一条错开 ≥5s 逐个跑）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-test --preview-daily-gaps
 
+# 周额度回顾：隔离假数据预览与事件回归（两次 GUI 运行至少间隔 5 秒）
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview --preview-quota-history
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-popover --preview-quota-history --preview-quota-history-test
+
+# 可附加 --preview-dark / --preview-narrow；状态用 --preview-quota-history-state=empty|short|long|unsaved|volatile|protected
 # 每日图空态/缺口/基期0/数据不足变体（与 --preview-daily-test 错开 ≥5s 逐个跑）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-unavailable
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-basezero
@@ -84,8 +90,10 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 | 文件 | 说明 |
 |---|---|
-| `GlmUsage.swift` | 当前全部 Swift 源码；单文件 AppKit 菜单栏应用 |
-| `build.sh` | 编译、打包和 ad-hoc 签名 |
+| `GlmUsage.swift` | AppKit 入口、凭据、网络、原面板与事件接线 |
+| `Sources/GLMQuotaCycle*.swift` | 周额度历史的模型、上下文、存储、协调器与原生视图 |
+| `tests/quota_cycle_history_test.py` | 假数据与临时目录中的周额度历史测试 |
+| `build.sh` | 多文件编译、打包和签名验证 |
 | `Info.plist` | Bundle 身份、最低系统版本和菜单栏常驻配置 |
 | `scripts/icon_gen.swift` | 图标生成脚本 |
 | `scripts/update.sh` | Release 下载、校验、暂存、换包和失败回滚 |

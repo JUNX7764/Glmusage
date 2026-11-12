@@ -1,11 +1,11 @@
 # GlmUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-11。
+> 状态：当前架构摘要。最后核对：2026-11-12。
 > 本文解释模块与边界，函数级行为以源码和测试为准。
 
 ## 1. 应用形态
 
-GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当前 Swift 实现集中在 `GlmUsage.swift`，无 Swift Package 依赖。面板使用原生 `NSPopover`。
+GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，入口和现有主体位于 `GlmUsage.swift`，周额度周期回顾按职责位于 `Sources/GLMQuotaCycle*.swift`，无 Swift Package 依赖。面板使用原生 `NSPopover`。
 
 应用身份保持为：
 
@@ -24,9 +24,10 @@ GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当前
 | `UpdateChecker` | 检查 GitHub Release 和更新资产，保留同一版本的更新说明 |
 | `UpdateProgressController` | 后台更新、进度恢复和错误展示 |
 | `AppDelegate` | 原生 Popover、刷新调度、重置卡操作、自启和状态聚合 |
+| `GLMQuotaCycleHistory / Context / Store / Coordinator / View` | 周额度观测、连接隔离、私有保存、串行协调和原生展示，见 `17-quota-cycle-history.md` |
 | `GLMOfflineRegression` | 使用临时目录和假数据的离线自检 |
 
-单文件是当前实现状态，不是永久架构约束。后续拆分时优先分离凭据、网络、Peak、更新和 UI。
+现有主体仍集中在入口文件；后续按职责渐进分离凭据、网络、Peak、更新和 UI。
 
 ## 3. 主要数据流
 
@@ -54,7 +55,7 @@ GitHub Release → 可安装版本选择 → ZIP / SHA256 下载 → 身份、�
 
 - 智谱监控接口与 ZCode 逆向接口的稳定性不同，重置卡接口变化不得影响其他额度区块。
 - OAuth token 可能过期，重置卡失败必须独立降级，不能伪造成卡数为零。
-- ZCode 3.18.0 默认通过系统钥匙串管理新版登录凭据。GlmUsage 单独保存用户在面板提交并验证通过的套餐 API Key。新版 ZCode 登录的重置卡在 ZCode 内管理。
+- ZCode 3.18.0 的 `enc:v2:os` 密钥由系统钥匙串管理；授权后可读取相关套餐和重置卡凭据。GlmUsage 单独保存用户在面板提交并验证通过的套餐 API Key。
 - GitHub Release 与 SHA256 来自同一信任源；ad-hoc 签名不提供独立发布者身份验证。
 - Peak 活动日期是带时效的配置，必须可测试并在过期后自动失效。
 - 离线 mock、真实接口验证和真实安装验收是不同证据。
