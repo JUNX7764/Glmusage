@@ -4543,8 +4543,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let records = snapshot.state.closed + (snapshot.state.current.map { [$0] } ?? [])
         guard records.count >= 13 else { fail("13-cycle fixture unavailable") }
         func hasSeparateUsageRow(_ view: NSView) -> Bool {
-            if let label = view as? NSTextField, label.stringValue.hasPrefix("已用 ") { return true }
+            if let label = view as? NSTextField,
+               label.stringValue.hasPrefix("已用 "), label.stringValue.contains("%") { return true }
             return view.subviews.contains(where: hasSeparateUsageRow)
+        }
+        // The legend names the two portions of a single track; only a numeric
+        // percentage row duplicates the values already shown beneath each date.
+        guard !hasSeparateUsageRow(NSTextField(labelWithString: "已用 / 距上限")),
+              hasSeparateUsageRow(NSTextField(labelWithString: "已用 68% · 最后观测剩余 3,200 / 10,000 积分")) else {
+            fail("usage-row classification must distinguish legend from duplicate values")
         }
         guard !hasSeparateUsageRow(panelController.view) else { fail("percentage must be under each date, not in a separate detail row") }
         initial.scrollToVisible(initial.bounds); panelController.view.layoutSubtreeIfNeeded(); window.acceptsMouseMovedEvents = true
@@ -4966,11 +4973,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         let buckets = canvas.dayBuckets
         guard buckets.count == 30 else { fail("bucket count \(buckets.count)") }
+        // Exercise actual AppKit layout, not only the pure width predicate.
+        // This host is outside the visible window so it cannot disturb the UI.
+        let probeHost = NSView(frame: NSRect(x: -1000, y: 0, width: 220, height: 100))
+        window.contentView?.addSubview(probeHost)
+        let probeStrip = GLMComparisonStrip(pairs: [("日环比", .added("新增 999.99B")), ("7日环比", .insufficient)])
+        probeHost.addSubview(probeStrip)
+        NSLayoutConstraint.activate([
+            probeStrip.leadingAnchor.constraint(equalTo: probeHost.leadingAnchor),
+            probeStrip.trailingAnchor.constraint(equalTo: probeHost.trailingAnchor),
+            probeStrip.topAnchor.constraint(equalTo: probeHost.topAnchor)
+        ])
+        func chips(_ view: NSView) -> [GLMDeltaChip] {
+            (view as? GLMDeltaChip).map { [$0] } ?? view.subviews.flatMap { chips($0) }
+        }
+        probeHost.layoutSubtreeIfNeeded()
+        probeStrip.needsLayout = true; probeStrip.layoutSubtreeIfNeeded()
+        window.contentView?.layoutSubtreeIfNeeded()
+        guard abs(probeStrip.frame.height - 44) < 0.5 else {
+            fail("narrow long chip must use two rows: frame=\(probeStrip.frame), fitting=\(probeStrip.fittingSize), widths=\(chips(probeStrip).map { $0.intrinsicContentSize.width })")
+        }
+        let probeChips = chips(probeStrip)
+        guard probeChips.count == 2,
+              probeChips.allSatisfy({ $0.valueLabel.frame.width + 0.5 >= $0.valueLabel.intrinsicContentSize.width }) else {
+            fail("narrow long chip clipped its value")
+        }
+        probeHost.setFrameSize(NSSize(width: 280, height: 100))
+        probeHost.layoutSubtreeIfNeeded()
+        probeStrip.needsLayout = true; probeStrip.layoutSubtreeIfNeeded()
+        window.contentView?.layoutSubtreeIfNeeded()
+        guard abs(probeStrip.frame.height - 30) < 0.5 else { fail("wide chip must return to one row") }
+        let detachedLabel = GLMAnimatedTokenLabel { "\(Int($0)) Token" }
+        probeHost.addSubview(detachedLabel)
+        detachedLabel.setTokens(100, animated: false)
+        detachedLabel.setTokens(200, animated: true)
+        guard detachedLabel.accessibilityValue() == "200 Token" else { fail("animation AX target must be immediate") }
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+           !detachedLabel.isAnimating { fail("attached label did not animate") }
+        detachedLabel.removeFromSuperview()
+        guard !detachedLabel.isAnimating, detachedLabel.stringValue == "200 Token" else {
+            fail("detached label must stop timer and settle")
+        }
+        probeHost.removeFromSuperview()
+        print("GLM_DAILY_TEST chip-two-row-layout-and-animation-detach: PASS")
         window.acceptsMouseMovedEvents = true
         canvas.scrollToVisible(canvas.bounds)
         panelController.view.layoutSubtreeIfNeeded()
         func sendMouse(_ type: NSEvent.EventType, atViewPoint point: NSPoint) {
             let location = canvas.convert(point, to: nil)
+            if type == .leftMouseDown, let content = window.contentView {
+                let hit = content.hitTest(content.convert(location, from: nil))
+                print("GLM_DAILY_TEST click-target: key=\(window.isKeyWindow) canvas=\(hit === canvas) location=\(location) visible=\(canvas.visibleRect)")
+            }
             guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                 context: nil, eventNumber: 0, clickCount: type == .leftMouseDown ? 1 : 0, pressure: 1) else {
@@ -5044,8 +5098,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         steps.append { hover(5); hover(20); verify("hover-retarget", index: 20)
             RunLoop.current.run(until: Date().addingTimeInterval(0.4))
             verify("hover-retarget-stable", index: 20)
-        }
-        steps.append {
+            // Verify exit in the same main-loop turn as the known selection;
+            // a later test step could receive a genuine hardware hover first.
             // NSEvent.mouseEventWithType 只接受 MouseMask/MouseMoved；离开事件须用
             // enterExitEvent 合成（与真实 tracking-area 离开事件同类型）
             let location = canvas.convert(NSPoint(x: -50, y: -50), to: nil)
@@ -5056,8 +5110,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             NSApp.sendEvent(exitEvent)
             // 离开图表保留最后选中值
-            guard dateLabel.stringValue == GLMDailyUsageSectionView.dayText(for: buckets[20].day) else {
-                fail("mouse-exited: selection jumped")
+            guard canvas.selectedIndex == 20,
+                  dateLabel.stringValue == GLMDailyUsageSectionView.dayText(for: buckets[20].day) else {
+                fail("mouse-exited: selection jumped to index \(canvas.selectedIndex), date \(dateLabel.stringValue)")
             }
             print("GLM_DAILY_TEST mouse-exited-keeps-selection: PASS"); fflush(stdout)
         }
@@ -5101,6 +5156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard index < steps.count else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
                 guard let self = self, self.popover.isShown else { fail("popover closed mid-test") }
+                guard window.isKeyWindow else { fail("key window lost before step \(index); native event delivery unverified") }
                 steps[index]()
                 runStep(index + 1)
             }
