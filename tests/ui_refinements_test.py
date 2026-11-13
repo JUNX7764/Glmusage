@@ -36,3 +36,6 @@ class UIRefinementsTest(unittest.TestCase):
 
     def test_history_track(self):
         self.case("historyTrack")
+
+    def test_distinct_symbols(self):
+        self.case("distinctSymbols")

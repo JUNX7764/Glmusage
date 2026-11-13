@@ -2572,7 +2572,7 @@ final class GLMDailyUsageSectionView: NSView {
         header.alignment = .centerY
         header.spacing = 6
         header.translatesAutoresizingMaskIntoConstraints = false
-        let icon = NSImageView(image: NSImage(systemSymbolName: "chart.bar", accessibilityDescription: nil) ?? NSImage())
+        let icon = NSImageView(image: NSImage(systemSymbolName: GLMPanelVisuals.dailySymbol, accessibilityDescription: nil) ?? NSImage())
         icon.contentTintColor = GLMPeakTint.accent
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
         icon.setContentHuggingPriority(.required, for: .horizontal)
@@ -4136,7 +4136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 额度周期回顾：默认紧跟每日用量、位于 MCP 之前；与其他内容卡一样支持独立显隐和排序。
             let historyCard = GLMPanelCard()
             historyCard.content.spacing = 3
-            let historyHeader = section("额度周期回顾", icon: "chart.bar", expanded: historyExpanded, action: #selector(toggleHistory))
+            let historyHeader = section("额度周期回顾", icon: GLMPanelVisuals.historySymbol, expanded: historyExpanded, action: #selector(toggleHistory))
             addContent(historyHeader, to: historyCard)
             var historyCanvas: GLMQuotaHistoryCanvas?
             if historyExpanded {

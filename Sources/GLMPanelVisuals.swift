@@ -1,6 +1,8 @@
 import AppKit
 
 enum GLMPanelVisuals {
+    static let dailySymbol = "chart.bar"
+    static let historySymbol = "clock.arrow.circlepath"
     static let dailyCornerRadius: CGFloat = 1.5
 
     static func topRoundedPath(in rect: NSRect, radius: CGFloat) -> NSBezierPath {

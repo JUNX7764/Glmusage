@@ -62,6 +62,13 @@ case "historyTrack":
     check(tiny.fill!.height < 1, "tiny use is not inflated to a 2pt bar")
     check(GLMPanelVisuals.historyBar(in: column, baseline: 31, usedPercent: .nan).fill == nil, "nonfinite does not fill")
     print("PASS: historyTrack")
+case "distinctSymbols":
+    check(GLMPanelVisuals.dailySymbol != GLMPanelVisuals.historySymbol, "history and daily must differ")
+    check(GLMPanelVisuals.dailySymbol == "chart.bar", "keep daily identity")
+    check(GLMPanelVisuals.historySymbol == "clock.arrow.circlepath", "history means cycles")
+    check(NSImage(systemSymbolName: GLMPanelVisuals.historySymbol, accessibilityDescription: nil) != nil,
+          "history symbol exists on this runtime")
+    print("PASS: distinctSymbols")
 default:
     fputs("FAIL: unknown visual fixture\n", stderr); exit(1)
 }
