@@ -1,6 +1,6 @@
 # GlmUsage 维护约定
 
-> 状态：当前维护约定。最后核对：2026-11-06。
+> 状态：当前维护约定。最后核对：2026-11-13。
 
 ## 1. 文档
 
@@ -48,7 +48,7 @@ python3 -m unittest discover -s tests -p '*_test.py'
 bash -n build.sh scripts/update.sh scripts/release.sh
 ```
 
-Popover 或交互变化需运行 `--preview-popover-test`。真实接口、真实安装和系统兼容性验证单独注明，不能用离线测试替代。
+Popover 或交互变化需运行 `--preview-popover-test`；卡片显隐/排序/统一菜单/空态/滚动与键盘链变化需运行 `--preview-card-settings-test`。各 Popover GUI 测试必须串行并错开至少 5 秒；键盘测试要求屏幕已解锁且 Popover 成为 key window。真实接口、真实安装和系统兼容性验证单独注明，不能用离线测试替代。
 
 ## 6. 版本与提交
 
