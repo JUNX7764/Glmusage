@@ -94,3 +94,184 @@ struct GLMPanelLayout: Equatable {
         defaults.set(data, forKey: Self.defaultsKey)
     }
 }
+
+import AppKit
+
+private let panelRowPasteboardType = NSPasteboard.PasteboardType.string
+
+private final class GLMCardSettingRowView: NSTableCellView {
+    let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    let upButton = NSButton(image: NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "上移") ?? NSImage(), target: nil, action: nil)
+    let downButton = NSButton(image: NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "下移") ?? NSImage(), target: nil, action: nil)
+    var onToggle: ((Bool) -> Void)?
+    var onMove: ((GLMPanelMoveDirection) -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        checkbox.target = self; checkbox.action = #selector(toggle)
+        checkbox.font = .systemFont(ofSize: 12)
+        for button in [upButton, downButton] {
+            button.isBordered = false
+            button.contentTintColor = .secondaryLabelColor
+            button.widthAnchor.constraint(equalToConstant: 24).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        }
+        upButton.target = self; upButton.action = #selector(moveUpAction)
+        downButton.target = self; downButton.action = #selector(moveDownAction)
+        let handle = NSImageView(image: NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "拖动排序") ?? NSImage())
+        handle.contentTintColor = .tertiaryLabelColor
+        let spring = NSView()
+        spring.setContentHuggingPriority(.init(1), for: .horizontal)
+        spring.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+        let stack = NSStackView(views: [checkbox, spring, upButton, downButton, handle])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 5
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            handle.widthAnchor.constraint(equalToConstant: 20),
+            handle.heightAnchor.constraint(equalToConstant: 20)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(id: GLMPanelCardID, visible: Bool, first: Bool, last: Bool) {
+        checkbox.title = id.title
+        checkbox.state = visible ? .on : .off
+        checkbox.setAccessibilityLabel("显示\(id.title)")
+        checkbox.identifier = NSUserInterfaceItemIdentifier("CardToggle.\(id.rawValue)")
+        upButton.isEnabled = !first
+        downButton.isEnabled = !last
+        upButton.setAccessibilityLabel("上移\(id.title)")
+        downButton.setAccessibilityLabel("下移\(id.title)")
+        upButton.identifier = NSUserInterfaceItemIdentifier("CardMoveUp.\(id.rawValue)")
+        downButton.identifier = NSUserInterfaceItemIdentifier("CardMoveDown.\(id.rawValue)")
+        toolTip = "拖动调整\(id.title)顺序"
+    }
+
+    @objc private func toggle(_ sender: NSButton) { onToggle?(sender.state == .on) }
+    @objc private func moveUpAction() { onMove?(.up) }
+    @objc private func moveDownAction() { onMove?(.down) }
+}
+
+final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    private(set) var layout: GLMPanelLayout
+    private let onChange: (GLMPanelLayout) -> Void
+    private let onDone: () -> Void
+    private let table = NSTableView()
+
+    init(layout: GLMPanelLayout, onChange: @escaping (GLMPanelLayout) -> Void, onDone: @escaping () -> Void) {
+        self.layout = layout
+        self.onChange = onChange
+        self.onDone = onDone
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("card"))
+        column.resizingMask = .autoresizingMask
+        table.addTableColumn(column)
+        table.headerView = nil
+        table.dataSource = self
+        table.delegate = self
+        table.rowHeight = 34
+        table.selectionHighlightStyle = .none
+        table.allowsEmptySelection = true
+        table.intercellSpacing = NSSize(width: 0, height: 2)
+        table.backgroundColor = .clear
+        table.registerForDraggedTypes([panelRowPasteboardType])
+        table.draggingDestinationFeedbackStyle = .regular
+
+        let title = NSTextField(labelWithString: "卡片显示与排序")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        let hint = NSTextField(labelWithString: "勾选显示；拖动行或使用箭头调整顺序")
+        hint.font = .systemFont(ofSize: 10)
+        hint.textColor = .secondaryLabelColor
+        let reset = NSButton(title: "恢复默认卡片布局", target: self, action: #selector(resetLayout))
+        let done = NSButton(title: "完成", target: self, action: #selector(done))
+        done.keyEquivalent = "\r"
+        done.bezelStyle = .rounded
+        done.controlSize = .regular
+        let actions = NSStackView(views: [reset, NSView(), done])
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+
+        let stack = GLMPanelStack()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for view in [title, hint, table, actions] { stack.addArrangedSubview(view) }
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            table.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            table.heightAnchor.constraint(equalToConstant: CGFloat(GLMPanelCardID.allCases.count) * 36),
+            actions.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setVisible(_ visible: Bool, for id: GLMPanelCardID) {
+        layout.setVisible(visible, for: id)
+        commit()
+    }
+
+    func move(_ id: GLMPanelCardID, direction: GLMPanelMoveDirection) {
+        layout.move(id, direction: direction)
+        commit()
+    }
+
+    private func commit() {
+        table.reloadData()
+        onChange(layout)
+    }
+
+    @objc private func resetLayout() { layout = .default; commit() }
+    @objc private func done() { onDone() }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { layout.order.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let id = layout.order[row]
+        let view = GLMCardSettingRowView()
+        view.configure(id: id, visible: layout.isVisible(id), first: row == 0, last: row == layout.order.count - 1)
+        view.onToggle = { [weak self] visible in self?.setVisible(visible, for: id) }
+        view.onMove = { [weak self] direction in self?.move(id, direction: direction) }
+        return view
+    }
+
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        let item = NSPasteboardItem()
+        item.setString(layout.order[row].rawValue, forType: panelRowPasteboardType)
+        return item
+    }
+
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
+                   proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
+        guard info.draggingSource as? NSTableView === table,
+              let raw = info.draggingPasteboard.string(forType: panelRowPasteboardType),
+              GLMPanelCardID(rawValue: raw) != nil else { return [] }
+        tableView.setDropRow(row, dropOperation: .above)
+        return .move
+    }
+
+    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
+                   row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
+        guard let raw = info.draggingPasteboard.string(forType: panelRowPasteboardType),
+              let id = GLMPanelCardID(rawValue: raw),
+              let source = layout.order.firstIndex(of: id) else { return false }
+        let destination = source < row ? row - 1 : row
+        layout.move(id, to: destination)
+        commit()
+        return true
+    }
+}

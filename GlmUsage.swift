@@ -3653,11 +3653,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             item.heightAnchor.constraint(equalToConstant: 24).isActive = true
             return item
         }
-        // 更新进行中：原按钮位置换成进度行（重开面板也在此恢复）；空闲时才显示更新按钮
-        if UpdateProgressController.shared.isActive { add(UpdateProgressRowView()) }
-        else if let confirmation = updateConfirmation { add(makeUpdateConfirmation(tag: confirmation.tag, notes: confirmation.notes, width: inner)) }
-        else if (UpdateChecker.shared.available && !preview) || (preview && CommandLine.arguments.contains("--preview-update-notes")) { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
-
         let needsPlanConnection = [CredStore.newCredentialMessage, CredStore.keychainUnavailableMessage,
                                    CredStore.v2LockedMessage, CredStore.missingPlanMessage]
             .contains { $0 == usage.quotaError }
@@ -3666,319 +3661,338 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 待授权（可恢复）→ 按钮直接解锁（不经过填 Key 弹窗）；凭据缺失/格式升级 → 才需要填 Key 连接
         let unlockable = usage.quotaError == CredStore.keychainUnavailableMessage
             || usage.quotaError == CredStore.v2LockedMessage || resetNeedsUnlock
-        if needsPlanConnection || resetNeedsUnlock {
-            let instruction = usage.quotaError == CredStore.keychainUnavailableMessage
-                ? "钥匙串连接待解锁，点击恢复自动读取"
-                : (usage.quotaError == CredStore.v2LockedMessage || resetNeedsUnlock
-                    ? "ZCode 凭据需钥匙串授权，点击解锁恢复自动用量与重置卡"
-                    : "使用套餐 API Key 恢复自动刷新")
-            add(label(instruction, color: .systemOrange))
-            if unlockable {
-                add(button("解锁凭据", #selector(onUnlockCredentials), prominent: true))
-            } else {
-                add(button("连接套餐", #selector(onConnectPlan), prominent: true))
-            }
-        }
-        // 六张内容卡先注册稳定 identifier，再按 panelLayout.visibleOrder 统一安装（全部隐藏时给空态）
-        var cardViews: [GLMPanelCardID: GLMPanelCard] = [:]
-        func register(_ card: GLMPanelCard, as id: GLMPanelCardID) {
-            card.identifier = NSUserInterfaceItemIdentifier("GLMPanelCard.\(id.rawValue)")
-            cardViews[id] = card
-        }
-        let quotaCard = GLMPanelCard()
-        quotaCard.content.spacing = 6
-        // 卡片标题行（CodexUsage 同款布局、自家绿色系）：图标+标题居左，「重置时间」列头居右
-        let quotaHead = row()
-        quotaHead.spacing = 6
-        quotaHead.addArrangedSubview(symbol("stopwatch"))
-        quotaHead.addArrangedSubview(label("用量进度", size: 12, bold: true))
-        quotaHead.addArrangedSubview(spacer())
-        let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor)
-        resetHeading.alignment = .right
-        quotaHead.addArrangedSubview(resetHeading)
-        addContent(quotaHead, to: quotaCard)
 
-        func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool) {
-            let group = GLMPanelStack()
-            group.orientation = .vertical
-            group.alignment = .leading
-            group.spacing = 4
-            func addToGroup(_ view: NSView) {
-                group.addArrangedSubview(view)
-                view.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
-            }
+        if showingCardSettings {
+            // 设置页原位替换内容区：不新增窗口，header/footer 与凭据恢复入口保持公共路径
+            // 修改即时更新内存布局并（非 preview）保存，开关/排序只刷新表格行，不重建整个 editor
+            let editor = GLMCardSettingsView(layout: panelLayout,
+                onChange: { [weak self] updated in
+                    guard let self else { return }
+                    self.panelLayout = updated
+                    self.persistPanelLayout()
+                },
+                onDone: { [weak self] in self?.finishCardSettings() })
+            add(editor)
+        } else {
+            // 更新进行中：原按钮位置换成进度行（重开面板也在此恢复）；空闲时才显示更新按钮
+            if UpdateProgressController.shared.isActive { add(UpdateProgressRowView()) }
+            else if let confirmation = updateConfirmation { add(makeUpdateConfirmation(tag: confirmation.tag, notes: confirmation.notes, width: inner)) }
+            else if (UpdateChecker.shared.available && !preview) || (preview && CommandLine.arguments.contains("--preview-update-notes")) { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
 
-            // 周期、百分比、进度条与重置时间共用一行，避免为进度条额外占用一行高度。
-            let heading = row()
-            heading.spacing = 4
-            let title = label(name, size: 11, bold: true)
-            title.widthAnchor.constraint(equalToConstant: 36).isActive = true
-            heading.addArrangedSubview(title)
-            let ratio = entry?.usedRemainingRatio
-            let pct = label(Fmt.pct(ratio), size: 14, bold: true, color: GLMRemainingColor.color(ratio))
-            pct.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
-            // 列宽按最宽展示值 "100%" 的实测渲染宽（40.89pt）取整，40pt 会折成 "100"/"%" 两行
-            pct.widthAnchor.constraint(equalToConstant: 46).isActive = true
-            heading.addArrangedSubview(pct)
-            let bar = GLMQuotaBar(ratio)
-            bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true
-            heading.addArrangedSubview(bar)
-            // 重置时间与「5 小时」标签同字号（11pt，实测最长 "12-06 周六 13:46" 95.1pt）
-            let reset = label(entry?.reset.map { Fmt.weekDayTime($0) } ?? "时间未知", size: 11, bold: true)
-            reset.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
-            reset.alignment = .right
-            reset.lineBreakMode = .byTruncatingTail
-            reset.maximumNumberOfLines = 1
-            reset.widthAnchor.constraint(equalToConstant: 100).isActive = true
-            reset.setContentCompressionResistancePriority(.required, for: .horizontal)
-            heading.addArrangedSubview(reset)
-            addToGroup(heading)
-
-            // 余量和所有异常文本独占卡片全宽，不参与右侧时间列的宽度竞争。
-            if let e = entry { addToGroup(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
-            else { addToGroup(label("暂无数据", color: .secondaryLabelColor)) }
-            if needsPlanConnection && error == usage.quotaError {
-                if let last { addToGroup(label("上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor)) }
-            } else if let e = error { addToGroup(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
-            if let warning = warning { addToGroup(label("部分数据异常：\(warning)", color: .systemOrange)) }
-            if error == nil && stale { addToGroup(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
-            addContent(group, to: quotaCard)
-        }
-        quota(usage.fiveHour, "5 小时", usage.fiveHourError, usage.fiveHourWarning, fiveHourLastOK, fiveHourStale)
-        if let fiveHourGroup = quotaCard.content.arrangedSubviews.last {
-            quotaCard.content.setCustomSpacing(10, after: fiveHourGroup)
-        }
-        quota(usage.week, "7 天", usage.weekError, usage.weekWarning, weekLastOK, weekStale)
-        let subscriptionError = needsPlanConnection && usage.subscriptionError == usage.quotaError ? nil : usage.subscriptionError
-        if usage.subscription != nil || subscriptionError != nil || subscriptionStale {
-            addContent(separator(), to: quotaCard)
-        }
-        if let sub = usage.subscription {
-            let expiry = sub.expireDate.map { "套餐到期：\(Fmt.fullTime.string(from: $0))" } ?? "套餐到期：暂无数据"
-            addContent(label(expiry, color: .secondaryLabelColor), to: quotaCard)
-        }
-        if let error = subscriptionError { addContent(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed), to: quotaCard) }
-        else if subscriptionStale { addContent(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange), to: quotaCard) }
-        register(quotaCard, as: .quota)
-        // 峰谷卡＝极简状态条：标题+状态胶囊一行，折扣与下次切换一行；限时活动行沿用旧版追加在下方。
-        // 视觉回归可用 --preview-peak 强制按高峰时刻渲染（下个工作日 14:00）
-        let peakNow = CommandLine.arguments.contains("--preview-peak") ? Peak.nextPeakStart(Date()) : Date()
-        let peakInfo = Peak.display(at: peakNow)
-        let peakCard = GLMPanelCard()
-        let peakTitle = row(); peakTitle.spacing = 6
-        peakTitle.addArrangedSubview(symbol("clock"))
-        peakTitle.addArrangedSubview(label("峰谷状态", size: 12, bold: true))
-        peakTitle.addArrangedSubview(spacer())
-        peakTitle.addArrangedSubview(GLMPeakBadge(isPeak: peakInfo.isPeak, text: peakInfo.badge))
-        peakCard.content.addArrangedSubview(peakTitle); peakTitle.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
-        peakCard.content.setCustomSpacing(5, after: peakTitle)
-        // 折扣组基线对齐读作一个短语；右列右对齐，标签弱、时间强调但低于折扣
-        let discountGroup = NSStackView(views: [
-            label(peakInfo.discount, size: 18, bold: true, color: peakInfo.isPeak ? .labelColor : GLMPeakTint.accent),
-            label("积分消耗", size: 10.5, color: .secondaryLabelColor)])
-        discountGroup.orientation = .horizontal; discountGroup.alignment = .firstBaseline; discountGroup.spacing = 5
-        let nextTime = label(peakInfo.nextTime, size: 12.5, bold: true)
-        nextTime.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
-        nextTime.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let nextGroup = NSStackView(views: [label(peakInfo.nextLabel, size: 10, color: .secondaryLabelColor), nextTime])
-        nextGroup.orientation = .vertical; nextGroup.alignment = .trailing; nextGroup.spacing = 1.5
-        let peakInfoRow = row(); peakInfoRow.spacing = 4
-        peakInfoRow.addArrangedSubview(discountGroup)
-        peakInfoRow.addArrangedSubview(spacer())
-        peakInfoRow.addArrangedSubview(nextGroup)
-        addContent(peakInfoRow, to: peakCard)
-        register(peakCard, as: .peak)
-        let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 6; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 12, bold: true))
-        if !resetLoginUnsupported, let count = usage.resetCards?.availableCount(now: Date()), count > 0 {
-            let countLabel = label("×\(count)", size: 12, bold: true, color: GLMPeakTint.accent)
-            countLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-            countLabel.setAccessibilityLabel("\(count) 张可用重置卡")
-            cardHead.addArrangedSubview(countLabel)
-        }
-        // 「🎫 使用重置卡」按钮（图标+文字，表意=消耗一张卡）：一类卡可用直接确认，两类都有先选类型，无卡提示；使用中不可点
-        let resetBtn = GLMPanelAction(title: "使用重置卡", target: self, action: #selector(onResetCardIcon(_:)))
-        resetBtn.isBordered = false
-        resetBtn.focusRingType = .default
-        resetBtn.subtleBackground = true
-        resetBtn.wantsLayer = true
-        resetBtn.layer?.cornerRadius = 6
-        resetBtn.widthAnchor.constraint(greaterThanOrEqualToConstant: 86).isActive = true
-        resetBtn.image = NSImage(systemSymbolName: "ticket.fill", accessibilityDescription: nil)?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
-        resetBtn.imagePosition = .imageLeft
-        resetBtn.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        resetBtn.contentTintColor = .secondaryLabelColor
-        resetBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        resetBtn.isEnabled = !resetUseInFlight
-        resetBtn.toolTip = resetUseInFlight ? "重置卡使用中…" : "使用一张重置卡，立即重置对应额度窗口"
-        resetBtn.setAccessibilityLabel(resetUseInFlight ? "重置卡使用中" : "使用重置卡")
-        cardHead.addArrangedSubview(spacer())
-        if !resetLoginUnsupported { cardHead.addArrangedSubview(resetBtn) }
-        cards.content.addArrangedSubview(cardHead); cardHead.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
-        if resetLoginUnsupported {
-            addContent(label("请在 ZCode 的「使用统计 → 编程套餐」查看和使用", color: .secondaryLabelColor), to: cards)
-        } else if let c = usage.resetCards {
-            func cardRow(_ name: String, _ detail: String, color: NSColor) {
-                let line = row()
-                let nameLabel = label(name, color: .secondaryLabelColor)
-                nameLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-                let detailLabel = label(detail, color: color)
-                detailLabel.alignment = .right
-                detailLabel.maximumNumberOfLines = 1
-                detailLabel.lineBreakMode = .byTruncatingTail
-                line.addArrangedSubview(nameLabel)
-                line.addArrangedSubview(spacer())
-                line.addArrangedSubview(detailLabel)
-                cards.content.addArrangedSubview(line)
-                line.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
-            }
-            for (name, dates) in [("5 小时卡", c.fiveHour), ("周卡", c.week)] {
-                if let dates = dates {
-                    let available = GLMFreshness.availableCards(dates, now: Date())
-                    if available.isEmpty { cardRow(name, "暂无可用", color: .secondaryLabelColor) }
-                    for d in available { cardRow(name, "\(Fmt.expires(d)) 过期", color: d.timeIntervalSinceNow <= 72 * 3600 ? .systemOrange : .labelColor) }
-                }
-            }
-        } else { let l = label("暂无数据", color: .secondaryLabelColor); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
-        for (name, error, stale, last) in [("5 小时卡", usage.fiveHourCardsError, fiveHourCardsStale, fiveHourCardsLastOK), ("周卡", usage.weekCardsError, weekCardsStale, weekCardsLastOK)] where !resetLoginUnsupported {
-            let message: String? = error.map { "\(name)获取失败：\($0)（ZCode 登录态可能过期，打开 ZCode 后重试） · 最后成功 \(Fmt.lastOK(last))" } ?? (stale ? "\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))" : nil)
-            if let message = message { let l = label(message, color: .systemRed); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
-        }
-        register(cards, as: .resetCards)
-        let usageCard = GLMPanelCard()
-        usageCard.content.spacing = 4
-        let usageSection = section("用量情况", icon: "square.stack.3d.up.fill", expanded: tokenExpanded, action: #selector(toggleToken))
-        addContent(usageSection, to: usageCard)
-        let windows: [(String, ModelUsage?, Date?, Bool, String?)] = [
-            ("今日", usage.tokensToday, tokensTodayLastOK, tokensTodayStale, usage.tokensTodayError),
-            ("近 7 天", usage.tokens7d, tokens7dLastOK, tokens7dStale, usage.tokens7dError),
-            ("近 30 天", usage.tokens30d, tokens30dLastOK, tokens30dStale, usage.tokens30dError)]
-        func tableCells(_ values: [String], header: Bool, modelDetail: Bool = false) -> NSStackView {
-            let r = row(); r.spacing = 4
-            // 三列与两个间距填满卡片内容宽；展开指示仍保留在行首。
-            let tableWidth = inner - GLMPanelCard.contentInset * 2 - 8
-            // 明细行将调用次数列之前的空间更多留给模型名；Token 右边缘保持与汇总行对齐。
-            let widths = modelDetail
-                ? [tableWidth * 0.46, tableWidth * 0.20, tableWidth * 0.34]
-                : [tableWidth * 0.32, tableWidth * 0.34, tableWidth * 0.34]
-            for (index, text) in values.enumerated() {
-                let color: NSColor = header || modelDetail ? .secondaryLabelColor : (index == 1 ? GLMPeakTint.accent : .labelColor)
-                let f = label(text, size: header ? 10 : 11, bold: !header && !modelDetail && index > 0, color: color)
-                if index > 0 { f.alignment = .right }
-                if modelDetail {
-                    f.maximumNumberOfLines = 1
-                    f.lineBreakMode = index == 0 ? .byTruncatingMiddle : .byTruncatingTail
-                    if index == 0 { f.toolTip = text }
-                    if index == 1 { f.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular) }
-                }
-                if modelDetail && index == 0 {
-                    let cell = row(); cell.spacing = 0
-                    cell.widthAnchor.constraint(equalToConstant: widths[index]).isActive = true
-                    let indent = spacer(); indent.widthAnchor.constraint(equalToConstant: 12).isActive = true
-                    f.widthAnchor.constraint(equalToConstant: widths[index] - 12).isActive = true
-                    cell.addArrangedSubview(indent); cell.addArrangedSubview(f); r.addArrangedSubview(cell)
+            if needsPlanConnection || resetNeedsUnlock {
+                let instruction = usage.quotaError == CredStore.keychainUnavailableMessage
+                    ? "钥匙串连接待解锁，点击恢复自动读取"
+                    : (usage.quotaError == CredStore.v2LockedMessage || resetNeedsUnlock
+                        ? "ZCode 凭据需钥匙串授权，点击解锁恢复自动用量与重置卡"
+                        : "使用套餐 API Key 恢复自动刷新")
+                add(label(instruction, color: .systemOrange))
+                if unlockable {
+                    add(button("解锁凭据", #selector(onUnlockCredentials), prominent: true))
                 } else {
-                    f.widthAnchor.constraint(equalToConstant: widths[index]).isActive = true
-                    r.addArrangedSubview(f)
+                    add(button("连接套餐", #selector(onConnectPlan), prominent: true))
                 }
             }
-            return r
-        }
-        if tokenExpanded {
-            let tableHeader = tableCells(["周期", "Token", "调用次数"], header: true)
-            addContent(tableHeader, to: usageCard)
-            // 参考 CodexUsage：普通汇总行紧凑排列，展开的明细组末留出间隔。
-            var previous: NSView? = tableHeader
-            var previousEndsGroup = false
-            func tighten(after view: NSView?, gap: CGFloat) {
-                if let view = view { usageCard.content.setCustomSpacing(gap, after: view) }
+            // 六张内容卡先注册稳定 identifier，再按 panelLayout.visibleOrder 统一安装（全部隐藏时给空态）
+            var cardViews: [GLMPanelCardID: GLMPanelCard] = [:]
+            func register(_ card: GLMPanelCard, as id: GLMPanelCardID) {
+                card.identifier = NSUserInterfaceItemIdentifier("GLMPanelCard.\(id.rawValue)")
+                cardViews[id] = card
             }
-            for (index, window) in windows.enumerated() {
-                let (name, stats, _, _, _) = window
-                let models = stats.map { TokenModelList.visible($0.byModel) } ?? []
-                let expanded = expandedModelWindows.contains(index)
-                // 折叠指示符在行首（周期名前缀，CodexUsage 同款）；无明细不加
-                let nameLabel = models.isEmpty ? name : (expanded ? "⌄ " : "› ") + name
-                let cells = tableCells([nameLabel, stats.map { Fmt.tokens($0.totalTokens) } ?? "--", stats.map { Fmt.count($0.totalCalls) } ?? "--"], header: false)
-                let item = GLMPanelAction(title: "", target: self, action: #selector(toggleModels(_:)))
-                item.isBordered = false; item.wantsLayer = true; item.layer?.cornerRadius = 5; item.tag = index
-                item.isEnabled = !models.isEmpty
-                let summary = "\(name)，Token \(stats.map { Fmt.tokens($0.totalTokens) } ?? "暂无数据")，调用 \(stats.map { Fmt.count($0.totalCalls) } ?? "暂无数据") 次"
-                item.setAccessibilityLabel(summary + (models.isEmpty ? "，无模型明细" : "，\(expanded ? "收起" : "展开")模型明细"))
-                item.toolTip = models.isEmpty ? "暂无模型明细" : (expanded ? "收起模型明细" : "展开模型明细")
-                cells.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(cells)
-                NSLayoutConstraint.activate([cells.leadingAnchor.constraint(equalTo: item.leadingAnchor), cells.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
-                item.heightAnchor.constraint(equalToConstant: 23).isActive = true
-                addContent(item, to: usageCard)
-                tighten(after: previous, gap: previous === tableHeader ? 3 : (previousEndsGroup ? 8 : 4))
-                previous = item
-                previousEndsGroup = false
-                if expanded {
-                    for (modelIndex, model) in models.enumerated() {
-                        let detail = tableCells([model.name, Fmt.tokens(model.tokens), ""], header: false, modelDetail: true)
-                        detail.heightAnchor.constraint(equalToConstant: 20).isActive = true
-                        addContent(detail, to: usageCard)
-                        tighten(after: previous, gap: 3)
-                        previous = detail
-                        previousEndsGroup = modelIndex == models.count - 1
+            let quotaCard = GLMPanelCard()
+            quotaCard.content.spacing = 6
+            // 卡片标题行（CodexUsage 同款布局、自家绿色系）：图标+标题居左，「重置时间」列头居右
+            let quotaHead = row()
+            quotaHead.spacing = 6
+            quotaHead.addArrangedSubview(symbol("stopwatch"))
+            quotaHead.addArrangedSubview(label("用量进度", size: 12, bold: true))
+            quotaHead.addArrangedSubview(spacer())
+            let resetHeading = label("重置时间", size: 10, color: .secondaryLabelColor)
+            resetHeading.alignment = .right
+            quotaHead.addArrangedSubview(resetHeading)
+            addContent(quotaHead, to: quotaCard)
+
+            func quota(_ entry: LimitEntry?, _ name: String, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool) {
+                let group = GLMPanelStack()
+                group.orientation = .vertical
+                group.alignment = .leading
+                group.spacing = 4
+                func addToGroup(_ view: NSView) {
+                    group.addArrangedSubview(view)
+                    view.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+                }
+
+                // 周期、百分比、进度条与重置时间共用一行，避免为进度条额外占用一行高度。
+                let heading = row()
+                heading.spacing = 4
+                let title = label(name, size: 11, bold: true)
+                title.widthAnchor.constraint(equalToConstant: 36).isActive = true
+                heading.addArrangedSubview(title)
+                let ratio = entry?.usedRemainingRatio
+                let pct = label(Fmt.pct(ratio), size: 14, bold: true, color: GLMRemainingColor.color(ratio))
+                pct.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+                // 列宽按最宽展示值 "100%" 的实测渲染宽（40.89pt）取整，40pt 会折成 "100"/"%" 两行
+                pct.widthAnchor.constraint(equalToConstant: 46).isActive = true
+                heading.addArrangedSubview(pct)
+                let bar = GLMQuotaBar(ratio)
+                bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true
+                heading.addArrangedSubview(bar)
+                // 重置时间与「5 小时」标签同字号（11pt，实测最长 "12-06 周六 13:46" 95.1pt）
+                let reset = label(entry?.reset.map { Fmt.weekDayTime($0) } ?? "时间未知", size: 11, bold: true)
+                reset.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+                reset.alignment = .right
+                reset.lineBreakMode = .byTruncatingTail
+                reset.maximumNumberOfLines = 1
+                reset.widthAnchor.constraint(equalToConstant: 100).isActive = true
+                reset.setContentCompressionResistancePriority(.required, for: .horizontal)
+                heading.addArrangedSubview(reset)
+                addToGroup(heading)
+
+                // 余量和所有异常文本独占卡片全宽，不参与右侧时间列的宽度竞争。
+                if let e = entry { addToGroup(label("剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits", color: .secondaryLabelColor)) }
+                else { addToGroup(label("暂无数据", color: .secondaryLabelColor)) }
+                if needsPlanConnection && error == usage.quotaError {
+                    if let last { addToGroup(label("上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor)) }
+                } else if let e = error { addToGroup(label("刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed)) }
+                if let warning = warning { addToGroup(label("部分数据异常：\(warning)", color: .systemOrange)) }
+                if error == nil && stale { addToGroup(label("数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange)) }
+                addContent(group, to: quotaCard)
+            }
+            quota(usage.fiveHour, "5 小时", usage.fiveHourError, usage.fiveHourWarning, fiveHourLastOK, fiveHourStale)
+            if let fiveHourGroup = quotaCard.content.arrangedSubviews.last {
+                quotaCard.content.setCustomSpacing(10, after: fiveHourGroup)
+            }
+            quota(usage.week, "7 天", usage.weekError, usage.weekWarning, weekLastOK, weekStale)
+            let subscriptionError = needsPlanConnection && usage.subscriptionError == usage.quotaError ? nil : usage.subscriptionError
+            if usage.subscription != nil || subscriptionError != nil || subscriptionStale {
+                addContent(separator(), to: quotaCard)
+            }
+            if let sub = usage.subscription {
+                let expiry = sub.expireDate.map { "套餐到期：\(Fmt.fullTime.string(from: $0))" } ?? "套餐到期：暂无数据"
+                addContent(label(expiry, color: .secondaryLabelColor), to: quotaCard)
+            }
+            if let error = subscriptionError { addContent(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed), to: quotaCard) }
+            else if subscriptionStale { addContent(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange), to: quotaCard) }
+            register(quotaCard, as: .quota)
+            // 峰谷卡＝极简状态条：标题+状态胶囊一行，折扣与下次切换一行；限时活动行沿用旧版追加在下方。
+            // 视觉回归可用 --preview-peak 强制按高峰时刻渲染（下个工作日 14:00）
+            let peakNow = CommandLine.arguments.contains("--preview-peak") ? Peak.nextPeakStart(Date()) : Date()
+            let peakInfo = Peak.display(at: peakNow)
+            let peakCard = GLMPanelCard()
+            let peakTitle = row(); peakTitle.spacing = 6
+            peakTitle.addArrangedSubview(symbol("clock"))
+            peakTitle.addArrangedSubview(label("峰谷状态", size: 12, bold: true))
+            peakTitle.addArrangedSubview(spacer())
+            peakTitle.addArrangedSubview(GLMPeakBadge(isPeak: peakInfo.isPeak, text: peakInfo.badge))
+            peakCard.content.addArrangedSubview(peakTitle); peakTitle.widthAnchor.constraint(equalTo: peakCard.content.widthAnchor).isActive = true
+            peakCard.content.setCustomSpacing(5, after: peakTitle)
+            // 折扣组基线对齐读作一个短语；右列右对齐，标签弱、时间强调但低于折扣
+            let discountGroup = NSStackView(views: [
+                label(peakInfo.discount, size: 18, bold: true, color: peakInfo.isPeak ? .labelColor : GLMPeakTint.accent),
+                label("积分消耗", size: 10.5, color: .secondaryLabelColor)])
+            discountGroup.orientation = .horizontal; discountGroup.alignment = .firstBaseline; discountGroup.spacing = 5
+            let nextTime = label(peakInfo.nextTime, size: 12.5, bold: true)
+            nextTime.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
+            nextTime.setContentCompressionResistancePriority(.required, for: .horizontal)
+            let nextGroup = NSStackView(views: [label(peakInfo.nextLabel, size: 10, color: .secondaryLabelColor), nextTime])
+            nextGroup.orientation = .vertical; nextGroup.alignment = .trailing; nextGroup.spacing = 1.5
+            let peakInfoRow = row(); peakInfoRow.spacing = 4
+            peakInfoRow.addArrangedSubview(discountGroup)
+            peakInfoRow.addArrangedSubview(spacer())
+            peakInfoRow.addArrangedSubview(nextGroup)
+            addContent(peakInfoRow, to: peakCard)
+            register(peakCard, as: .peak)
+            let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 6; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 12, bold: true))
+            if !resetLoginUnsupported, let count = usage.resetCards?.availableCount(now: Date()), count > 0 {
+                let countLabel = label("×\(count)", size: 12, bold: true, color: GLMPeakTint.accent)
+                countLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+                countLabel.setAccessibilityLabel("\(count) 张可用重置卡")
+                cardHead.addArrangedSubview(countLabel)
+            }
+            // 「🎫 使用重置卡」按钮（图标+文字，表意=消耗一张卡）：一类卡可用直接确认，两类都有先选类型，无卡提示；使用中不可点
+            let resetBtn = GLMPanelAction(title: "使用重置卡", target: self, action: #selector(onResetCardIcon(_:)))
+            resetBtn.isBordered = false
+            resetBtn.focusRingType = .default
+            resetBtn.subtleBackground = true
+            resetBtn.wantsLayer = true
+            resetBtn.layer?.cornerRadius = 6
+            resetBtn.widthAnchor.constraint(greaterThanOrEqualToConstant: 86).isActive = true
+            resetBtn.image = NSImage(systemSymbolName: "ticket.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+            resetBtn.imagePosition = .imageLeft
+            resetBtn.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            resetBtn.contentTintColor = .secondaryLabelColor
+            resetBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
+            resetBtn.isEnabled = !resetUseInFlight
+            resetBtn.toolTip = resetUseInFlight ? "重置卡使用中…" : "使用一张重置卡，立即重置对应额度窗口"
+            resetBtn.setAccessibilityLabel(resetUseInFlight ? "重置卡使用中" : "使用重置卡")
+            cardHead.addArrangedSubview(spacer())
+            if !resetLoginUnsupported { cardHead.addArrangedSubview(resetBtn) }
+            cards.content.addArrangedSubview(cardHead); cardHead.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
+            if resetLoginUnsupported {
+                addContent(label("请在 ZCode 的「使用统计 → 编程套餐」查看和使用", color: .secondaryLabelColor), to: cards)
+            } else if let c = usage.resetCards {
+                func cardRow(_ name: String, _ detail: String, color: NSColor) {
+                    let line = row()
+                    let nameLabel = label(name, color: .secondaryLabelColor)
+                    nameLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+                    let detailLabel = label(detail, color: color)
+                    detailLabel.alignment = .right
+                    detailLabel.maximumNumberOfLines = 1
+                    detailLabel.lineBreakMode = .byTruncatingTail
+                    line.addArrangedSubview(nameLabel)
+                    line.addArrangedSubview(spacer())
+                    line.addArrangedSubview(detailLabel)
+                    cards.content.addArrangedSubview(line)
+                    line.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true
+                }
+                for (name, dates) in [("5 小时卡", c.fiveHour), ("周卡", c.week)] {
+                    if let dates = dates {
+                        let available = GLMFreshness.availableCards(dates, now: Date())
+                        if available.isEmpty { cardRow(name, "暂无可用", color: .secondaryLabelColor) }
+                        for d in available { cardRow(name, "\(Fmt.expires(d)) 过期", color: d.timeIntervalSinceNow <= 72 * 3600 ? .systemOrange : .labelColor) }
+                    }
+                }
+            } else { let l = label("暂无数据", color: .secondaryLabelColor); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
+            for (name, error, stale, last) in [("5 小时卡", usage.fiveHourCardsError, fiveHourCardsStale, fiveHourCardsLastOK), ("周卡", usage.weekCardsError, weekCardsStale, weekCardsLastOK)] where !resetLoginUnsupported {
+                let message: String? = error.map { "\(name)获取失败：\($0)（ZCode 登录态可能过期，打开 ZCode 后重试） · 最后成功 \(Fmt.lastOK(last))" } ?? (stale ? "\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))" : nil)
+                if let message = message { let l = label(message, color: .systemRed); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
+            }
+            register(cards, as: .resetCards)
+            let usageCard = GLMPanelCard()
+            usageCard.content.spacing = 4
+            let usageSection = section("用量情况", icon: "square.stack.3d.up.fill", expanded: tokenExpanded, action: #selector(toggleToken))
+            addContent(usageSection, to: usageCard)
+            let windows: [(String, ModelUsage?, Date?, Bool, String?)] = [
+                ("今日", usage.tokensToday, tokensTodayLastOK, tokensTodayStale, usage.tokensTodayError),
+                ("近 7 天", usage.tokens7d, tokens7dLastOK, tokens7dStale, usage.tokens7dError),
+                ("近 30 天", usage.tokens30d, tokens30dLastOK, tokens30dStale, usage.tokens30dError)]
+            func tableCells(_ values: [String], header: Bool, modelDetail: Bool = false) -> NSStackView {
+                let r = row(); r.spacing = 4
+                // 三列与两个间距填满卡片内容宽；展开指示仍保留在行首。
+                let tableWidth = inner - GLMPanelCard.contentInset * 2 - 8
+                // 明细行将调用次数列之前的空间更多留给模型名；Token 右边缘保持与汇总行对齐。
+                let widths = modelDetail
+                    ? [tableWidth * 0.46, tableWidth * 0.20, tableWidth * 0.34]
+                    : [tableWidth * 0.32, tableWidth * 0.34, tableWidth * 0.34]
+                for (index, text) in values.enumerated() {
+                    let color: NSColor = header || modelDetail ? .secondaryLabelColor : (index == 1 ? GLMPeakTint.accent : .labelColor)
+                    let f = label(text, size: header ? 10 : 11, bold: !header && !modelDetail && index > 0, color: color)
+                    if index > 0 { f.alignment = .right }
+                    if modelDetail {
+                        f.maximumNumberOfLines = 1
+                        f.lineBreakMode = index == 0 ? .byTruncatingMiddle : .byTruncatingTail
+                        if index == 0 { f.toolTip = text }
+                        if index == 1 { f.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular) }
+                    }
+                    if modelDetail && index == 0 {
+                        let cell = row(); cell.spacing = 0
+                        cell.widthAnchor.constraint(equalToConstant: widths[index]).isActive = true
+                        let indent = spacer(); indent.widthAnchor.constraint(equalToConstant: 12).isActive = true
+                        f.widthAnchor.constraint(equalToConstant: widths[index] - 12).isActive = true
+                        cell.addArrangedSubview(indent); cell.addArrangedSubview(f); r.addArrangedSubview(cell)
+                    } else {
+                        f.widthAnchor.constraint(equalToConstant: widths[index]).isActive = true
+                        r.addArrangedSubview(f)
+                    }
+                }
+                return r
+            }
+            if tokenExpanded {
+                let tableHeader = tableCells(["周期", "Token", "调用次数"], header: true)
+                addContent(tableHeader, to: usageCard)
+                // 参考 CodexUsage：普通汇总行紧凑排列，展开的明细组末留出间隔。
+                var previous: NSView? = tableHeader
+                var previousEndsGroup = false
+                func tighten(after view: NSView?, gap: CGFloat) {
+                    if let view = view { usageCard.content.setCustomSpacing(gap, after: view) }
+                }
+                for (index, window) in windows.enumerated() {
+                    let (name, stats, _, _, _) = window
+                    let models = stats.map { TokenModelList.visible($0.byModel) } ?? []
+                    let expanded = expandedModelWindows.contains(index)
+                    // 折叠指示符在行首（周期名前缀，CodexUsage 同款）；无明细不加
+                    let nameLabel = models.isEmpty ? name : (expanded ? "⌄ " : "› ") + name
+                    let cells = tableCells([nameLabel, stats.map { Fmt.tokens($0.totalTokens) } ?? "--", stats.map { Fmt.count($0.totalCalls) } ?? "--"], header: false)
+                    let item = GLMPanelAction(title: "", target: self, action: #selector(toggleModels(_:)))
+                    item.isBordered = false; item.wantsLayer = true; item.layer?.cornerRadius = 5; item.tag = index
+                    item.isEnabled = !models.isEmpty
+                    let summary = "\(name)，Token \(stats.map { Fmt.tokens($0.totalTokens) } ?? "暂无数据")，调用 \(stats.map { Fmt.count($0.totalCalls) } ?? "暂无数据") 次"
+                    item.setAccessibilityLabel(summary + (models.isEmpty ? "，无模型明细" : "，\(expanded ? "收起" : "展开")模型明细"))
+                    item.toolTip = models.isEmpty ? "暂无模型明细" : (expanded ? "收起模型明细" : "展开模型明细")
+                    cells.translatesAutoresizingMaskIntoConstraints = false; item.addSubview(cells)
+                    NSLayoutConstraint.activate([cells.leadingAnchor.constraint(equalTo: item.leadingAnchor), cells.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
+                    item.heightAnchor.constraint(equalToConstant: 23).isActive = true
+                    addContent(item, to: usageCard)
+                    tighten(after: previous, gap: previous === tableHeader ? 3 : (previousEndsGroup ? 8 : 4))
+                    previous = item
+                    previousEndsGroup = false
+                    if expanded {
+                        for (modelIndex, model) in models.enumerated() {
+                            let detail = tableCells([model.name, Fmt.tokens(model.tokens), ""], header: false, modelDetail: true)
+                            detail.heightAnchor.constraint(equalToConstant: 20).isActive = true
+                            addContent(detail, to: usageCard)
+                            tighten(after: previous, gap: 3)
+                            previous = detail
+                            previousEndsGroup = modelIndex == models.count - 1
+                        }
                     }
                 }
             }
-        }
-        for (name, _, last, stale, error) in windows {
-            if needsPlanConnection && error == usage.quotaError {
-                if let last { addContent(label("\(name)上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor), to: usageCard) }
-            } else if let error = error { addContent(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed), to: usageCard) }
-            else if stale { addContent(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange), to: usageCard) }
-        }
-        register(usageCard, as: .usage)
+            for (name, _, last, stale, error) in windows {
+                if needsPlanConnection && error == usage.quotaError {
+                    if let last { addContent(label("\(name)上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor), to: usageCard) }
+                } else if let error = error { addContent(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed), to: usageCard) }
+                else if stale { addContent(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange), to: usageCard) }
+            }
+            register(usageCard, as: .usage)
 
-        // 每日用量：标题、选中行、图表和比较条作为一个完整模块进入独立卡片。
-        let dailyCard = GLMPanelCard()
-        dailyCard.content.spacing = 6
-        let dailyPending = usage.dailyTokens != nil && (usage.dailyTokensError != nil || dailyStale)
-        let dailySection = GLMDailyUsageSectionView(buckets: usage.dailyTokens, selectedIndex: dailySelectedIndex,
-                                                    expanded: dailyExpanded, toggleTarget: self,
-                                                    toggleAction: #selector(toggleDaily), pendingNote: dailyPending) { [weak self] index in
-            self?.dailySelectedIndex = index
-        }
-        addContent(dailySection, to: dailyCard)
-        register(dailyCard, as: .daily)
+            // 每日用量：标题、选中行、图表和比较条作为一个完整模块进入独立卡片。
+            let dailyCard = GLMPanelCard()
+            dailyCard.content.spacing = 6
+            let dailyPending = usage.dailyTokens != nil && (usage.dailyTokensError != nil || dailyStale)
+            let dailySection = GLMDailyUsageSectionView(buckets: usage.dailyTokens, selectedIndex: dailySelectedIndex,
+                                                        expanded: dailyExpanded, toggleTarget: self,
+                                                        toggleAction: #selector(toggleDaily), pendingNote: dailyPending) { [weak self] index in
+                self?.dailySelectedIndex = index
+            }
+            addContent(dailySection, to: dailyCard)
+            register(dailyCard, as: .daily)
 
-        let mcpCard = GLMPanelCard()
-        mcpCard.content.spacing = 4
-        let mcpSection = section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP))
-        addContent(mcpSection, to: mcpCard)
-        // 键盘可达（PRD §6.2 支持键盘切换日期）：把柱图接进 key view loop——
-        // 「用量情况」标题 → 柱图 → 「MCP 工具」标题为显式顺序，其余环节按几何自动；
-        // Full Keyboard Access 下 Tab 即可到达柱图，左右方向键切换日期
-        if dailyExpanded {
-            usageSection.nextKeyView = dailySection.chartCanvas
-            dailySection.chartCanvas.nextKeyView = mcpSection
-        } else {
-            usageSection.nextKeyView = mcpSection   // 折叠时柱图不在视图层级，直接桥接相邻板块
-        }
-        if mcpExpanded {
-            if let t = usage.tools30d { addContent(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor), to: mcpCard) }
-            else { addContent(label("暂无数据", color: .secondaryLabelColor), to: mcpCard) }
-        }
-        if needsPlanConnection && usage.toolsError == usage.quotaError {
-            if let last = toolsLastOK { addContent(label("上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor), to: mcpCard) }
-        } else if let e = usage.toolsError { addContent(label("MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemRed), to: mcpCard) }
-        else if toolsStale { addContent(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange), to: mcpCard) }
-        register(mcpCard, as: .mcp)
+            let mcpCard = GLMPanelCard()
+            mcpCard.content.spacing = 4
+            let mcpSection = section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP))
+            addContent(mcpSection, to: mcpCard)
+            // 键盘可达（PRD §6.2 支持键盘切换日期）：把柱图接进 key view loop——
+            // 「用量情况」标题 → 柱图 → 「MCP 工具」标题为显式顺序，其余环节按几何自动；
+            // Full Keyboard Access 下 Tab 即可到达柱图，左右方向键切换日期
+            if dailyExpanded {
+                usageSection.nextKeyView = dailySection.chartCanvas
+                dailySection.chartCanvas.nextKeyView = mcpSection
+            } else {
+                usageSection.nextKeyView = mcpSection   // 折叠时柱图不在视图层级，直接桥接相邻板块
+            }
+            if mcpExpanded {
+                if let t = usage.tools30d { addContent(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor), to: mcpCard) }
+                else { addContent(label("暂无数据", color: .secondaryLabelColor), to: mcpCard) }
+            }
+            if needsPlanConnection && usage.toolsError == usage.quotaError {
+                if let last = toolsLastOK { addContent(label("上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor), to: mcpCard) }
+            } else if let e = usage.toolsError { addContent(label("MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemRed), to: mcpCard) }
+            else if toolsStale { addContent(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange), to: mcpCard) }
+            register(mcpCard, as: .mcp)
 
-        // 按用户布局的可见顺序安装卡片；全部隐藏时给出可恢复空态，不留无法解释的空白
-        let visibleCards = panelLayout.visibleOrder.compactMap { cardViews[$0] }
-        if visibleCards.isEmpty {
-            let emptyCard = GLMPanelCard()
-            emptyCard.identifier = NSUserInterfaceItemIdentifier("GLMPanelEmptyState")
-            addContent(label("卡片已全部隐藏，可通过右上角「···」恢复。", color: .secondaryLabelColor), to: emptyCard)
-            let restore = button("恢复默认卡片布局", #selector(restoreDefaultPanelLayout))
-            addContent(restore, to: emptyCard)
-            add(emptyCard)
-        } else {
-            for card in visibleCards { add(card) }
+            // 按用户布局的可见顺序安装卡片；全部隐藏时给出可恢复空态，不留无法解释的空白
+            let visibleCards = panelLayout.visibleOrder.compactMap { cardViews[$0] }
+            if visibleCards.isEmpty {
+                let emptyCard = GLMPanelCard()
+                emptyCard.identifier = NSUserInterfaceItemIdentifier("GLMPanelEmptyState")
+                addContent(label("卡片已全部隐藏，可通过右上角「···」恢复。", color: .secondaryLabelColor), to: emptyCard)
+                let restore = button("恢复默认卡片布局", #selector(restoreDefaultPanelLayout))
+                addContent(restore, to: emptyCard)
+                add(emptyCard)
+            } else {
+                for card in visibleCards { add(card) }
+            }
         }
 
         let header = row(); header.spacing = 12
@@ -4302,6 +4316,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         let expectedDefault = GLMPanelCardID.allCases.map(\.rawValue)
         guard cardOrder() == expectedDefault else { fail("default card order \(cardOrder())") }
+        // 生产布局偏好基线：preview 全程不得写入，结束前逐字节比对（不假定用户原先没有该配置）
+        let productionLayoutData = UserDefaults.standard.data(forKey: GLMPanelLayout.defaultsKey)
         // 隐藏 + 排序后按可见顺序组装：resetCards 不动，daily 上移到 usage 之前，mcp 隐藏
         panelLayout.setVisible(false, for: .mcp)
         panelLayout.move(.daily, direction: .up)
@@ -4324,7 +4340,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard backgroundStyle == style else { fail("background selection \(style.rawValue)") }
         }
         guard panelMenu.items[0].isEnabled else { fail("settings entry disabled outside settings") }
-        print("GLM card settings test: PASS (default layout, unified menu)")
+
+        // ===== 原位设置页：显隐开关 + 上/下排序按钮 + 完成（全部走真实按钮事件） =====
+        showCardSettings()
+        guard showingCardSettings else { fail("settings did not open") }
+        func editorView() -> GLMCardSettingsView? {
+            allViews(panelController.view).compactMap { $0 as? GLMCardSettingsView }.first
+        }
+        func buttonWithID(_ identifier: String) -> NSButton? {
+            allViews(panelController.view).first(where: { $0.identifier?.rawValue == identifier }) as? NSButton
+        }
+        guard let editor = editorView() else { fail("settings view missing") }
+        guard editor.layout.order.count == 6 else { fail("settings row count \(editor.layout.order.count)") }
+        // 首行上移、末行下移按钮必须禁用
+        guard let quotaUp = buttonWithID("CardMoveUp.quota"), !quotaUp.isEnabled else { fail("first row up must be disabled") }
+        guard let mcpDown = buttonWithID("CardMoveDown.mcp"), !mcpDown.isEnabled else { fail("last row down must be disabled") }
+        // 真实复选框事件：隐藏 MCP，其余卡片保持显示
+        guard let mcpToggle = buttonWithID("CardToggle.mcp") else { fail("mcp toggle missing") }
+        mcpToggle.performClick(nil)
+        guard editor.layout.isVisible(.mcp) == false else { fail("mcp not hidden via checkbox") }
+        guard editor.layout.visibleOrder == [.quota, .peak, .resetCards, .usage, .daily] else { fail("hide touched other cards") }
+        // 真实上移按钮事件：每日用量上移一格
+        guard let dailyUp = buttonWithID("CardMoveUp.daily") else { fail("daily up button missing") }
+        dailyUp.performClick(nil)
+        guard editor.layout.order == [.quota, .peak, .resetCards, .daily, .usage, .mcp] else { fail("daily not moved via button") }
+        // 真实「完成」按钮：退出设置页并应用布局到实际卡片
+        guard let doneButton = allViews(panelController.view).compactMap({ $0 as? NSButton }).first(where: { $0.title == "完成" }) else { fail("done button missing") }
+        doneButton.performClick(nil)
+        guard !showingCardSettings else { fail("settings did not close") }
+        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage"] else { fail("settings changes not applied \(cardOrder())") }
+        // 重开设置页：必须重建新视图、保留内存布局与开关状态
+        showCardSettings()
+        guard let reopenedEditor = editorView() else { fail("reopened settings view missing") }
+        guard reopenedEditor !== editor else { fail("settings view was not rebuilt") }
+        guard reopenedEditor.layout.isVisible(.mcp) == false else { fail("hidden state lost on rebuild") }
+        guard let reopenedMcpToggle = buttonWithID("CardToggle.mcp"), reopenedMcpToggle.state == .off else { fail("toggle state lost on reopen") }
+        finishCardSettings()
+        // 关闭再打开 Popover：回到正常面板且布局不变
+        popover.performClose(nil)
+        if !popover.isShown { togglePanel() }
+        var reopenWait = 0.0
+        while !popover.isShown && reopenWait < 2.0 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            reopenWait += 0.1
+            if !popover.isShown { togglePanel() }
+        }
+        guard popover.isShown else { fail("popover did not reopen") }
+        guard showingCardSettings == false else { fail("settings leaked after popover reopen") }
+        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage"] else { fail("layout lost after popover reopen \(cardOrder())") }
+        restoreDefaultPanelLayout()
+        guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
+        guard UserDefaults.standard.data(forKey: GLMPanelLayout.defaultsKey) == productionLayoutData else { fail("preview wrote production layout defaults") }
+        print("GLM card settings test: PASS (default layout, unified menu, settings editor)")
         exit(0)
     }
 
