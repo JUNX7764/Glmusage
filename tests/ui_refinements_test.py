@@ -27,3 +27,6 @@ class UIRefinementsTest(unittest.TestCase):
 
     def test_daily_corners(self):
         self.case("dailyCorners")
+
+    def test_token_transition(self):
+        self.case("tokenTransition")

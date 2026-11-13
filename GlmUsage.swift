@@ -2507,7 +2507,7 @@ final class GLMDailyUsageSectionView: NSView {
     }
 
     private let dateLabel = NSTextField(wrappingLabelWithString: "")
-    private let valueLabel = NSTextField(wrappingLabelWithString: "")
+    private let valueLabel = GLMAnimatedTokenLabel { "\(Fmt.tokens($0)) Token" }
     private let canvas = GLMDailyChartCanvas()
 
     /// 柱图（供面板把每日图接进 key view loop，Tab/FKA 可达）
@@ -2630,7 +2630,7 @@ final class GLMDailyUsageSectionView: NSView {
         canvas.configure(buckets: buckets, initialIndex: defaultIndex)
         canvas.focusRingType = .default
         canvas.onSelect = { [weak self] index in
-            self?.syncSelection(index)
+            self?.syncSelection(index, animated: true)
             onSelect(index)
         }
         canvas.translatesAutoresizingMaskIntoConstraints = false
@@ -2671,19 +2671,13 @@ final class GLMDailyUsageSectionView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    private func syncSelection(_ index: Int) {
-        // 由 canvas 在选中变化时调用（含键盘/悬停）；直接改本块标签，不重建面板、不发请求
+    private func syncSelection(_ index: Int, animated: Bool = false) {
         let buckets = canvas.dayBuckets
         guard buckets.indices.contains(index) else { return }
         let bucket = buckets[index]
         dateLabel.stringValue = Self.dayText(for: bucket.day)
-        if let tokens = bucket.tokens {
-            valueLabel.stringValue = "\(Fmt.tokens(tokens)) Token"
-            valueLabel.textColor = .labelColor
-        } else {
-            valueLabel.stringValue = "数据不足"
-            valueLabel.textColor = .secondaryLabelColor
-        }
+        valueLabel.textColor = bucket.tokens == nil ? .secondaryLabelColor : .labelColor
+        valueLabel.setTokens(bucket.tokens, animated: animated)
     }
 
     private func comparisonPairs(for buckets: [GLMDayBucket]?) -> [(label: String, outcome: GLMUsageComparison.Outcome)] {
@@ -4969,7 +4963,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard dateLabel.stringValue == expectedDate else {
                 fail("\(step): date \(dateLabel.stringValue) != \(expectedDate)")
             }
-            guard valueLabel.stringValue == expectedValue else {
+            guard let animatedLabel = valueLabel as? GLMAnimatedTokenLabel,
+                  animatedLabel.accessibilityValue() as? String == expectedValue else { fail("\(step): AX target") }
+            if bucket.tokens == nil && valueLabel.stringValue != expectedValue { fail("\(step): missing must be immediate") }
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.8
+            while (valueLabel.stringValue != expectedValue || animatedLabel.isAnimating) && ProcessInfo.processInfo.systemUptime < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            }
+            guard valueLabel.stringValue == expectedValue && !animatedLabel.isAnimating else {
                 fail("\(step): value \(valueLabel.stringValue) != \(expectedValue)")
             }
             print("GLM_DAILY_TEST \(step): \(expectedDate) \(expectedValue)")
@@ -4994,13 +4995,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         steps.append {
             hover(5)
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+               let label = valueLabel as? GLMAnimatedTokenLabel, buckets[5].tokens != nil,
+               buckets[5].tokens != buckets.last?.tokens, !label.isAnimating { fail("hover did not animate") }
             print("GLM_DAILY_DEBUG selected=\(canvas.selectedIndex) firstResponder=\(String(describing: window.firstResponder)) canvasInWindow=\(canvas.convert(canvas.bounds, to: nil)) acceptsMoved=\(window.acceptsMouseMovedEvents) tracking=\(canvas.trackingAreas.count)")
             verify("hover-day", index: 5)
         }
         steps.append { hover(10); verify("hover-zero-day", index: 10) }            // 零值日可命中
         steps.append { hover(17); verify("hover-missing-day", index: 17) }         // 缺失日=数据不足（非 0）
         steps.append { hover(17, edge: true); verify("hover-column-edge", index: 17) }  // 整天宽命中
-        steps.append { hover(20); verify("hover-move", index: 20) }
+        steps.append { hover(5); hover(20); verify("hover-retarget", index: 20)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+            verify("hover-retarget-stable", index: 20)
+        }
         steps.append {
             // NSEvent.mouseEventWithType 只接受 MouseMask/MouseMoved；离开事件须用
             // enterExitEvent 合成（与真实 tracking-area 离开事件同类型）
