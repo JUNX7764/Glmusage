@@ -94,6 +94,8 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 无 ZCode 凭证库时，可在真实网络验收中通过 `GLM_API_KEY` 提供 key；不得把真实 key 写入命令记录、文档或提交。运行状态诊断写入 `~/Library/Application Support/GlmUsage/status.json`。
 
+每日图所选 Token 值在交互切换时以 320ms ease-out 过渡，日期与辅助功能目标值即时更新；首次显示、缺失及恢复、减少动态效果或移出窗口时即时到位。环比胶囊在窄版长值下可增高为双行，保留完整文字。
+
 ## 文件说明
 
 | 文件 | 说明 |
@@ -101,6 +103,8 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `GlmUsage.swift` | 应用入口、数据层、刷新调度与面板组装 |
 | `PanelCustomization.swift` | 面板卡片布局模型（`GLMPanelLayout`）与卡片设置视图（`GLMCardSettingsView`） |
 | `Sources/GLMQuotaCycle*.swift` | 周额度历史的模型、上下文、存储、协调器与原生视图 |
+| `Sources/GLMPanelVisuals.swift`、`Sources/GLMAnimatedTokenValue.swift`、`Sources/GLMDeltaChip.swift` | 绘图几何、每日 Token 数值过渡和比较值胶囊 |
+| `tests/ui_refinements_test.py` | 独立 Swift 视觉几何、数值过渡、胶囊和图标离线夹具 |
 | `tests/quota_cycle_history_test.py` | 假数据与临时目录中的周额度历史测试 |
 | `build.sh` | 多文件编译、打包和签名验证 |
 | `Info.plist` | Bundle 身份、最低系统版本和菜单栏常驻配置 |
