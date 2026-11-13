@@ -2481,6 +2481,9 @@ final class GLMDailyUsageSectionView: NSView {
     /// 柱图（供面板把每日图接进 key view loop，Tab/FKA 可达）
     var chartCanvas: GLMDailyChartCanvas { canvas }
 
+    /// 折叠/展开按钮（供面板按可见顺序把每日图标题接进 key view loop）
+    private(set) var toggleControl: NSView?
+
     init(buckets: [GLMDayBucket]?, selectedIndex: Int?, expanded: Bool,
          toggleTarget: AnyObject?, toggleAction: Selector, pendingNote: Bool = false, onSelect: @escaping (Int) -> Void) {
         super.init(frame: .zero)
@@ -2548,6 +2551,7 @@ final class GLMDailyUsageSectionView: NSView {
         toggle.heightAnchor.constraint(equalToConstant: 26).isActive = true
         stack.addArrangedSubview(toggle)
         toggle.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        toggleControl = toggle
 
         // 折叠：仅保留标题行（待更新提示仍在），日期/柱图/刻度/比较条全部不入层级
         guard expanded else { return }
@@ -2654,6 +2658,30 @@ final class GLMDailyUsageSectionView: NSView {
         let outcomes = GLMUsageComparison.dailyPair(buckets: buckets ?? [])
         return [("日环比", outcomes.dayOnDay), ("7日环比", outcomes.weekOnWeek)]
     }
+}
+
+/// 拖放 data source 回归用 NSDraggingInfo 测试替身（validateDrop 只读 source/pasteboard）。
+/// 仅用于直接调用 data source 方法验证拖放数据边界；真实鼠标拖拽由 Cua 验收，不以此冒充。
+private final class GLMStubDraggingInfo: NSObject, NSDraggingInfo {
+    private let stubPasteboard: NSPasteboard
+    private let stubSource: AnyObject?
+    init(pasteboard: NSPasteboard, source: AnyObject?) { stubPasteboard = pasteboard; stubSource = source }
+    var draggingDestinationWindow: NSWindow? { nil }
+    var draggingSourceOperationMask: NSDragOperation { .move }
+    var draggingLocation: NSPoint { .zero }
+    var draggedImageLocation: NSPoint { .zero }
+    var draggedImage: NSImage? { nil }
+    var draggingPasteboard: NSPasteboard { stubPasteboard }
+    var draggingSource: Any? { stubSource }
+    var draggingSequenceNumber: Int { 1 }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    override func namesOfPromisedFilesDropped(atDestination dropDestination: URL) -> [String]? { nil }
+    var draggingFormation: NSDraggingFormation = .none
+    var animatesToDestination: Bool = false
+    var numberOfValidItemsForDrop: Int = 1
+    func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions, for view: NSView?, classes classArray: [AnyClass], searchOptions: [NSPasteboard.ReadingOptionKey: Any], using block: @escaping (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+    func resetSpringLoading() {}
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
@@ -3962,14 +3990,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             mcpCard.content.spacing = 4
             let mcpSection = section("MCP 工具（近 30 天）", icon: "square.stack.3d.up", expanded: mcpExpanded, action: #selector(toggleMCP))
             addContent(mcpSection, to: mcpCard)
-            // 键盘可达（PRD §6.2 支持键盘切换日期）：把柱图接进 key view loop——
-            // 「用量情况」标题 → 柱图 → 「MCP 工具」标题为显式顺序，其余环节按几何自动；
+            // 键盘可达（PRD §6.2 支持键盘切换日期）：key view loop 按 panelLayout.visibleOrder
+            // 动态连接「板块标题 → 柱图」显式顺序，其余环节按几何自动；隐藏/折叠的卡片不留链接。
             // Full Keyboard Access 下 Tab 即可到达柱图，左右方向键切换日期
-            if dailyExpanded {
-                usageSection.nextKeyView = dailySection.chartCanvas
-                dailySection.chartCanvas.nextKeyView = mcpSection
-            } else {
-                usageSection.nextKeyView = mcpSection   // 折叠时柱图不在视图层级，直接桥接相邻板块
+            var focusChain: [NSView] = []
+            for id in panelLayout.visibleOrder {
+                switch id {
+                case .usage:
+                    focusChain.append(usageSection)
+                case .daily:
+                    if let toggle = dailySection.toggleControl { focusChain.append(toggle) }
+                    if dailyExpanded { focusChain.append(dailySection.chartCanvas) }
+                case .mcp:
+                    focusChain.append(mcpSection)
+                case .quota, .peak, .resetCards:
+                    break // 其他卡片内现有按钮继续由 AppKit 按几何与控件策略处理
+                }
+            }
+            for (current, next) in zip(focusChain, focusChain.dropFirst()) {
+                current.nextKeyView = next
             }
             if mcpExpanded {
                 if let t = usage.tools30d { addContent(label("网络搜索 \(Fmt.count(t.networkSearch)) 次 · 网页读取 \(Fmt.count(t.webRead)) 次", color: .secondaryLabelColor), to: mcpCard) }
@@ -4329,6 +4368,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard allViews(panelController.view).contains(where: { $0.identifier?.rawValue == "GLMPanelEmptyState" }) else { fail("all-hidden empty state") }
         restoreDefaultPanelLayout()
         guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
+        // ===== 动态 key view 链：重排后按可见顺序连接，而非旧固定 usage → chart → mcp =====
+        func actionToggle(_ keyword: String) -> NSButton? {
+            allViews(panelController.view).first { view in
+                guard let b = view as? NSButton, let a11y = b.accessibilityLabel() else { return false }
+                return a11y.contains(keyword)
+            } as? NSButton
+        }
+        func chartCanvas() -> GLMDailyChartCanvas? {
+            allViews(panelController.view).compactMap { $0 as? GLMDailyChartCanvas }.first
+        }
+        // 每日图移到用量情况之前，MCP 换到首位：链必须按可见顺序 mcp → daily(toggle, chart) → usage
+        panelLayout.move(.daily, direction: .up)
+        panelLayout.move(.mcp, to: 0)
+        rebuildPanel()
+        guard cardOrder() == ["mcp", "quota", "peak", "resetCards", "daily", "usage"] else { fail("key chain setup order \(cardOrder())") }
+        guard let mcpToggle = actionToggle("MCP 工具") else { fail("key chain views missing: mcp") }
+        guard let dailyToggle = actionToggle("每日用量") else { fail("key chain views missing: daily") }
+        guard let usageToggle = actionToggle("用量情况") else { fail("key chain views missing: usage") }
+        guard let canvas = chartCanvas() else { fail("key chain views missing: canvas") }
+        guard mcpToggle.nextKeyView === dailyToggle else { fail("key chain mcp → daily toggle") }
+        guard dailyToggle.nextKeyView === canvas else { fail("key chain daily toggle → chart") }
+        guard canvas.nextKeyView === usageToggle else { fail("key chain chart → usage") }
+        // 隐藏 daily 后链中不得留 chartCanvas：daily 卡片不在层级，链跳过它直连 usage
+        panelLayout.setVisible(false, for: .daily)
+        rebuildPanel()
+        guard chartCanvas() == nil else { fail("hidden daily canvas still in hierarchy") }
+        guard let mcpToggle2 = actionToggle("MCP 工具"), let usageToggle2 = actionToggle("用量情况") else { fail("hidden daily chain views") }
+        guard mcpToggle2.nextKeyView === usageToggle2 else { fail("hidden daily left chart link") }
+        guard usageToggle2.nextKeyView == nil else { fail("hidden daily chain tail") }
+        // 折叠 daily（真实点击 toggle）：toggle 保留在链中，chartCanvas 不在层级也不被链接
+        panelLayout.setVisible(true, for: .daily)
+        rebuildPanel()
+        guard let dailyToggle3 = actionToggle("每日用量") else { fail("daily toggle missing before collapse") }
+        dailyToggle3.performClick(nil)
+        guard dailyExpanded == false else { fail("daily did not collapse via toggle") }
+        guard chartCanvas() == nil else { fail("collapsed daily canvas still in hierarchy") }
+        guard let mcpToggle3 = actionToggle("MCP 工具"), let collapsedDailyToggle = actionToggle("每日用量"),
+              let usageToggle3 = actionToggle("用量情况") else { fail("collapsed chain views") }
+        guard mcpToggle3.nextKeyView === collapsedDailyToggle else { fail("collapsed chain mcp → daily") }
+        guard collapsedDailyToggle.nextKeyView === usageToggle3 else { fail("collapsed chain daily → usage") }
+        // 恢复展开与默认布局，后续用例基于干净状态
+        actionToggle("每日用量")?.performClick(nil)
+        guard dailyExpanded else { fail("daily did not re-expand") }
+        restoreDefaultPanelLayout()
+        guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
+        // ===== 滚动钳制：内容溢出时滚到底；纯排序（高度不变）不改 offset；隐藏大卡片后钳制到新 maxY =====
+        // 与 --preview-long 同款 30 模型假数据，保证内容必然超过 Popover 最大高度（截断区）
+        let tallStats = ModelUsage(totalTokens: 9_000_000, totalCalls: 500, byModel: (1...30).map { ("glm-very-long-model-name-\($0)", Double($0 * 10_000)) })
+        usage.tokensToday = tallStats; usage.tokens7d = tallStats; usage.tokens30d = tallStats
+        expandedModelWindows = [0, 1, 2]
+        rebuildPanel()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        panelScroll.layoutSubtreeIfNeeded()
+        let clip = panelScroll.contentView
+        func currentMaxY() -> CGFloat {
+            max(0, (panelScroll.documentView?.frame.height ?? 0) - clip.bounds.height)
+        }
+        let fullMaxY = currentMaxY()
+        guard fullMaxY > 1 else { fail("preview content did not overflow; cannot verify scroll clamping") }
+        clip.scroll(to: NSPoint(x: 0, y: fullMaxY))
+        let offsetBeforeSort = clip.bounds.origin.y
+        panelLayout.move(.usage, direction: .up)
+        rebuildPanel()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        panelScroll.layoutSubtreeIfNeeded()
+        guard abs(clip.bounds.origin.y - offsetBeforeSort) < 1 else { fail("pure reorder changed scroll offset \(clip.bounds.origin.y) vs \(offsetBeforeSort)") }
+        panelLayout.setVisible(false, for: .daily)
+        panelLayout.setVisible(false, for: .mcp)
+        rebuildPanel()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        panelScroll.layoutSubtreeIfNeeded()
+        let shrunkMaxY = currentMaxY()
+        guard shrunkMaxY < fullMaxY else { fail("hiding cards did not shrink content") }
+        guard clip.bounds.origin.y >= -0.5 && clip.bounds.origin.y <= shrunkMaxY + 0.5 else { fail("scroll offset out of bounds after hide") }
+        // 设置页进出：内容高度变化后 offset 仍钳制在界内，不留异常锚点漂移
+        showCardSettings()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        panelScroll.layoutSubtreeIfNeeded()
+        guard clip.bounds.origin.y >= -0.5 && clip.bounds.origin.y <= currentMaxY() + 0.5 else { fail("scroll offset out of bounds in settings") }
+        finishCardSettings()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        panelScroll.layoutSubtreeIfNeeded()
+        guard clip.bounds.origin.y >= -0.5 && clip.bounds.origin.y <= shrunkMaxY + 0.5 else { fail("scroll offset out of bounds after settings") }
+        expandedModelWindows = []
+        restoreDefaultPanelLayout()
+        guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
         // 统一「···」菜单：卡片设置入口 + 背景样式子菜单，背景选择仍即时生效
         let panelMenu = makePanelSettingsMenu()
         guard panelMenu.items.map(\.title) == ["卡片显示与排序…", "背景样式"] else { fail("panel menu structure") }
@@ -4352,6 +4477,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         guard let editor = editorView() else { fail("settings view missing") }
         guard editor.layout.order.count == 6 else { fail("settings row count \(editor.layout.order.count)") }
+        // 拖放数据边界：六行 writer 只写本表卡片 ID；validateDrop 接受本表、拒绝外部文本与外部来源。
+        // 注意：这是直接调用 table data source 方法的模型级验证，真实鼠标拖拽由 Cua 验收（Task 7）。
+        guard let table = allViews(editor).compactMap({ $0 as? NSTableView }).first,
+              table.dataSource === editor else { fail("settings table missing") }
+        for row in editor.layout.order.indices {
+            guard let item = editor.tableView(table, pasteboardWriterForRow: row) as? NSPasteboardItem,
+                  let raw = item.string(forType: .string),
+                  GLMPanelCardID(rawValue: raw) == editor.layout.order[row] else { fail("drag writer row \(row)") }
+        }
+        func dragInfo(_ text: String, source: AnyObject?) -> GLMStubDraggingInfo {
+            let pb = NSPasteboard(name: NSPasteboard.Name("glm.card-settings-test.\(UUID().uuidString)"))
+            pb.clearContents()
+            pb.setString(text, forType: .string)
+            return GLMStubDraggingInfo(pasteboard: pb, source: source)
+        }
+        guard editor.tableView(table, validateDrop: dragInfo(GLMPanelCardID.quota.rawValue, source: table), proposedRow: 0, proposedDropOperation: .above) == .move else { fail("valid card drag rejected") }
+        guard editor.tableView(table, validateDrop: dragInfo("外部文本不是卡片", source: table), proposedRow: 0, proposedDropOperation: .above) == [] else { fail("external text drag accepted") }
+        guard editor.tableView(table, validateDrop: dragInfo(GLMPanelCardID.quota.rawValue, source: nil), proposedRow: 0, proposedDropOperation: .above) == [] else { fail("foreign source drag accepted") }
         // 首行上移、末行下移按钮必须禁用
         guard let quotaUp = buttonWithID("CardMoveUp.quota"), !quotaUp.isEnabled else { fail("first row up must be disabled") }
         guard let mcpDown = buttonWithID("CardMoveDown.mcp"), !mcpDown.isEnabled else { fail("last row down must be disabled") }
@@ -4391,7 +4534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         restoreDefaultPanelLayout()
         guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
         guard UserDefaults.standard.data(forKey: GLMPanelLayout.defaultsKey) == productionLayoutData else { fail("preview wrote production layout defaults") }
-        print("GLM card settings test: PASS (default layout, unified menu, settings editor)")
+        print("GLM card settings test: PASS (default layout, unified menu, settings editor, dynamic key chain, scroll clamping, drag data boundary)")
         exit(0)
     }
 
@@ -5594,6 +5737,17 @@ enum GLMOfflineRegression {
             var allHidden = GLMPanelLayout.default
             for id in GLMPanelCardID.allCases { allHidden.setVisible(false, for: id) }
             try expect(allHidden.visibleOrder.isEmpty && allHidden.order.count == 6, "all-hidden state rejected")
+
+            // 拖放目标位置等价模型：首项移到末尾、末项移到开头、同位置不变、越界钳制
+            var moveLayout = GLMPanelLayout.default
+            moveLayout.move(.quota, to: 99)
+            try expect(moveLayout.order == [.peak, .resetCards, .usage, .daily, .mcp, .quota], "move first to end")
+            moveLayout.move(.quota, to: -3)
+            try expect(moveLayout.order == GLMPanelCardID.allCases, "move last back to start clamps to 0")
+            moveLayout.move(.peak, to: 1)
+            try expect(moveLayout.order == GLMPanelCardID.allCases, "move to same position is a no-op")
+            moveLayout.move(.mcp, to: 3)
+            try expect(moveLayout.order == [.quota, .peak, .resetCards, .mcp, .usage, .daily], "move to middle")
 
             let suite = "GLMLayoutTest.\(UUID().uuidString)"
             let defaults = UserDefaults(suiteName: suite)!
