@@ -3367,6 +3367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         updateConfirmation = nil
+        showingCardSettings = false
         removeClickMonitors()
         if previewPopover && CommandLine.arguments.contains("--preview-trace") {
             print("GLM_POPOVER_TRACE closed")
@@ -4022,12 +4023,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         header.addArrangedSubview(headerText); headerText.translatesAutoresizingMaskIntoConstraints = false
         headerText.widthAnchor.constraint(equalToConstant: inner - 76).isActive = true
         header.addArrangedSubview(spacer())
-        let backgroundButton = NSButton(image: NSImage(systemSymbolName: "paintpalette", accessibilityDescription: "背景样式") ?? NSImage(), target: self, action: #selector(showBackgroundStyleMenu(_:)))
-        backgroundButton.isBordered = false; backgroundButton.contentTintColor = .secondaryLabelColor
-        backgroundButton.toolTip = "背景样式"; backgroundButton.setAccessibilityLabel("背景样式")
-        backgroundButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        backgroundButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        header.addArrangedSubview(backgroundButton)
+        let settingsButton = NSButton(image: NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "面板设置") ?? NSImage(), target: self, action: #selector(showPanelSettingsMenu(_:)))
+        settingsButton.isBordered = false; settingsButton.contentTintColor = .secondaryLabelColor
+        settingsButton.toolTip = "面板设置"; settingsButton.setAccessibilityLabel("面板设置")
+        settingsButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        settingsButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        header.addArrangedSubview(settingsButton)
         let scroll = panelScroll
         activeScroll = scroll
         let footer = GLMPanelStack(); footer.orientation = .vertical; footer.alignment = .leading; footer.spacing = 8
@@ -4312,7 +4313,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard allViews(panelController.view).contains(where: { $0.identifier?.rawValue == "GLMPanelEmptyState" }) else { fail("all-hidden empty state") }
         restoreDefaultPanelLayout()
         guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
-        print("GLM card settings test: PASS (default layout)")
+        // 统一「···」菜单：卡片设置入口 + 背景样式子菜单，背景选择仍即时生效
+        let panelMenu = makePanelSettingsMenu()
+        guard panelMenu.items.map(\.title) == ["卡片显示与排序…", "背景样式"] else { fail("panel menu structure") }
+        guard let backgroundMenu = panelMenu.items[1].submenu else { fail("background submenu") }
+        guard backgroundMenu.items.map(\.title).contains("纯色") else { fail("solid background missing") }
+        for style in GLMPanelBackgroundStyle.allCases where style != .liquidGlass || Self.supportsLiquidGlass {
+            guard let item = backgroundMenu.items.first(where: { $0.representedObject as? String == style.rawValue }) else { fail("background item \(style.rawValue)") }
+            selectBackgroundStyle(item)
+            guard backgroundStyle == style else { fail("background selection \(style.rawValue)") }
+        }
+        guard panelMenu.items[0].isEnabled else { fail("settings entry disabled outside settings") }
+        print("GLM card settings test: PASS (default layout, unified menu)")
         exit(0)
     }
 
@@ -4710,18 +4722,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panelBackground.isHidden = style != .solid
         panelEffect.isHidden = style != .classicMaterial
     }
-    @objc private func showBackgroundStyleMenu(_ sender: NSButton) {
-        let menu = NSMenu(); menu.autoenablesItems = false
+    private func makePanelSettingsMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        let cards = NSMenuItem(title: "卡片显示与排序…", action: #selector(showCardSettings), keyEquivalent: "")
+        cards.target = self
+        cards.isEnabled = !showingCardSettings
+        menu.addItem(cards)
+
+        let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
+        let backgroundMenu = NSMenu()
+        backgroundMenu.autoenablesItems = false
         for style in GLMPanelBackgroundStyle.allCases {
             let unavailable = style == .liquidGlass && !Self.supportsLiquidGlass
             let item = NSMenuItem(title: unavailable ? "液态玻璃（需 macOS 26+）" : style.title, action: #selector(selectBackgroundStyle(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = style.rawValue; item.state = style == backgroundStyle ? .on : .off; item.isEnabled = !unavailable
-            menu.addItem(item)
+            backgroundMenu.addItem(item)
         }
+        background.submenu = backgroundMenu
+        menu.addItem(background)
+        return menu
+    }
+
+    @objc private func showPanelSettingsMenu(_ sender: NSButton) {
         let hadMonitors = localClickMonitor != nil || globalClickMonitor != nil
         if hadMonitors { removeClickMonitors() }
-        menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.maxX, y: -6), in: sender)
+        makePanelSettingsMenu().popUp(positioning: nil, at: NSPoint(x: sender.bounds.maxX, y: -6), in: sender)
         if hadMonitors && popover.isShown { installClickMonitors() }
+    }
+
+    @objc private func showCardSettings() {
+        showingCardSettings = true
+        rebuildPanel()
+    }
+
+    @objc private func finishCardSettings() {
+        showingCardSettings = false
+        rebuildPanel()
     }
     @objc private func selectBackgroundStyle(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let style = GLMPanelBackgroundStyle(rawValue: raw), style != .liquidGlass || Self.supportsLiquidGlass else { return }
