@@ -30,16 +30,20 @@ fi
 echo "== 编译 Swift 源码 =="
 # 必须显式指定部署目标：本机 CLT 默认 target 是 macosx28.0（比当前系统 macOS 27 新），
 # 缺省编译出的二进制 minos=28.0 会被 LaunchServices 拒绝（"不能与此版本 macOS 配合使用"）。
-BUILD_DIR="$(mktemp -d)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
-cp "$DIR/GlmUsage.swift" "$BUILD_DIR/main.swift"
-swiftc -O -target arm64-apple-macos13.0 -o "$DIR/GlmUsage-bin" \
-    "$BUILD_DIR/main.swift" \
-    "$DIR/Sources/GLMQuotaCycleHistory.swift" \
-    "$DIR/Sources/GLMQuotaCycleContext.swift" \
-    "$DIR/Sources/GLMQuotaCycleStore.swift" \
-    "$DIR/Sources/GLMQuotaCycleCoordinator.swift" \
-    "$DIR/Sources/GLMQuotaCycleHistoryView.swift"
+# GlmUsage.swift 保留唯一 top-level 入口；新增文件只能声明类型，不能增加第二个 main。
+# 多文件编译下只有名为 main.swift 的文件允许 top-level 代码，因此把 GlmUsage.swift
+# 以符号链接为 main.swift 放进临时编译目录，根目录与 Sources/ 的其余 Swift 文件按真实路径参与编译。
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/glm-build.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+ln -s "$DIR/GlmUsage.swift" "$STAGE/main.swift"
+sources=("$STAGE/main.swift")
+while IFS= read -r source; do
+    sources+=("$source")
+done < <(find "$DIR" -maxdepth 1 -name '*.swift' ! -name 'GlmUsage.swift' -print | sort)
+while IFS= read -r source; do
+    sources+=("$source")
+done < <(find "$DIR/Sources" -maxdepth 1 -name '*.swift' -print | sort)
+swiftc -O -target arm64-apple-macos13.0 -o "$DIR/GlmUsage-bin" "${sources[@]}"
 
 echo "== 打包 .app =="
 rm -rf "$APP"

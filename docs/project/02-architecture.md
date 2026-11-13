@@ -1,11 +1,11 @@
 # GlmUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-12。
+> 状态：当前架构摘要。最后核对：2026-11-13。
 > 本文解释模块与边界，函数级行为以源码和测试为准。
 
 ## 1. 应用形态
 
-GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，入口和现有主体位于 `GlmUsage.swift`，周额度周期回顾按职责位于 `Sources/GLMQuotaCycle*.swift`，无 Swift Package 依赖。面板使用原生 `NSPopover`。
+GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 Swift Package 依赖。面板使用原生 `NSPopover`。`GlmUsage.swift` 保留应用入口、数据层与面板组装；`PanelCustomization.swift` 管理面板卡片布局模型与设置视图，周额度周期回顾按职责位于 `Sources/GLMQuotaCycle*.swift`。
 
 应用身份保持为：
 
@@ -23,11 +23,15 @@ GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，入口
 | `Peak` | 高峰、非高峰和限时活动的本地时段计算 |
 | `UpdateChecker` | 检查 GitHub Release 和更新资产，保留同一版本的更新说明 |
 | `UpdateProgressController` | 后台更新、进度恢复和错误展示 |
+| `GLMPanelLayout` | 面板内容卡片的显隐与顺序模型，负责旧配置迁移、编码和本机持久化 |
+| `GLMCardSettingsView` | 「··· → 卡片显示与排序…」设置视图：显隐开关、上下移动与拖放排序、恢复默认 |
 | `AppDelegate` | 原生 Popover、刷新调度、重置卡操作、自启和状态聚合 |
 | `GLMQuotaCycleHistory / Context / Store / Coordinator / View` | 周额度观测、连接隔离、私有保存、串行协调和原生展示，见 `17-quota-cycle-history.md` |
 | `GLMOfflineRegression` | 使用临时目录和假数据的离线自检 |
 
-现有主体仍集中在入口文件；后续按职责渐进分离凭据、网络、Peak、更新和 UI。
+面板内容卡片（用量进度、峰谷状态、重置卡、用量情况、每日用量、MCP 工具）支持显隐与纵向排序，设置从页头「··· → 卡片显示与排序…」进入并保存在本机，可恢复默认。显隐只控制面板渲染，不影响刷新调度与网络请求；固定更新入口、凭据恢复入口与额度周期回顾卡不属于可隐藏卡片，全部隐藏时面板提供经「···」恢复的入口。
+
+`GlmUsage.swift` 保留唯一应用入口与面板组装是当前的边界约定，不是永久架构约束；`PanelCustomization.swift` 已从其中分离出卡片布局模型与设置视图。后续拆分时优先分离凭据、网络、Peak、更新和 UI。
 
 ## 3. 主要数据流
 
@@ -63,4 +67,4 @@ GitHub Release → 可安装版本选择 → ZIP / SHA256 下载 → 身份、�
 - 离线 mock、真实接口验证和真实安装验收是不同证据。
 - 当前没有 CI 强制发布门禁，也没有完整系统版本兼容性矩阵。
 
-面板支持纯色、经典毛玻璃和 macOS 26+ 液态玻璃；用户选择保存在本机，系统降低透明度时临时显示纯色。更新前在面板中展示说明并确认，确认时核对版本和说明未变化。
+面板支持纯色、经典毛玻璃和 macOS 26+ 液态玻璃，从页头「··· → 背景样式」进入；用户选择保存在本机，系统降低透明度时临时显示纯色。更新前在面板中展示说明并确认，确认时核对版本和说明未变化。
