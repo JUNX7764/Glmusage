@@ -165,6 +165,7 @@ final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDeleg
     private let onDone: () -> Void
     let table = NSTableView()
     private var resetButton: NSButton!
+    private var backButton: NSButton!
     private var doneButton: NSButton!
 
     /// 打开设置页时的初始焦点视图：Space 等按键应作用于设置控件，而不是残留的上一次点击目标。
@@ -197,13 +198,19 @@ final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDeleg
         hint.font = .systemFont(ofSize: 10)
         hint.textColor = .secondaryLabelColor
         let reset = NSButton(title: "恢复默认卡片布局", target: self, action: #selector(resetLayout))
+        // 「返回」与「完成」同为退出设置页回面板：改动经 onChange 即时生效，无可丢弃的待定修改，
+        // 因此语义相同；保留两个出口是降低「完成=提交」的心理负担，视觉上用默认灰底区别于蓝色主按钮。
+        let back = NSButton(title: "返回", target: self, action: #selector(back))
+        back.bezelStyle = .rounded
+        back.controlSize = .regular
         let done = NSButton(title: "完成", target: self, action: #selector(done))
         done.keyEquivalent = "\r"
         done.bezelStyle = .rounded
         done.controlSize = .regular
         self.resetButton = reset
+        self.backButton = back
         self.doneButton = done
-        let actions = NSStackView(views: [reset, NSView(), done])
+        let actions = NSStackView(views: [reset, NSView(), back, done])
         actions.orientation = .horizontal
         actions.alignment = .centerY
 
@@ -232,7 +239,7 @@ final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDeleg
         wireKeyLoop()
     }
 
-    /// 设置页 key view loop：表格 → 每行复选框 → 上移/下移 → 恢复默认 → 完成 → 回到表格。
+    /// 设置页 key view loop：表格 → 每行复选框 → 上移/下移 → 恢复默认 → 返回 → 完成 → 回到表格。
     /// 不接线时 Space 会落到进入设置页前的残留焦点（如「···」按钮），把菜单再弹出来并关掉 transient Popover。
     private func wireKeyLoop() {
         var chain: [NSView] = [table]
@@ -243,6 +250,7 @@ final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDeleg
             chain.append(rowView.downButton)
         }
         chain.append(resetButton)
+        chain.append(backButton)
         chain.append(doneButton)
         for (current, next) in zip(chain, chain.dropFirst()) {
             current.nextKeyView = next
@@ -267,6 +275,7 @@ final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDeleg
     }
 
     @objc private func resetLayout() { layout = .default; commit() }
+    @objc private func back() { onDone() }
     @objc private func done() { onDone() }
 
     func numberOfRows(in tableView: NSTableView) -> Int { layout.order.count }

@@ -5022,7 +5022,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let actions = NSStackView(); actions.orientation = .horizontal; actions.alignment = .centerY; actions.spacing = 5
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal); actions.addArrangedSubview(spacer)
         actions.addArrangedSubview(NSButton(title: "取消", target: self, action: #selector(cancelUpdateConfirmation)))
-        actions.addArrangedSubview(NSButton(title: "下载并安装", target: self, action: #selector(confirmUpdate)))
+        // 主操作按钮用产品绿 prominent 样式（与页脚「立即刷新」同源），在确认页里清晰可辨
+        let install = GLMPanelAction(title: "下载并安装", target: self, action: #selector(confirmUpdate))
+        install.isBordered = false; install.focusRingType = .default; install.wantsLayer = true
+        install.layer?.cornerRadius = 6; install.prominent = true
+        install.attributedTitle = NSAttributedString(string: "下载并安装", attributes: [
+            .foregroundColor: NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .black : .white },
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
+        ])
+        install.heightAnchor.constraint(greaterThanOrEqualToConstant: 30).isActive = true
+        actions.addArrangedSubview(install)
         add(actions)
         return content
     }
