@@ -4476,7 +4476,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             allViews(panelController.view).first(where: { $0.identifier?.rawValue == identifier }) as? NSButton
         }
         guard let editor = editorView() else { fail("settings view missing") }
+        // 键盘可达性回归：打开设置页后焦点必须落在设置视图上，Space 等按键不会落到残留的「···」按钮
+        // 再把菜单弹出来关掉 transient Popover（Cua 真实按键验收发现的缺陷）。
+        if let responder = panelController.view.window?.firstResponder {
+            guard responder === editor.table else { fail("settings editor not initial first responder: \(responder)") }
+        } else { fail("settings editor window missing first responder") }
         guard editor.layout.order.count == 6 else { fail("settings row count \(editor.layout.order.count)") }
+        // 设置页 key view loop：表格 → 复选框 → 上移/下移 → 恢复默认 → 完成，逐环可达。
+        guard let firstRowView = editor.table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? GLMCardSettingRowView else { fail("settings row view missing") }
+        guard editor.table.nextKeyView === firstRowView.checkbox,
+              firstRowView.checkbox.nextKeyView === firstRowView.upButton,
+              firstRowView.upButton.nextKeyView === firstRowView.downButton else { fail("settings key loop broken") }
         // 拖放数据边界：六行 writer 只写本表卡片 ID；validateDrop 接受本表、拒绝外部文本与外部来源。
         // 注意：这是直接调用 table data source 方法的模型级验证，真实鼠标拖拽由 Cua 验收（Task 7）。
         guard let table = allViews(editor).compactMap({ $0 as? NSTableView }).first,
@@ -4965,6 +4975,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func showCardSettings() {
         showingCardSettings = true
         rebuildPanel()
+        // 打开设置页时接管焦点：否则焦点残留在「···」按钮上，Space 会再次弹出菜单，
+        // 菜单跟踪期间 transient Popover 失去 key 被关闭（Cua 真实按键验收发现的缺陷）。
+        func scan(_ view: NSView) -> GLMCardSettingsView? {
+            if let editor = view as? GLMCardSettingsView { return editor }
+            for subview in view.subviews {
+                if let found = scan(subview) { return found }
+            }
+            return nil
+        }
+        if let editor = scan(panelController.view) {
+            panelController.view.window?.makeFirstResponder(editor.initialKeyView)
+        }
     }
 
     @objc private func finishCardSettings() {

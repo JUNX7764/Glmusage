@@ -99,7 +99,7 @@ import AppKit
 
 private let panelRowPasteboardType = NSPasteboard.PasteboardType.string
 
-private final class GLMCardSettingRowView: NSTableCellView {
+final class GLMCardSettingRowView: NSTableCellView {
     let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     let upButton = NSButton(image: NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "上移") ?? NSImage(), target: nil, action: nil)
     let downButton = NSButton(image: NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "下移") ?? NSImage(), target: nil, action: nil)
@@ -163,7 +163,12 @@ final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDeleg
     private(set) var layout: GLMPanelLayout
     private let onChange: (GLMPanelLayout) -> Void
     private let onDone: () -> Void
-    private let table = NSTableView()
+    let table = NSTableView()
+    private var resetButton: NSButton!
+    private var doneButton: NSButton!
+
+    /// 打开设置页时的初始焦点视图：Space 等按键应作用于设置控件，而不是残留的上一次点击目标。
+    var initialKeyView: NSView { table }
 
     init(layout: GLMPanelLayout, onChange: @escaping (GLMPanelLayout) -> Void, onDone: @escaping () -> Void) {
         self.layout = layout
@@ -196,6 +201,8 @@ final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDeleg
         done.keyEquivalent = "\r"
         done.bezelStyle = .rounded
         done.controlSize = .regular
+        self.resetButton = reset
+        self.doneButton = done
         let actions = NSStackView(views: [reset, NSView(), done])
         actions.orientation = .horizontal
         actions.alignment = .centerY
@@ -220,6 +227,29 @@ final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDeleg
 
     required init?(coder: NSCoder) { fatalError() }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        wireKeyLoop()
+    }
+
+    /// 设置页 key view loop：表格 → 每行复选框 → 上移/下移 → 恢复默认 → 完成 → 回到表格。
+    /// 不接线时 Space 会落到进入设置页前的残留焦点（如「···」按钮），把菜单再弹出来并关掉 transient Popover。
+    private func wireKeyLoop() {
+        var chain: [NSView] = [table]
+        for row in 0..<numberOfRows(in: table) {
+            guard let rowView = table.view(atColumn: 0, row: row, makeIfNecessary: true) as? GLMCardSettingRowView else { continue }
+            chain.append(rowView.checkbox)
+            chain.append(rowView.upButton)
+            chain.append(rowView.downButton)
+        }
+        chain.append(resetButton)
+        chain.append(doneButton)
+        for (current, next) in zip(chain, chain.dropFirst()) {
+            current.nextKeyView = next
+        }
+        doneButton.nextKeyView = table
+    }
+
     func setVisible(_ visible: Bool, for id: GLMPanelCardID) {
         layout.setVisible(visible, for: id)
         commit()
@@ -232,6 +262,7 @@ final class GLMCardSettingsView: NSView, NSTableViewDataSource, NSTableViewDeleg
 
     private func commit() {
         table.reloadData()
+        wireKeyLoop()
         onChange(layout)
     }
 
