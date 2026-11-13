@@ -249,7 +249,7 @@ case "historyPaging":
     keyboard.move(1, records: thirteen)
     check(keyboard.visibleRange(thirteen) == 7..<13 && keyboard.selectedCycleID == thirteen[7].id, "keyboard right advances a whole page")
     let details = GLMQuotaCycleDetails.lines(records[0])
-    check(details.0.contains("未知") && details.1.contains("10,000"), "first observed and credits")
+    check(details.0.contains("推算") && GLMQuotaCycleDetails.startExplanation(records[0]).contains("未知") && details.1.contains("10,000"), "estimated presentation preserves uncertainty and credits")
     var closed = records[0]; closed.end = .gap
     check(GLMQuotaCycleDetails.lines(closed).1.contains("最后观测") && !GLMQuotaCycleDetails.lines(closed).1.contains("到期未用"), "honest closure")
     print("PASS: historyPaging")
@@ -416,6 +416,92 @@ case "oldConnectionOperation":
     check(c.testCurrentState()?.operations[hash]?.result == .confirmedUsed, "old partition keeps operation fact")
     check(c.testCurrentState()?.operations[hash]?.attributionProven == false, "old partition does not gain proof")
     print("PASS: oldConnectionOperation")
+case "smallReboundPending":
+    let r = GLMQuotaCycleReducer(policy: GLMQuotaCyclePolicy())
+    var s = GLMQuotaCycleState()
+    r.ingest(sample(0, 2800), into: &s)
+    r.ingest(sample(10, 2850), into: &s)
+    check(s.current?.lastObservation.remainingCredits == 2800, "small rebound does not overwrite trusted reading")
+    check(s.pending?.first.remainingCredits == 2850, "small rebound is retained as pending evidence")
+    r.ingest(sample(20, 2700), into: &s)
+    check(s.pending == nil && s.current?.rollbackEvidence.first?.remainingCredits == 2850, "small rebound rollback retains evidence")
+    print("PASS: smallReboundPending")
+case "rollbackThenSmallReboundStore":
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let r = GLMQuotaCycleReducer(policy: GLMQuotaCyclePolicy()), store = GLMQuotaCycleStore(root: root)
+    let p = String(repeating: "a", count: 64)
+    var s = GLMQuotaCycleState()
+    r.ingest(sample(0, 2800), into: &s)
+    r.ingest(sample(10, 9800, 605800), into: &s)
+    r.ingest(sample(20, 2850), into: &s)
+    check(s.current?.rollbackEvidence.count == 1, "earlier candidate retained")
+    check(GLMQuotaCycleStore.validate(s), "rollback evidence after last trusted observation must remain saveable")
+    do { try store.save(s, partition: p); let loaded = try store.load(partition: p); check(loaded == s, "rollback state roundtrip") }
+    catch { check(false, "rollback state save failed: \(error)") }
+    r.ingest(sample(30, 2700), into: &s)
+    r.ingest(sample(40, 9800, 605800), into: &s)
+    r.ingest(sample(60, 9700, 605800), into: &s)
+    check(s.closed.count == 1 && s.closed[0].rollbackEvidence.count == 2, "both rolled-back candidates survive closure")
+    do { try store.save(s, partition: p); let loaded = try store.load(partition: p); check(loaded == s, "closed rollback evidence roundtrip") }
+    catch { check(false, "closed rollback state save failed: \(error)") }
+    print("PASS: rollbackThenSmallReboundStore")
+case "operationInvalidState":
+    let r = GLMQuotaCycleReducer(policy: GLMQuotaCyclePolicy())
+    var s = GLMQuotaCycleState()
+    r.ingest(sample(0, 2800), into: &s)
+    let hash = String(repeating: "a", count: 64)
+    r.record(.init(operationHash: hash, originalRequestedAt: t, responseAt: nil, isWeek: true, result: .confirmedUsed, baselineCycleID: s.current!.id, attributionProven: true), into: &s)
+    check(s.operations.isEmpty && GLMQuotaCycleStore.validate(s), "invalid confirmed result cannot poison state")
+    let hash2 = String(repeating: "b", count: 64)
+    r.record(.init(operationHash: hash2, originalRequestedAt: t, responseAt: t, isWeek: true, result: .confirmedUsed, baselineCycleID: UUID(), attributionProven: true), into: &s)
+    check(s.operations[hash2]?.baselineCycleID == nil && s.operations[hash2]?.attributionProven == false, "missing baseline stays unbound")
+    check(GLMQuotaCycleStore.validate(s), "unbound operation remains saveable")
+    print("PASS: operationInvalidState")
+case "chartPercentageLabels":
+    for (value, expected) in [(0.0, "0%"), (100, "100%"), (81.2, "81%"), (72, "72%"), (0.4, "<1%"), (99.6, ">99%")] {
+        check(GLMQuotaHistoryGeometry.usedPercentLabel(value) == expected, "compact per-cycle percentage preserves endpoints")
+    }
+    check(GLMQuotaHistoryGeometry.usedPercentLabel(.nan) == "—", "nonfinite label is unknown")
+    for width in [220.0, 280.0] {
+        let columns = GLMQuotaHistoryGeometry.columns(width: width, height: GLMQuotaHistoryGeometry.canvasHeight, count: 6)
+        for column in columns {
+            let percentage = GLMQuotaHistoryGeometry.percentageFrame(in: column)
+            let date = GLMQuotaHistoryGeometry.dateFrame(in: column)
+            check(percentage.minY >= 0 && percentage.maxY <= date.minY, "percentage belongs below its date")
+            check(date.maxY < GLMQuotaHistoryGeometry.plotBaseline, "date does not overlap bars")
+            check(percentage.midX == date.midX && percentage.width == column.width, "labels align with their cycle column")
+        }
+    }
+    print("PASS: chartPercentageLabels")
+case "shortHistoryRightAligned":
+    for width in [220.0, 280.0] {
+        for count in 1...6 {
+            let frames = GLMQuotaHistoryGeometry.columns(width: width, height: 92, count: count)
+            check(frames.count == count && frames.last?.maxX == CGFloat(width), "short history must finish at the right edge")
+            check(frames[0].minX >= 20 && zip(frames, frames.dropFirst()).allSatisfy { $0.maxX <= $1.minX }, "right-aligned groups stay ordered")
+        }
+        check(GLMQuotaHistoryGeometry.columns(width: width, height: 92, count: 0).isEmpty, "no placeholder cycles")
+    }
+    print("PASS: shortHistoryRightAligned")
+case "compactCycleWording":
+    let calendar = Calendar(identifier: .gregorian)
+    let observed = calendar.date(from: DateComponents(year: 2026, month: 11, day: 12, hour: 12))!
+    let reset = calendar.date(from: DateComponents(year: 2026, month: 11, day: 13, hour: 12))!
+    let observation = GLMQuotaObservation(requestStartedAt: observed, observedAt: observed,
+        limitCredits: 10000, reportedUsedCredits: 6000, remainingCredits: 4000, resetAt: reset, planLevel: "LITE")
+    var record = GLMQuotaCycleRecord(observation, startKind: .firstObserved)
+    check(GLMQuotaCycleDetails.lines(record).0 == "推算11/06–至今（预计11/13） · 进行中", "current cycle uses compact estimated range and expected end")
+    check(record.firstObservedAt == observed && record.startKind == .firstObserved, "display estimate does not rewrite observed history")
+    check(GLMQuotaCycleDetails.dateLabel(record) == "~11/06", "estimated date is visibly marked")
+    check(GLMQuotaCycleDetails.startExplanation(record).contains("实际开始时刻未知"), "tooltip preserves uncertainty")
+    record.end = .natural
+    check(GLMQuotaCycleDetails.lines(record).0.contains("推算11/06–11/13") && GLMQuotaCycleDetails.lines(record).0.contains("正常到期"), "closed range is not shown as ongoing")
+    let yearReset = calendar.date(from: DateComponents(year: 2027, month: 1, day: 3, hour: 12))!
+    let crossYear = GLMQuotaObservation(requestStartedAt: observed, observedAt: observed,
+        limitCredits: 10000, reportedUsedCredits: 0, remainingCredits: 10000, resetAt: yearReset, planLevel: "LITE")
+    check(GLMQuotaCycleDetails.lines(GLMQuotaCycleRecord(crossYear, startKind: .firstObserved)).0 == "推算12/27–至今（预计01/03） · 进行中", "estimated label handles year boundary")
+    print("PASS: compactCycleWording")
 default:
     fputs("FAIL: unknown test case\n", stderr); exit(1)
 }

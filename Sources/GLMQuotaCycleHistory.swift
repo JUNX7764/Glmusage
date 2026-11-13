@@ -101,7 +101,15 @@ struct GLMQuotaCycleReducer {
         guard evidence.operationHash.count == 64,
               evidence.operationHash.allSatisfy({ "0123456789abcdef".contains($0) }),
               evidence.originalRequestedAt.timeIntervalSince1970.isFinite,
+              (evidence.result != .confirmedUsed || evidence.responseAt != nil),
               evidence.responseAt.map({ $0.timeIntervalSince1970.isFinite && $0 >= evidence.originalRequestedAt }) ?? true else { return }
+        let knownBaseline = evidence.baselineCycleID.flatMap { id in
+            (state.closed.contains { $0.id == id } || state.current?.id == id) ? id : nil
+        }
+        let evidence = GLMQuotaOperationEvidence(operationHash: evidence.operationHash,
+            originalRequestedAt: evidence.originalRequestedAt, responseAt: evidence.responseAt,
+            isWeek: evidence.isWeek, result: evidence.result, baselineCycleID: knownBaseline,
+            attributionProven: evidence.attributionProven && knownBaseline != nil)
         if let old = state.operations[evidence.operationHash] {
             guard old.result != .confirmedUsed else { return }
             if evidence.result == .requested && old.result != .requested { return }
@@ -177,8 +185,16 @@ struct GLMQuotaCycleReducer {
             }
             return
         }
-        if resetChanged || drop {
+        if resetChanged || sample.remainingCredits > last.remainingCredits {
             if state.pending?.reason != nil || state.pending.map({ abs($0.first.resetAt.timeIntervalSince(sample.resetAt)) > policy.resetJitter }) != false {
+                if let candidate = state.pending,
+                   !current.rollbackEvidence.contains(where: {
+                       $0.resetAt == candidate.first.resetAt && $0.remainingCredits == candidate.first.remainingCredits &&
+                       $0.limitCredits == candidate.first.limitCredits && $0.planLevel == candidate.first.planLevel
+                   }) {
+                    current.rollbackEvidence.append(candidate.first)
+                    state.current = current
+                }
                 state.pending = GLMQuotaCycleCandidate(baselineID: current.id, first: sample, reason: nil)
             }
             return
@@ -240,9 +256,30 @@ struct GLMQuotaHistoryBrowser {
 }
 
 enum GLMQuotaCycleDetails {
+    // A presentation-only estimate; the stored first observation and boundary evidence stay intact.
+    static func displayedStart(_ record: GLMQuotaCycleRecord) -> Date {
+        record.startKind == .firstObserved ? record.expectedResetAt.addingTimeInterval(-7 * 86400) : record.firstObservedAt
+    }
+    static func dateLabel(_ record: GLMQuotaCycleRecord) -> String {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "MM/dd"
+        return (record.startKind == .firstObserved ? "~" : "") + f.string(from: displayedStart(record))
+    }
+    static func startExplanation(_ record: GLMQuotaCycleRecord) -> String {
+        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateStyle = .medium; f.timeStyle = .medium
+        let first = "首次成功观测：" + f.string(from: record.firstObservedAt)
+        return record.startKind == .firstObserved
+            ? "起点按预计重置时间减7天推算，实际开始时刻未知，不代表完整记录了7天；" + first
+            : "开始边界基于观测，非服务端准确时刻；" + first
+    }
     static func lines(_ record: GLMQuotaCycleRecord) -> (String, String) {
-        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "MM/dd HH:mm"
-        let prefix = record.startKind == .firstObserved ? "首次观测 \(f.string(from: record.firstObservedAt)) · 开始时间未知" : "观测开始约 \(f.string(from: record.firstObservedAt))"
+        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "MM/dd"
+        let prefix: String
+        switch record.startKind {
+        case .firstObserved: prefix = "推算"
+        case .afterGap, .specificationChanged: prefix = "观测"
+        case .observedTransition, .redeemed: prefix = "约"
+        }
+        let start = prefix + f.string(from: displayedStart(record))
         let reason: String
         switch record.end {
         case .natural: reason = "正常到期"
@@ -250,7 +287,14 @@ enum GLMQuotaCycleDetails {
         case .unknownChange: reason = "额度窗口变化（原因未确认）"
         case .gap: reason = "观测缺口"
         case .specificationChanged: reason = "额度规格变化"
-        case nil: reason = "当前"
+        case nil: reason = "进行中"
+        }
+        let period: String
+        if record.end == nil {
+            period = "\(start)–至今（预计\(f.string(from: record.expectedResetAt))）"
+        } else {
+            let end = record.end == .natural ? record.expectedResetAt : record.boundaryUpper ?? record.lastObservation.observedAt
+            period = "\(start)–\(f.string(from: end))（约）"
         }
         let n = NumberFormatter(); n.locale = Locale(identifier: "en_US"); n.numberStyle = .decimal; n.maximumFractionDigits = 2
         let obs = record.lastObservation
@@ -259,6 +303,6 @@ enum GLMQuotaCycleDetails {
         let percent = n.string(from: NSNumber(value: obs.usedPercent)) ?? "—"
         let label = record.end == nil ? "当前剩余" : "最后观测剩余"
         let full = obs.remainingCredits == 0 ? " · 已用满（观测余额为 0）" : ""
-        return ("\(prefix) · \(reason)", "已用 \(percent)% · \(label) \(remaining) / \(limit) 积分\(full)")
+        return ("\(period) · \(reason)", "已用 \(percent)% · \(label) \(remaining) / \(limit) 积分\(full)")
     }
 }

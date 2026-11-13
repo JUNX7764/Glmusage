@@ -73,6 +73,15 @@ class QuotaCycleHistoryTest(unittest.TestCase):
     def test_chart_geometry(self):
         self.case("chartGeometry")
 
+    def test_percentage_below_each_date(self):
+        self.case("chartPercentageLabels")
+
+    def test_short_history_right_aligned(self):
+        self.case("shortHistoryRightAligned")
+
+    def test_compact_cycle_wording(self):
+        self.case("compactCycleWording")
+
     def test_clock_rollback_pending(self):
         self.case("clockRollbackPending")
 
@@ -105,3 +114,12 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_old_connection_operation_isolation(self):
         self.case("oldConnectionOperation")
+
+    def test_small_rebound_pending(self):
+        self.case("smallReboundPending")
+
+    def test_rollback_then_small_rebound_store(self):
+        self.case("rollbackThenSmallReboundStore")
+
+    def test_operation_invalid_state(self):
+        self.case("operationInvalidState")

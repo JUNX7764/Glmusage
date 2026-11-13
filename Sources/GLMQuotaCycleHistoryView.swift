@@ -1,11 +1,30 @@
 import AppKit
 
 enum GLMQuotaHistoryGeometry {
+    static let canvasHeight: CGFloat = 92
+    static let plotBaseline: CGFloat = 31
+    static func percentageFrame(in column: CGRect) -> CGRect {
+        CGRect(x: column.minX, y: 1, width: column.width, height: 14)
+    }
+    static func dateFrame(in column: CGRect) -> CGRect {
+        CGRect(x: column.minX, y: 16, width: column.width, height: 12)
+    }
+    static func usedPercentLabel(_ percent: Double) -> String {
+        guard percent.isFinite, (0...100).contains(percent) else { return "—" }
+        if percent > 0 && percent < 1 { return "<1%" }
+        if percent > 99 && percent < 100 { return ">99%" }
+        return "\(Int(percent.rounded()))%"
+    }
     static func columns(width: CGFloat, height: CGFloat, count: Int) -> [CGRect] {
         guard count > 0 else { return [] }
         let axis: CGFloat = min(20, max(0, width)), available = max(0, width - axis)
+        let visibleCount = min(count, 6)
+        let firstSlot = 6 - visibleCount
         func boundary(_ index: Int) -> CGFloat { index == 6 ? width : axis + available * CGFloat(index) / 6 }
-        return (0..<min(count, 6)).map { CGRect(x: boundary($0), y: 0, width: boundary($0 + 1) - boundary($0), height: height) }
+        return (0..<visibleCount).map { index in
+            let slot = firstSlot + index
+            return CGRect(x: boundary(slot), y: 0, width: boundary(slot + 1) - boundary(slot), height: height)
+        }
     }
 }
 
@@ -47,21 +66,34 @@ final class GLMQuotaHistoryCanvas: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let frames = GLMQuotaHistoryGeometry.columns(width: bounds.width, height: bounds.height, count: records.count)
         let labelAttributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor]
+        let percentageAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold),
+            .foregroundColor: NSColor.labelColor]
         ("100%" as NSString).draw(at: NSPoint(x: 0, y: bounds.height - 13), withAttributes: labelAttributes)
-        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "MM/dd"
         for (i, rect) in frames.enumerated() {
             let record = records[i], highlighted = (hover ?? selected) == record.id
-            if record.end == nil || highlighted { accent.withAlphaComponent(highlighted ? 0.11 : 0.05).setFill(); rect.insetBy(dx: 1, dy: 0).fill() }
-            let baseline: CGFloat = 17, chartHeight = max(0, rect.height - baseline - 4)
+            let baseline = GLMQuotaHistoryGeometry.plotBaseline
+            let chartHeight = max(0, rect.height - baseline - 4)
+            if record.end == nil || record.id == selected || highlighted {
+                accent.withAlphaComponent(highlighted ? 0.11 : record.id == selected ? 0.08 : 0.05).setFill()
+                let background = NSRect(x: rect.minX + 1, y: baseline - 2,
+                    width: max(0, rect.width - 2), height: max(0, rect.height - baseline + 2))
+                NSBezierPath(roundedRect: background, xRadius: 4, yRadius: 4).fill()
+            }
             let center = rect.midX
             NSColor.secondaryLabelColor.withAlphaComponent(0.25).setFill()
             NSBezierPath(roundedRect: NSRect(x: center - 8, y: baseline, width: 6, height: chartHeight), xRadius: 2, yRadius: 2).fill()
             let usedHeight = chartHeight * CGFloat(max(0, min(100, record.lastObservation.usedPercent))) / 100
             accent.withAlphaComponent(highlighted ? 1 : 0.72).setFill()
             NSBezierPath(roundedRect: NSRect(x: center + 2, y: baseline, width: 6, height: max(2, usedHeight)), xRadius: 2, yRadius: 2).fill()
-            let text = formatter.string(from: record.firstObservedAt) + (record.startKind == .firstObserved ? "*" : "")
+            let text = GLMQuotaCycleDetails.dateLabel(record)
             let size = (text as NSString).size(withAttributes: labelAttributes)
-            (text as NSString).draw(at: NSPoint(x: center - size.width / 2, y: 1), withAttributes: labelAttributes)
+            let dateFrame = GLMQuotaHistoryGeometry.dateFrame(in: rect)
+            (text as NSString).draw(at: NSPoint(x: center - size.width / 2, y: dateFrame.minY), withAttributes: labelAttributes)
+            let percentage = GLMQuotaHistoryGeometry.usedPercentLabel(record.lastObservation.usedPercent)
+            let percentageSize = (percentage as NSString).size(withAttributes: percentageAttributes)
+            let percentageFrame = GLMQuotaHistoryGeometry.percentageFrame(in: rect)
+            (percentage as NSString).draw(at: NSPoint(x: center - percentageSize.width / 2, y: percentageFrame.minY), withAttributes: percentageAttributes)
         }
     }
 }
@@ -84,15 +116,33 @@ final class GLMQuotaHistorySectionView: NSStackView {
         controls.addArrangedSubview(legend)
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal); controls.addArrangedSubview(spacer)
         for (title, selector) in [("‹", #selector(older)), ((browser.pageAnchorID == nil ? "最近" : "历史") + "\(range.count)轮", #selector(latest)), ("›", #selector(newer)), ("更早", #selector(earlier))] {
-            let b = NSButton(title: title, target: self, action: selector); b.isBordered = false; b.font = .systemFont(ofSize: 11); controls.addArrangedSubview(b)
+            let b = NSButton(title: title, target: self, action: selector)
+            b.isBordered = false; b.font = .systemFont(ofSize: 11)
+            switch selector {
+            case #selector(older):
+                b.setAccessibilityLabel("更早的周期")
+                b.isEnabled = range.lowerBound > max(0, records.count - browser.loadedLimit)
+            case #selector(newer):
+                b.setAccessibilityLabel("更新的周期")
+                b.isEnabled = range.upperBound < records.count
+            case #selector(earlier):
+                b.setAccessibilityLabel("加载更早记录")
+                b.isEnabled = records.count > browser.loadedLimit
+            default:
+                b.setAccessibilityLabel("返回最新周期")
+                b.isEnabled = !records.isEmpty
+            }
+            controls.addArrangedSubview(b)
         }
         addArrangedSubview(controls); controls.widthAnchor.constraint(equalTo: widthAnchor).isActive = true; controls.heightAnchor.constraint(equalToConstant: 22).isActive = true
         canvas.records = Array(records[range]); canvas.selected = browser.selectedCycleID ?? records.last?.id; canvas.accent = accent
         canvas.setAccessibilityElement(true); canvas.setAccessibilityRole(.group)
         canvas.setAccessibilityLabel("额度周期回顾，使用左右方向键选择")
         canvas.translatesAutoresizingMaskIntoConstraints = false
-        addArrangedSubview(canvas); canvas.widthAnchor.constraint(equalTo: widthAnchor).isActive = true; canvas.heightAnchor.constraint(equalToConstant: 78).isActive = true
-        for line in [firstLine, secondLine] {
+        addArrangedSubview(canvas); canvas.widthAnchor.constraint(equalTo: widthAnchor).isActive = true; canvas.heightAnchor.constraint(equalToConstant: GLMQuotaHistoryGeometry.canvasHeight).isActive = true
+        // Per-cycle percentages live under each date; keep only the period/status footer.
+        // Exact credit readings remain available in the tooltip and accessibility value.
+        for line in (records.isEmpty ? [firstLine, secondLine] : [firstLine]) {
             line.font = .systemFont(ofSize: 10); line.textColor = .secondaryLabelColor; line.lineBreakMode = .byTruncatingTail
             addArrangedSubview(line); line.widthAnchor.constraint(equalTo: widthAnchor).isActive = true; line.heightAnchor.constraint(equalToConstant: 14).isActive = true
         }
@@ -119,14 +169,18 @@ final class GLMQuotaHistorySectionView: NSStackView {
         guard let record = records.first(where: { $0.id == id }) else { return }
         let lines = GLMQuotaCycleDetails.lines(record)
         firstLine.stringValue = lines.0; secondLine.stringValue = lines.1
-        let suffix = [pending ? "窗口变化待确认" : nil, status].compactMap { $0 }.joined(separator: " · ")
+        let suffix = [pending && record.end == nil ? "窗口变化待确认" : nil, status].compactMap { $0 }.joined(separator: " · ")
         if !suffix.isEmpty { firstLine.stringValue = suffix + " · " + lines.0 }
-        firstLine.toolTip = lines.0 + " · 历史按套餐连接保存，更换 Key 不自动合并"; secondLine.toolTip = lines.1 + (suffix.isEmpty ? "" : " · " + suffix)
+        firstLine.toolTip = lines.0 + " · " + lines.1 + " · " + GLMQuotaCycleDetails.startExplanation(record)
+            + " · 历史按套餐连接保存，更换 Key 不自动合并" + (suffix.isEmpty ? "" : " · " + suffix)
+        secondLine.toolTip = lines.1 + (suffix.isEmpty ? "" : " · " + suffix)
         canvas.setAccessibilityLabel("额度周期回顾")
         let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.dateStyle = .medium; formatter.timeStyle = .medium
         let observationTime = "最后成功观测：" + formatter.string(from: record.lastObservation.observedAt)
+        firstLine.toolTip = (firstLine.toolTip ?? "") + " · " + observationTime
         secondLine.toolTip = (secondLine.toolTip ?? "") + " · " + observationTime
-        canvas.setAccessibilityValue(lines.0 + "，" + lines.1 + "，" + observationTime + (suffix.isEmpty ? "" : "，" + suffix))
+        canvas.setAccessibilityValue(lines.0 + "，" + lines.1 + "，" + GLMQuotaCycleDetails.startExplanation(record)
+            + "，" + observationTime + (suffix.isEmpty ? "" : "，" + suffix))
     }
     @objc private func older() { browser.pageOlder(records); changed(browser, true) }
     @objc private func newer() { browser.pageNewer(records); changed(browser, true) }

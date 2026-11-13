@@ -62,7 +62,13 @@ final class GLMQuotaCycleStore {
             if (record.boundaryLower == nil) != (record.boundaryUpper == nil) { return false }
             if let lower = record.boundaryLower, let upper = record.boundaryUpper,
                (lower != record.lastObservation.observedAt || lower > upper || record.end == nil) { return false }
-            if !record.rollbackEvidence.allSatisfy({ $0.observedAt >= record.firstObservedAt && $0.observedAt <= record.lastObservation.observedAt }) { return false }
+            // Rolled-back candidates can occur after the last trusted balance. For a closed
+            // record they must precede its boundary; for the live one, the latest accepted sample.
+            let evidenceEnd = record.end == nil ? state.lastAcceptedObservedAt : record.boundaryUpper
+            if !record.rollbackEvidence.allSatisfy({ observation in
+                observation.observedAt >= record.firstObservedAt &&
+                evidenceEnd.map { observation.observedAt <= $0 } == true
+            }) { return false }
         }
         guard state.closed.allSatisfy({ $0.end != nil }), state.current?.end == nil else { return false }
         for (previous, next) in zip(records, records.dropFirst()) {

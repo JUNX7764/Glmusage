@@ -1,6 +1,6 @@
 # GlmUsage 发布与回滚说明
 
-> 状态：当前发布清单。最后核对：2026-11-06。
+> 状态：当前发布清单。最后核对：2026-11-13。
 > 本文区分脚本自动检查与仍需人工完成的验收。
 
 ## 1. 发布资产
@@ -26,7 +26,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 准备 `release-notes/vX.Y.Z.md`，以用户可感知的语言说明本次变化；空文件或已有 Release 说明不一致会阻止发布。确认工作区干净、HEAD 已推送且版本号符合变更类型后，执行 `scripts/release.sh vX.Y.Z`。
 
-脚本自动完成远端与身份检查、标签创建、构建、二进制自检、Peak 测试、ad-hoc 签名验证、DMG / ZIP 打包与校验、SHA256 生成以及 Release 创建或补全。
+脚本要求HEAD与origin/main一致，自动完成远端与身份检查、标签创建、构建、二进制自检、Peak 测试、签名验证、DMG / ZIP 打包与校验、SHA256生成以及Release创建或补全；构建优先使用本机稳定`local-codesign`身份，缺失时回退ad-hoc。
 
 **脚本不会自动执行 Python 回归、真实面板更新、崩溃回滚或最低系统版本验收。**
 
@@ -56,7 +56,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 ## 6. 当前公开分发限制
 
-- 当前使用 ad-hoc 签名，不是 Developer ID 公证。
+- 当前构建优先使用本机稳定自签身份，缺失时回退ad-hoc；两者均非Developer ID公证。
 - ZIP 与 SHA256 来自同一 Release，尚无独立发布者签名验证。
 - 尚无 CI 和 macOS 13 / 14 / 15 的完整兼容性矩阵。
 - 完整面板点击升级与崩溃回滚应成为更新链路变化的固定验收，而非默认假设已完成。

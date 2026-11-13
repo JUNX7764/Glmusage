@@ -126,7 +126,7 @@ enum CredStore {
     static let envKey = "GLM_API_KEY"
     static let newCredentialMessage = "ZCode 新版登录暂不支持"
     // enc:v2:os: 凭据存在但系统密钥未授权（用户拒绝/未弹框）——可恢复，引导解锁。
-    static let v2LockedMessage = "ZCode 凭据待授权，点击「连接套餐」解锁"
+    static let v2LockedMessage = "ZCode 凭据待授权，请点击「修复连接」"
     static let missingPlanMessage = "未找到或无法读取 ZCode 凭证"
 
     // v2 凭据解密失败的错误分类（仅读进程内缓存，不触 keychain，self-test 可覆盖）：
@@ -951,6 +951,17 @@ final class RefreshGate {
         if queuedManual { queuedManual = false; return true }
         active = false
         return false
+    }
+}
+
+enum GLMConnectionRecovery {
+    enum Action { case none, unlock, settings }
+    static func action(quotaError: String?, resetError: String?) -> Action {
+        if quotaError == CredStore.keychainUnavailableMessage || quotaError == CredStore.v2LockedMessage
+            || resetError == CredStore.v2LockedMessage { return .unlock }
+        if let error = quotaError, [CredStore.newCredentialMessage, CredStore.missingPlanMessage,
+                                  "HTTP 401", "HTTP 403"].contains(error) { return .settings }
+        return .none
     }
 }
 
@@ -2721,7 +2732,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var updateMessageDismissal: DispatchWorkItem?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
-    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-connection-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
     private var updateTimer: Timer?
@@ -2854,6 +2865,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if CommandLine.arguments.contains("--preview-update-test") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in self?.testUpdatePreview() }
             }
+            if CommandLine.arguments.contains("--preview-connection-test") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in self?.testConnectionPresentation() }
+            }
             if let i = CommandLine.arguments.firstIndex(of: "--preview-screenshot"), CommandLine.arguments.count > i + 1 {
                 let shotPath = CommandLine.arguments[i + 1]
                 fputs("GLM preview screenshot: scheduled\n", stderr)
@@ -2889,19 +2903,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.reconcileBarAppearance()
         }
         appearancePollTimer?.tolerance = 1
-        // 凭据钥匙串授权引导：更新后二进制签名指纹变化会使已授权条目重新上锁，且 ZCode
-        // 新版凭据（enc:v2:os）首次也需要授权。启动稳定后交互式解锁一次（系统授权框，
-        // 请点「始终允许」）；拒绝则依赖面板提示行与「解锁凭据」按钮。preview/CLI 不触发。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self = self, !self.preview else { return }
-            let savedLocked = CredStore.savedKeyNeedsUnlock
-            let systemLocked = CredStore.needsV2Unlock && !ZCodeSystemKey.isUnlocked
-            guard savedLocked || systemLocked else { return }
-            var unlocked = false
-            if savedLocked { unlocked = CredStore.unlockSavedKey() || unlocked }
-            if systemLocked { unlocked = CredStore.unlockZCodeKey() || unlocked }
-            if unlocked { self.refresh(tokens: true, manual: true) }
-        }
+        // Startup and polling stay non-interactive. Only an explicit repair/settings click
+        // may open a Keychain authorization dialog; a locked item must not stall the menu bar.
         refresh(tokens: true)
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -3584,9 +3587,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let base = Date(timeIntervalSince1970: 1_799_000_000)
             for i in 0..<count {
                 let at = base.addingTimeInterval(Double(i) * 604800)
+                let remaining = i == 0 ? 0.0 : i == 5 ? 1900.0 : Double(10000 - ((i * 733) % 10000))
                 let observation = GLMQuotaObservation(requestStartedAt: at, observedAt: at.addingTimeInterval(1),
-                    limitCredits: 10000, reportedUsedCredits: Double((i * 733) % 10000),
-                    remainingCredits: Double(10000 - ((i * 733) % 10000)), resetAt: at.addingTimeInterval(604800), planLevel: "PRO")
+                    limitCredits: 10000, reportedUsedCredits: 10000 - remaining,
+                    remainingCredits: remaining, resetAt: at.addingTimeInterval(604800), planLevel: "PRO")
                 var record = GLMQuotaCycleRecord(observation, startKind: i == 0 ? .firstObserved : .observedTransition)
                 if i == count - 1 { history.current = record }
                 else {
@@ -3699,6 +3703,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func buildPanel() {
+        let restoreHistoryFocus = historyCanvasForFocus.map { canvas in
+            canvas.window?.firstResponder === canvas
+        } ?? false
+        historyCanvasForFocus = nil
         let savedOffset = activeScroll?.contentView.bounds.origin ?? .zero
         let width: CGFloat = CommandLine.arguments.contains("--preview-narrow") ? 280 : 340
         let inner = width - 32
@@ -3754,26 +3762,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         else if let confirmation = updateConfirmation { add(makeUpdateConfirmation(tag: confirmation.tag, notes: confirmation.notes, width: inner)) }
         else if (UpdateChecker.shared.available && !preview) || (preview && CommandLine.arguments.contains("--preview-update-notes")) { add(button("⬆ 新版本可用，点击更新", #selector(onUpdateApp), prominent: true)) }
 
-        let needsPlanConnection = [CredStore.newCredentialMessage, CredStore.keychainUnavailableMessage,
-                                   CredStore.v2LockedMessage, CredStore.missingPlanMessage]
-            .contains { $0 == usage.quotaError }
-        let resetNeedsUnlock = usage.resetCardsError == CredStore.v2LockedMessage
+        let recovery = GLMConnectionRecovery.action(quotaError: usage.quotaError, resetError: usage.resetCardsError)
+        let needsPlanConnection = GLMConnectionRecovery.action(quotaError: usage.quotaError, resetError: nil) != .none
         let resetLoginUnsupported = usage.resetCardsError == CredStore.newCredentialMessage
-        // 待授权（可恢复）→ 按钮直接解锁（不经过填 Key 弹窗）；凭据缺失/格式升级 → 才需要填 Key 连接
-        let unlockable = usage.quotaError == CredStore.keychainUnavailableMessage
-            || usage.quotaError == CredStore.v2LockedMessage || resetNeedsUnlock
-        if needsPlanConnection || resetNeedsUnlock {
-            let instruction = usage.quotaError == CredStore.keychainUnavailableMessage
-                ? "钥匙串连接待解锁，点击恢复自动读取"
-                : (usage.quotaError == CredStore.v2LockedMessage || resetNeedsUnlock
-                    ? "ZCode 凭据需钥匙串授权，点击解锁恢复自动用量与重置卡"
-                    : "使用套餐 API Key 恢复自动刷新")
+        if recovery != .none {
+            let instruction = recovery == .unlock
+                ? "连接需要系统授权，修复后恢复自动读取"
+                : "自动读取暂不可用，应用会继续重试；可修复连接使用备用来源"
             add(label(instruction, color: .systemOrange))
-            if unlockable {
-                add(button("解锁凭据", #selector(onUnlockCredentials), prominent: true))
-            } else {
-                add(button("连接套餐", #selector(onConnectPlan), prominent: true))
-            }
+            let repair = button("修复连接", #selector(onRepairConnection), prominent: true)
+            repair.identifier = NSUserInterfaceItemIdentifier("GLMRepairConnection")
+            add(repair)
         }
         let quotaCard = GLMPanelCard()
         quotaCard.content.spacing = 6
@@ -4048,6 +4047,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if historySnapshot?.isProtected == true { historyNotes.append("历史文件受保护") }
             else if historySnapshot?.isUnsaved == true { historyNotes.append("历史未保存") }
             if historySnapshot?.isVolatile == true { historyNotes.append("仅保留本次运行") }
+            if !preview && state.current != nil && weekStale { historyNotes.append("额度待更新，余额为最后观测") }
             if state.operations.values.contains(where: { $0.isWeek && $0.result == .confirmedUsed && !$0.attributionProven }) { historyNotes.append("本机用卡归属未确认") }
             if state.current.map({ $0.expectedResetAt < Date() && state.pending == nil }) == true { historyNotes.append("等待窗口更新") }
             let status: String? = historyNotes.isEmpty ? nil : historyNotes.joined(separator: " · ")
@@ -4055,9 +4055,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 guard let self = self else { return }
                 self.historyBrowser = browser
                 if needsRebuild {
-                    let focused = self.historyCanvasForFocus?.window?.firstResponder === self.historyCanvasForFocus
                     self.rebuildPanel()
-                    if focused, let canvas = self.historyCanvasForFocus { canvas.window?.makeFirstResponder(canvas) }
                 }
             }
             historyCanvas = historyView.canvas
@@ -4095,8 +4093,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 隐藏不占空高。套餐到期仍在冻结区原位置显示。
         let headerText = GLMPanelStack(); headerText.orientation = .vertical; headerText.alignment = .leading; headerText.spacing = 2
         let titleRow = row(); titleRow.spacing = 7
-        let title = label("GLM 用量", size: 15, bold: true)
-        title.lineBreakMode = .byTruncatingTail; title.maximumNumberOfLines = 1
+        let title = GLMPanelAction(title: "GLM 用量", target: self, action: #selector(onConnectPlan))
+        title.isBordered = false; title.focusRingType = .default; title.alignment = .left
+        title.font = .systemFont(ofSize: 15, weight: .bold)
+        title.contentTintColor = .labelColor; title.cell?.lineBreakMode = .byTruncatingTail
+        title.wantsLayer = true; title.layer?.cornerRadius = 4
+        title.identifier = NSUserInterfaceItemIdentifier("GLMConnectionTitle")
+        title.toolTip = "连接设置（默认自动读取）"
+        title.setAccessibilityLabel("GLM 用量，连接设置")
+        title.heightAnchor.constraint(equalToConstant: 20).isActive = true
         title.setContentCompressionResistancePriority(.init(751), for: .horizontal)
         titleRow.addArrangedSubview(title)
         let tier = GLMPlanTier.resolve(subscription: usage.subscription,
@@ -4147,9 +4152,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let msg = updateMessage { footer.addArrangedSubview(label(msg, color: .secondaryLabelColor)) }
         let actions = row(); actions.spacing = 6
         let refresh = button("立即刷新", #selector(onRefresh), prominent: true); refresh.keyEquivalent = "r"; refresh.keyEquivalentModifierMask = .command; refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true; actions.addArrangedSubview(refresh)
-        if !needsPlanConnection {
-            let connect = button("套餐设置", #selector(onConnectPlan)); actions.addArrangedSubview(connect)
-        }
         let login = NSButton(checkboxWithTitle: "开机自启", target: self, action: #selector(onToggleLogin)); login.font = .systemFont(ofSize: 12); login.state = (!preview && isLoginItemEnabled()) ? .on : .off; actions.addArrangedSubview(login); actions.addArrangedSubview(spacer())
         let quit = button("退出", #selector(onQuit)); quit.keyEquivalent = "q"; quit.keyEquivalentModifierMask = .command; quit.widthAnchor.constraint(equalToConstant: 40).isActive = true; actions.addArrangedSubview(quit)
         footer.addArrangedSubview(actions); actions.widthAnchor.constraint(equalToConstant: inner).isActive = true
@@ -4198,7 +4200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let maxHeight = (statusItem.button?.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
         // --preview-screenshot（预览窗口）不受屏幕高度截断：离线预览矩阵需完整渲染
         // scroll 以下的底部卡片（额度周期回顾/MCP）；窗口可超屏，离屏缓存渲染不受影响。
-        let screenshotFull = CommandLine.arguments.contains("--preview-screenshot") && !previewPopover
+        let screenshotFull = preview && CommandLine.arguments.contains("--preview-screenshot") && !previewPopover
         let rawHeight = screenshotFull
             ? max(250, root.fittingSize.height + footer.fittingSize.height + 78)
             : min(maxHeight * 0.82, max(250, root.fittingSize.height + footer.fittingSize.height + 78))
@@ -4225,6 +4227,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 window.contentViewController = panelController
             }
             previewWindow?.setContentSize(desiredSize)
+        }
+        if restoreHistoryFocus, let canvas = historyCanvasForFocus {
+            canvas.window?.makeFirstResponder(canvas)
         }
         tracePopover("rebuild")
     }
@@ -4408,6 +4413,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
               let snapshot = historySnapshot else { fail("key window or fixture unavailable; keyboard unverified") }
         let records = snapshot.state.closed + (snapshot.state.current.map { [$0] } ?? [])
         guard records.count >= 13 else { fail("13-cycle fixture unavailable") }
+        func hasSeparateUsageRow(_ view: NSView) -> Bool {
+            if let label = view as? NSTextField, label.stringValue.hasPrefix("已用 ") { return true }
+            return view.subviews.contains(where: hasSeparateUsageRow)
+        }
+        guard !hasSeparateUsageRow(panelController.view) else { fail("percentage must be under each date, not in a separate detail row") }
         initial.scrollToVisible(initial.bounds); panelController.view.layoutSubtreeIfNeeded(); window.acceptsMouseMovedEvents = true
         func mouse(_ type: NSEvent.EventType, _ view: NSView, _ point: NSPoint) {
             guard let event = NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: [],
@@ -4441,6 +4451,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard historyBrowser.selectedCycleID == records[7].id else { fail("cross-page right") }
         key(124)
         guard historyBrowser.selectedCycleID == records[8].id else { fail("repeated keyboard focus") }
+        let selectionBeforeRefresh = historyBrowser.selectedCycleID
+        rebuildPanel()
+        guard let refreshedCanvas = historyCanvasForFocus,
+              window.firstResponder === refreshedCanvas,
+              historyBrowser.selectedCycleID == selectionBeforeRefresh else { fail("refresh lost history keyboard focus or selection") }
+        guard (refreshedCanvas.accessibilityValue() as? String)?.contains("窗口变化待确认") != true else { fail("current pending notice leaked into closed cycle details") }
         func findButton(_ view: NSView, title: String? = nil, action: Selector? = nil) -> NSButton? {
             if let button = view as? NSButton, (title == nil || button.title == title), (action == nil || button.action == action) { return button }
             for child in view.subviews { if let found = findButton(child, title: title, action: action) { return found } }
@@ -4451,6 +4467,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let center = NSPoint(x: button.bounds.midX, y: button.bounds.midY)
             mouse(.leftMouseDown, button, center); mouse(.leftMouseUp, button, center)
         }
+        guard let newer = findButton(panelController.view, title: "›"), !newer.isEnabled,
+              newer.accessibilityLabel() == "更新的周期" else { fail("latest page boundary or accessible navigation label") }
         guard let older = findButton(panelController.view, title: "‹") else { fail("older button missing") }
         clickButton(older)
         guard historyBrowser.pageAnchorID != nil else { fail("older page click") }
@@ -4466,6 +4484,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard historyExpanded && historyBrowser.selectedCycleID == selectedBeforeCollapse else { fail("reopen preserves selection") }
         print("GLM history test: PASS (tab, hover, click, paging, earlier, fold, cross-page and repeated keyboard)")
         try? "PASS".write(toFile: resultFile, atomically: true, encoding: .utf8)
+        exit(0)
+    }
+
+    private func testConnectionPresentation() {
+        func fail(_ message: String) -> Never { fputs("GLM connection test: FAIL \(message)\n", stderr); exit(1) }
+        func buttons(_ view: NSView) -> [NSButton] {
+            ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap { buttons($0) }
+        }
+        func fields(_ view: NSView) -> [NSSecureTextField] {
+            ((view as? NSSecureTextField).map { [$0] } ?? []) + view.subviews.flatMap { fields($0) }
+        }
+        // Deterministic native-control activation, not a claim of hardware mouse coverage.
+        // Cua separately verifies the visible title/settings path in a real AppKit window.
+        func click(_ button: NSButton) {
+            guard let window = button.window else { fail("button window missing") }
+            button.scrollToVisible(button.bounds); window.contentView?.layoutSubtreeIfNeeded()
+            button.performClick(nil)
+        }
+        func titleButton() -> NSButton {
+            guard let title = buttons(panelHeaderSlot).first(where: { $0.identifier?.rawValue == "GLMConnectionTitle" }),
+                  title.title == "GLM 用量", title.action == #selector(onConnectPlan),
+                  title.toolTip?.contains("连接设置") == true, title.canBecomeKeyView else { fail("hidden title entry missing or inaccessible") }
+            return title
+        }
+        func expectSettingsDialog(_ trigger: () -> Void) {
+            var inspected = false
+            // A run-loop timer, not a main-queue block: NSAlert's nested modal loop
+            // cannot re-enter the GCD block that started this fixture.
+            let inspection = Timer(timeInterval: 0.1, repeats: true) { timer in
+                guard let modal = NSApp.modalWindow else { return }
+                guard let content = modal.contentView,
+                      buttons(content).contains(where: { $0.title == "取消" }),
+                      fields(content).count == 1 else { fail("settings dialog or secure field missing") }
+                func containsTitle(_ view: NSView) -> Bool {
+                    ((view as? NSTextField)?.stringValue == "连接设置") || view.subviews.contains(where: containsTitle)
+                }
+                guard containsTitle(content) else { fail("settings dialog title is misleading") }
+                inspected = true; timer.invalidate()
+                NSApp.stopModal(withCode: .alertSecondButtonReturn)
+                modal.orderOut(nil)
+            }
+            RunLoop.current.add(inspection, forMode: .common)
+            RunLoop.current.add(inspection, forMode: .modalPanel)
+            defer { inspection.invalidate() }
+            trigger()
+            let deadline = Date().addingTimeInterval(2)
+            while !inspected && Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            }
+            guard inspected else { fail("entry did not open native settings dialog") }
+        }
+        guard buttons(panelFooterSlot).allSatisfy({ $0.action != #selector(onConnectPlan) }),
+              !buttons(panelRoot).contains(where: { $0.title == "修复连接" }) else { fail("normal state exposes connection controls") }
+        expectSettingsDialog { click(titleButton()) }
+        for error in [CredStore.keychainUnavailableMessage, CredStore.v2LockedMessage] {
+            usage.quotaError = error; usage.resetCardsError = nil; rebuildPanel()
+            guard let repair = buttons(panelRoot).first(where: { $0.title == "修复连接" }) else { fail("locked state has no repair entry") }
+            click(repair)
+            guard updateMessage?.contains("预览模式：解锁") == true else { fail("repair did not choose unlock route") }
+        }
+        usage.quotaError = nil; usage.resetCardsError = CredStore.v2LockedMessage; rebuildPanel()
+        guard buttons(panelRoot).contains(where: { $0.title == "修复连接" }) else { fail("reset credential lock has no repair entry") }
+        usage.resetCardsError = nil
+        for error in [CredStore.missingPlanMessage, CredStore.newCredentialMessage, "HTTP 401", "HTTP 403"] {
+            usage.quotaError = error; rebuildPanel()
+            guard buttons(panelRoot).contains(where: { $0.title == "修复连接" }) else { fail("credential failure has no repair entry") }
+        }
+        guard let repair = buttons(panelRoot).first(where: { $0.title == "修复连接" }) else { fail("repair entry missing") }
+        expectSettingsDialog { click(repair) }
+        usage.quotaError = "HTTP 500"; rebuildPanel()
+        guard !buttons(panelRoot).contains(where: { $0.title == "修复连接" }) else { fail("server failure should keep automatic retries, not request a Key") }
+        usage.quotaError = nil; rebuildPanel()
+        guard buttons(panelFooterSlot).allSatisfy({ $0.action != #selector(onConnectPlan) }) else { fail("footer setting button returned") }
+        _ = titleButton()
+        print("GLM connection test: PASS (native control activation, title entry, dialog/cancel, footer removal, unlock/manual repair, automatic retry state)")
         exit(0)
     }
 
@@ -4696,30 +4789,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private var connectingPlan = false
 
-    /// 待授权场景的直接入口：一键交互式解锁自建连接与 ZCode 系统密钥（系统授权框），
-    /// 不经过填 Key 弹窗。任一成功即全量刷新。
+    @objc private func onRepairConnection() {
+        switch GLMConnectionRecovery.action(quotaError: usage.quotaError, resetError: usage.resetCardsError) {
+        case .unlock: onUnlockCredentials()
+        case .settings: onConnectPlan()
+        case .none: if !preview { refresh(tokens: true, manual: true) }
+        }
+    }
+
+    /// Interactive authorization is restricted to the credential source that is locked.
     @objc private func onUnlockCredentials() {
-        guard !preview else { return }
+        if preview { setUpdateMessage("预览模式：解锁凭据，不访问真实钥匙串", dismissAfter: 3); return }
         NSApp.activate(ignoringOtherApps: true)
-        let savedOK = CredStore.unlockSavedKey()
-        let systemOK = CredStore.unlockZCodeKey()
+        let savedOK = usage.quotaError == CredStore.keychainUnavailableMessage && CredStore.unlockSavedKey()
+        let systemLocked = usage.quotaError == CredStore.v2LockedMessage || usage.resetCardsError == CredStore.v2LockedMessage
+        let systemOK = systemLocked && CredStore.unlockZCodeKey()
         if savedOK || systemOK {
             setUpdateMessage("凭据已解锁，正在恢复自动读取", dismissAfter: 4)
             refresh(tokens: true, manual: true)
         } else {
-            setUpdateMessage("钥匙串解锁被拒绝，可重试或用「套餐设置」连接", dismissAfter: 8)
+            setUpdateMessage("钥匙串解锁被拒绝，可重试或点击顶部「GLM 用量」打开连接设置", dismissAfter: 8)
         }
     }
 
     @objc private func onConnectPlan() {
         guard !connectingPlan else { return }
-        if ProcessInfo.processInfo.environment[CredStore.envKey]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+        if !preview && ProcessInfo.processInfo.environment[CredStore.envKey]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
             setUpdateMessage("当前由 GLM_API_KEY 指定套餐，请先移除该环境变量再连接", dismissAfter: 6); return
         }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "连接 GLM Coding Plan"
-        alert.informativeText = "粘贴套餐 API Key。验证成功后将安全保存在本机钥匙串，用于刷新用量。"
+        alert.messageText = "连接设置"
+        alert.informativeText = "默认自动读取 ZCode。仅在自动读取不可用或需要切换来源时，填写套餐 API Key；验证成功后安全保存在本机钥匙串。"
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
         field.placeholderString = "套餐 API Key"
         alert.accessoryView = field
@@ -4727,8 +4828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         alert.addButton(withTitle: "取消")
         alert.addButton(withTitle: "获取 API Key")
         // 解锁入口覆盖两类钥匙串条目：本应用的已保存连接、ZCode 新版凭据的系统密钥
-        let canUnlock = !preview && (usage.quotaError == CredStore.keychainUnavailableMessage
-            || usage.quotaError == CredStore.v2LockedMessage || usage.resetCardsError == CredStore.v2LockedMessage)
+        let canUnlock = !preview && GLMConnectionRecovery.action(quotaError: usage.quotaError, resetError: usage.resetCardsError) == .unlock
         if canUnlock { alert.addButton(withTitle: "解锁凭据") }
         if canUnlock {
             alert.informativeText = "粘贴套餐 API Key，或选「解锁凭据」恢复自动读取（首次会弹钥匙串授权，请点「始终允许」）。"
@@ -4739,14 +4839,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         alert.window.initialFirstResponder = field
         let response = alert.runModal()
         if canUnlock && response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 3 {
-            let savedOK = CredStore.unlockSavedKey()
-            let systemOK = CredStore.unlockZCodeKey()
-            if savedOK || systemOK { refresh(tokens: true, manual: true) }
-            else { setUpdateMessage("钥匙串解锁被拒绝，可稍后重试", dismissAfter: 8) }
+            onUnlockCredentials()
             return
         }
-        if canDisconnect && response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 4 {
+        if canDisconnect && response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + (canUnlock ? 4 : 3) {
             CredStore.forgetSavedKey()
+            bindHistoryContext(nil)
             setUpdateMessage("已断开连接，改用 ZCode 凭据自动读取", dismissAfter: 5)
             refresh(tokens: true, manual: true)
             return
@@ -4788,6 +4886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self.dailySelectedIndex = nil
                 }
                 self.bindPlanCredential(key)
+                self.bindHistoryContext(CredStore.loadPlanCredentialTyped().context)
                 self.lastAttemptAt = Date()
                 self.applyQuota(result)
                 self.setUpdateMessage("套餐已连接，正在刷新", dismissAfter: 5)
@@ -5120,6 +5219,42 @@ enum GLMOfflineRegression {
             historyFresh.weekWarning = nil
             try expect(GLMHistoryAdapter.observation(historyFresh, requestStartedAt: now, observedAt: now)?.remainingCredits == 5700,
                        "valid week not captured")
+
+            let heartbeatDelivery = DispatchQueue(label: "GlmUsage.self-test.history-delivery")
+            var heartbeatSnapshots: [GLMQuotaCycleSnapshot] = []
+            var heartbeatWrites = 0
+            let heartbeatCoordinator = GLMQuotaCycleCoordinator(
+                root: root.appendingPathComponent("history-heartbeat"),
+                writer: { _, _ in heartbeatWrites += 1 }, deliveryQueue: heartbeatDelivery,
+                deliver: { heartbeatSnapshots.append($0) })
+            heartbeatCoordinator.activate(.apiKey("fixture-heartbeat"))
+            func observeHeartbeat(_ seconds: Double, resetJitter: Double = 0) {
+                let time = now.addingTimeInterval(seconds)
+                let observation = GLMQuotaObservation(requestStartedAt: time.addingTimeInterval(-1),
+                    observedAt: time, limitCredits: 10000, reportedUsedCredits: 4300,
+                    remainingCredits: 5700, resetAt: now.addingTimeInterval(604800 + resetJitter), planLevel: "PRO")
+                let token = heartbeatCoordinator.capture(requestStartedAt: observation.requestStartedAt)!
+                heartbeatCoordinator.observe(observation, token: token)
+                heartbeatCoordinator.drain(); heartbeatDelivery.sync {}
+            }
+            observeHeartbeat(0)
+            observeHeartbeat(10, resetJitter: 1)
+            try expect(heartbeatWrites == 1, "reset jitter alone must not force history writes")
+            observeHeartbeat(300)
+            let lastHeartbeat = heartbeatDelivery.sync { heartbeatSnapshots.last?.state.current?.lastObservation.observedAt }
+            try expect(heartbeatWrites == 2 && lastHeartbeat == now.addingTimeInterval(300),
+                       "unchanged quota heartbeat must update the UI observation timestamp")
+
+            let recoveryCases: [(String?, String?, GLMConnectionRecovery.Action)] = [
+                (nil, nil, .none), ("HTTP 500", nil, .none), ("request timed out", nil, .none),
+                (CredStore.keychainUnavailableMessage, nil, .unlock),
+                (CredStore.v2LockedMessage, nil, .unlock), (nil, CredStore.v2LockedMessage, .unlock),
+                (CredStore.missingPlanMessage, nil, .settings), (CredStore.newCredentialMessage, nil, .settings),
+                ("HTTP 401", nil, .settings), ("HTTP 403", nil, .settings)]
+            for (quota, reset, action) in recoveryCases {
+                try expect(GLMConnectionRecovery.action(quotaError: quota, resetError: reset) == action,
+                           "connection recovery route must distinguish authorization from transient failures")
+            }
 
             try expect(GLMNumber.finite(nil) == nil, "missing numeric value became zero")
             try expect(GLMNumber.finite(true) == nil, "boolean numeric value was accepted")

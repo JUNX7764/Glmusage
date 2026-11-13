@@ -29,6 +29,7 @@
 ## 原理与数据边界
 
 - **凭据**：优先使用 `GLM_API_KEY`，其次使用用户在 GlmUsage 面板中连接的套餐 API Key，最后回退到 ZCode `~/.zcode/v2/credentials.json` 中支持的凭据。`enc:v1` 可使用 `ZCODE_CREDENTIAL_SECRET` 参与密钥派生；`enc:v2:os` 依赖系统钥匙串授权，`enc:v2:env` 不支持。用户主动连接时先查询额度验证，成功后存入 GlmUsage 的 macOS 钥匙串条目。重置卡使用 ZCode 双 token；可读取已授权的 `enc:v2:os` 登录态。API Key 与 OAuth token 不写入仓库、日志或诊断状态。
+- **连接入口**：底部不再显示「套餐设置」，顶部「GLM 用量」是无边框、可键盘访问的连接设置入口，悬停提供提示。已知凭据缺失/格式不支持、HTTP 401/403 或钥匙串未授权时显示「修复连接」；锁定优先解锁对应来源，其他凭据问题进入备用设置，HTTP 5xx/超时继续自动重试而不引导填 Key。启动不再在1.5秒后主动调用交互式解锁；启动与定时刷新仅non-interactive读取，系统授权仅由用户显式点击触发，既有已保存来源不自动删除或切换。
 - **额度与用量**：通过智谱监控接口查询 5 小时、7 天额度、模型 Token / 调用数和 MCP 工具次数。
 - **额度周期回顾**：只采集独立额度刷新通道中无警告、带有效 reset 的新鲜周额度；周期、证据、连接分区和存储边界见 `docs/project/17-quota-cycle-history.md`。
 - **Start Plan 用量**：只读 `~/.zcode/cli/db/db.sqlite` 的 `model_usage`，按请求时间将国内 Start Plan 的 Token 与调用数补入今天、近 7 天、近 30 天、模型明细和每日趋势。同名模型忽略大小写合并，保留官方显示名。使用 `provider_total_tokens`，缺失时回退 `computed_total_tokens`，缓存输入已计入总数；仅纳入已结束且 Token 大于零的请求，实际重试的额外消耗保留。使用系统 SQLite3，无第三方依赖。
@@ -57,7 +58,11 @@ python3 -m unittest discover -s tests -p '*_test.py'
 # Shell 语法检查
 bash -n build.sh scripts/update.sh scripts/release.sh
 
-# 原生 Popover 假数据交互回归
+# 连接入口：标题/底部隐藏/异常路由/原生弹窗与取消结果（控件激活，非硬件鼠标；所有数据为假）
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-connection-test
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-connection-test --preview-narrow
+
+# 原生 Popover 假数据交互回归（与其他GUI进程错开至少5秒）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-popover-test
 
 # 每日用量交互回归（悬停/键盘/Tab 可达/零日缺失读取；与上一条错开 ≥5s 逐个跑）

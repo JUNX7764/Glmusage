@@ -14,6 +14,7 @@ final class GLMQuotaCycleCoordinator {
         var isProtected = false
         var isUnsaved = false
         var lastSavedAt: Date?
+        var lastPublishedAt: Date?
         let context: GLMQuotaHistoryContext
         init(_ context: GLMQuotaHistoryContext) { self.context = context }
     }
@@ -85,7 +86,10 @@ final class GLMQuotaCycleCoordinator {
             guard entry.state != old else { return }
             let previousUnsaved = entry.isUnsaved, previousProtected = entry.isProtected
             self.persist(entry, previous: old, observedAt: sample.observedAt)
-            if self.hasSemanticChange(previous: old, next: entry.state) ||
+            let heartbeatDue = entry.lastPublishedAt.map {
+                sample.observedAt.timeIntervalSince($0) >= self.reducer.policy.heartbeatInterval
+            } ?? true
+            if self.hasSemanticChange(previous: old, next: entry.state) || heartbeatDue ||
                 previousUnsaved != entry.isUnsaved || previousProtected != entry.isProtected {
                 self.publish(entry, generation: token.activation)
             }
@@ -108,8 +112,10 @@ final class GLMQuotaCycleCoordinator {
     }
     private func semanticObservation(_ o: GLMQuotaObservation?) -> [String] {
         guard let o else { return [] }
+        // Accepted same-cycle reset jitter is not a semantic change. Real window changes
+        // already appear in pending/closed records, so timestamps alone do not force I/O.
         return [String(o.limitCredits), String(o.reportedUsedCredits), String(o.remainingCredits),
-                String(o.resetAt.timeIntervalSince1970), o.planLevel ?? ""]
+                o.planLevel ?? ""]
     }
     private func hasSemanticChange(previous: GLMQuotaCycleState, next: GLMQuotaCycleState) -> Bool {
         previous.closed != next.closed || previous.pending != next.pending ||
@@ -118,7 +124,7 @@ final class GLMQuotaCycleCoordinator {
     }
     private func persist(_ entry: Entry, previous: GLMQuotaCycleState, observedAt: Date, force: Bool = false) {
         guard let partition = entry.context.partition, !entry.isProtected else { return }
-        guard force || hasSemanticChange(previous: previous, next: entry.state) || entry.isUnsaved || entry.lastSavedAt.map({ observedAt.timeIntervalSince($0) >= 300 }) ?? true else { return }
+        guard force || hasSemanticChange(previous: previous, next: entry.state) || entry.isUnsaved || entry.lastSavedAt.map({ observedAt.timeIntervalSince($0) >= reducer.policy.heartbeatInterval }) ?? true else { return }
         do { try store.save(entry.state, partition: partition); entry.isUnsaved = false; entry.lastSavedAt = observedAt }
         catch {
             if store.isProtected(partition: partition) { entry.isProtected = true; entry.isUnsaved = false }
@@ -126,6 +132,7 @@ final class GLMQuotaCycleCoordinator {
         }
     }
     private func publish(_ entry: Entry, generation: UInt64) {
+        entry.lastPublishedAt = entry.state.lastAcceptedObservedAt
         let snapshot = GLMQuotaCycleSnapshot(state: entry.state, isVolatile: entry.context.partition == nil,
                                               isProtected: entry.isProtected, isUnsaved: entry.isUnsaved)
         deliveryQueue.async {
