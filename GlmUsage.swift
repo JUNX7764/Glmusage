@@ -2699,8 +2699,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var updateMessageDismissal: DispatchWorkItem?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
-    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
-    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-card-settings-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-card-settings-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
@@ -2742,6 +2742,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var dailyLastOK: Date?
     // 每日图选中日（面板每 10s 重建后沿用；nil = 用默认最新有记录日，通常为今日）
     private var dailySelectedIndex: Int?
+    // 面板六张内容卡的显隐与纵向顺序；preview 进程强制默认基线且不落盘生产偏好
+    private var panelLayout = GLMPanelLayout.load()
+    private var showingCardSettings = false
+
+    private func persistPanelLayout() {
+        if !preview { panelLayout.save() }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 恢复上次「结果未知」遗留的幂等 key：跨重启防重复扣卡
@@ -2763,7 +2770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.animates = false
         // 仅离线 GUI 回归进程：改用 applicationDefined，避免测试期间的真实鼠标点击
         // （用户正在用机）把 transient Popover 关掉造成几何断言误报；生产与普通预览不变
-        if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") {
+        if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-card-settings-test") {
             popover.behavior = .applicationDefined
         }
         if preview {
@@ -2771,6 +2778,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 几何测试需保留展开模型所需的高度余量；每日图交互由独立测试覆盖。
             if CommandLine.arguments.contains("--preview-popover-test") { dailyExpanded = false }
             installPreviewData()
+            // 卡片设置回归的基线必须是默认布局：忽略生产 UserDefaults 里可能存在的自定义顺序
+            panelLayout = .default
             rebuildPanel()
             statusItem.button?.title = "GLM 预览"
             if previewPopover && CommandLine.arguments.contains("--preview-popover-ui") {
@@ -2788,7 +2797,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 previewWindow?.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
             }
-            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
+            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-card-settings-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self = self else { return }
                     self.togglePanel()
@@ -2798,6 +2807,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                     if CommandLine.arguments.contains("--preview-daily-test") {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.testDailyInteraction() }
+                    }
+                    if CommandLine.arguments.contains("--preview-card-settings-test") {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.testCardSettings() }
                     }
                 }
             }
@@ -3303,6 +3315,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if updateConfirmation == nil || !panelConfigured { buildPanel() }
     }
 
+    @objc private func restoreDefaultPanelLayout() {
+        panelLayout = .default
+        persistPanelLayout()
+        showingCardSettings = false
+        rebuildPanel()
+    }
+
     @objc private func togglePanel() {
         if popover.isShown { popover.performClose(nil); return }
         dailySelectedIndex = nil
@@ -3659,6 +3678,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 add(button("连接套餐", #selector(onConnectPlan), prominent: true))
             }
         }
+        // 六张内容卡先注册稳定 identifier，再按 panelLayout.visibleOrder 统一安装（全部隐藏时给空态）
+        var cardViews: [GLMPanelCardID: GLMPanelCard] = [:]
+        func register(_ card: GLMPanelCard, as id: GLMPanelCardID) {
+            card.identifier = NSUserInterfaceItemIdentifier("GLMPanelCard.\(id.rawValue)")
+            cardViews[id] = card
+        }
         let quotaCard = GLMPanelCard()
         quotaCard.content.spacing = 6
         // 卡片标题行（CodexUsage 同款布局、自家绿色系）：图标+标题居左，「重置时间」列头居右
@@ -3733,7 +3758,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         if let error = subscriptionError { addContent(label("套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemRed), to: quotaCard) }
         else if subscriptionStale { addContent(label("套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))", color: .systemOrange), to: quotaCard) }
-        add(quotaCard)
+        register(quotaCard, as: .quota)
         // 峰谷卡＝极简状态条：标题+状态胶囊一行，折扣与下次切换一行；限时活动行沿用旧版追加在下方。
         // 视觉回归可用 --preview-peak 强制按高峰时刻渲染（下个工作日 14:00）
         let peakNow = CommandLine.arguments.contains("--preview-peak") ? Peak.nextPeakStart(Date()) : Date()
@@ -3761,7 +3786,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         peakInfoRow.addArrangedSubview(spacer())
         peakInfoRow.addArrangedSubview(nextGroup)
         addContent(peakInfoRow, to: peakCard)
-        add(peakCard)
+        register(peakCard, as: .peak)
         let cards = GLMPanelCard(); let cardHead = row(); cardHead.spacing = 6; cardHead.addArrangedSubview(symbol("calendar")); cardHead.addArrangedSubview(label("重置卡", size: 12, bold: true))
         if !resetLoginUnsupported, let count = usage.resetCards?.availableCount(now: Date()), count > 0 {
             let countLabel = label("×\(count)", size: 12, bold: true, color: GLMPeakTint.accent)
@@ -3818,7 +3843,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let message: String? = error.map { "\(name)获取失败：\($0)（ZCode 登录态可能过期，打开 ZCode 后重试） · 最后成功 \(Fmt.lastOK(last))" } ?? (stale ? "\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))" : nil)
             if let message = message { let l = label(message, color: .systemRed); cards.content.addArrangedSubview(l); l.widthAnchor.constraint(equalTo: cards.content.widthAnchor).isActive = true }
         }
-        add(cards)
+        register(cards, as: .resetCards)
         let usageCard = GLMPanelCard()
         usageCard.content.spacing = 4
         let usageSection = section("用量情况", icon: "square.stack.3d.up.fill", expanded: tokenExpanded, action: #selector(toggleToken))
@@ -3905,7 +3930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             } else if let error = error { addContent(label("\(name)刷新失败：\(error) · 最后成功 \(Fmt.lastOK(last))", color: .systemRed), to: usageCard) }
             else if stale { addContent(label("\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))", color: .systemOrange), to: usageCard) }
         }
-        add(usageCard)
+        register(usageCard, as: .usage)
 
         // 每日用量：标题、选中行、图表和比较条作为一个完整模块进入独立卡片。
         let dailyCard = GLMPanelCard()
@@ -3917,7 +3942,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.dailySelectedIndex = index
         }
         addContent(dailySection, to: dailyCard)
-        add(dailyCard)
+        register(dailyCard, as: .daily)
 
         let mcpCard = GLMPanelCard()
         mcpCard.content.spacing = 4
@@ -3940,7 +3965,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let last = toolsLastOK { addContent(label("上次更新 \(Fmt.lastOK(last))", color: .secondaryLabelColor), to: mcpCard) }
         } else if let e = usage.toolsError { addContent(label("MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemRed), to: mcpCard) }
         else if toolsStale { addContent(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange), to: mcpCard) }
-        add(mcpCard)
+        register(mcpCard, as: .mcp)
+
+        // 按用户布局的可见顺序安装卡片；全部隐藏时给出可恢复空态，不留无法解释的空白
+        let visibleCards = panelLayout.visibleOrder.compactMap { cardViews[$0] }
+        if visibleCards.isEmpty {
+            let emptyCard = GLMPanelCard()
+            emptyCard.identifier = NSUserInterfaceItemIdentifier("GLMPanelEmptyState")
+            addContent(label("卡片已全部隐藏，可通过右上角「···」恢复。", color: .secondaryLabelColor), to: emptyCard)
+            let restore = button("恢复默认卡片布局", #selector(restoreDefaultPanelLayout))
+            addContent(restore, to: emptyCard)
+            add(emptyCard)
+        } else {
+            for card in visibleCards { add(card) }
+        }
 
         let header = row(); header.spacing = 12
         let icon = NSImageView(image: NSApp.applicationIconImage); icon.widthAnchor.constraint(equalToConstant: 32).isActive = true; icon.heightAnchor.constraint(equalToConstant: 32).isActive = true; header.addArrangedSubview(icon)
@@ -4241,6 +4279,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // 离线回归：每日用量交互（合成数据）。鼠标事件经 NSApp.sendEvent 真实派发
     // （悬停命中整天宽列、缺失/零日可读、离开保留选中、点击选日、键盘切换），非直接调内部方法。
+    private func testCardSettings() {
+        func fail(_ message: String) -> Never {
+            fputs("GLM card settings test: FAIL \(message)\n", stderr)
+            exit(1)
+        }
+        func allViews(_ root: NSView) -> [NSView] { [root] + root.subviews.flatMap(allViews) }
+        func cardOrder() -> [String] {
+            panelRoot.arrangedSubviews.compactMap { view in
+                guard view is GLMPanelCard, let raw = view.identifier?.rawValue else { return nil }
+                return raw.replacingOccurrences(of: "GLMPanelCard.", with: "")
+            }
+        }
+        // 前一实例刚退出时 popover 偶发未及弹出：与每日交互测试一致先补齐打开再断言
+        if !popover.isShown { togglePanel() }
+        var waited = 0.0
+        while !popover.isShown && waited < 2.0 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            waited += 0.1
+            if !popover.isShown { togglePanel() }
+        }
+        let expectedDefault = GLMPanelCardID.allCases.map(\.rawValue)
+        guard cardOrder() == expectedDefault else { fail("default card order \(cardOrder())") }
+        // 隐藏 + 排序后按可见顺序组装：resetCards 不动，daily 上移到 usage 之前，mcp 隐藏
+        panelLayout.setVisible(false, for: .mcp)
+        panelLayout.move(.daily, direction: .up)
+        rebuildPanel()
+        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage"] else { fail("custom visible order \(cardOrder())") }
+        // 全部隐藏必须出现可恢复空态，而不是留下无法解释的空白
+        for id in GLMPanelCardID.allCases { panelLayout.setVisible(false, for: id) }
+        rebuildPanel()
+        guard allViews(panelController.view).contains(where: { $0.identifier?.rawValue == "GLMPanelEmptyState" }) else { fail("all-hidden empty state") }
+        restoreDefaultPanelLayout()
+        guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
+        print("GLM card settings test: PASS (default layout)")
+        exit(0)
+    }
+
     private func testDailyInteraction() {
         func fail(_ message: String) -> Never {
             fputs("GLM daily test: FAIL \(message)\n", stderr)
