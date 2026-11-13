@@ -2820,7 +2820,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var dailyLastOK: Date?
     // 每日图选中日（面板每 10s 重建后沿用；nil = 用默认最新有记录日，通常为今日）
     private var dailySelectedIndex: Int?
-    // 面板六张内容卡的显隐与纵向顺序；preview 进程强制默认基线且不落盘生产偏好
+    // 面板七张内容卡的显隐与纵向顺序；preview 进程强制默认基线且不落盘生产偏好
     private var panelLayout = GLMPanelLayout.load()
     private var showingCardSettings = false
 
@@ -3836,7 +3836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 repair.identifier = NSUserInterfaceItemIdentifier("GLMRepairConnection")
                 add(repair)
             }
-            // 六张内容卡先注册稳定 identifier，再按 panelLayout.visibleOrder 统一安装（全部隐藏时给空态）
+            // 七张内容卡先注册稳定 identifier，再按 panelLayout.visibleOrder 统一安装（全部隐藏时给空态）
             var cardViews: [GLMPanelCardID: GLMPanelCard] = [:]
             func register(_ card: GLMPanelCard, as id: GLMPanelCardID) {
                 card.identifier = NSUserInterfaceItemIdentifier("GLMPanelCard.\(id.rawValue)")
@@ -4102,8 +4102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             addContent(dailySection, to: dailyCard)
             register(dailyCard, as: .daily)
 
-            // 额度周期回顾：固定卡片（不在「···」卡片设置的可配置范围内），紧跟每日用量、位于 MCP 之前；
-            // MCP 隐藏或排到最后时排在可见内容末尾，保证额度周期回顾始终可见
+            // 额度周期回顾：默认紧跟每日用量、位于 MCP 之前；与其他内容卡一样支持独立显隐和排序。
             let historyCard = GLMPanelCard()
             historyCard.content.spacing = 3
             let historyHeader = section("额度周期回顾", icon: "chart.bar", expanded: historyExpanded, action: #selector(toggleHistory))
@@ -4132,6 +4131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 historyCanvasForFocus = historyView.canvas
                 addContent(historyView, to: historyCard)
             }
+            register(historyCard, as: .history)
 
             let mcpCard = GLMPanelCard()
             mcpCard.content.spacing = 4
@@ -4139,7 +4139,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             addContent(mcpSection, to: mcpCard)
             // 键盘可达（PRD §6.2 支持键盘切换日期）：key view loop 按 panelLayout.visibleOrder
             // 动态连接「板块标题 → 柱图」显式顺序，其余环节按几何自动；隐藏/折叠的卡片不留链接。
-            // 额度周期回顾为固定卡片，键盘链路插在 MCP 之前（MCP 隐藏时排在末尾）。
             // Full Keyboard Access 下 Tab 即可到达柱图，左右方向键切换日期
             var focusChain: [NSView] = []
             for id in panelLayout.visibleOrder {
@@ -4149,17 +4148,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 case .daily:
                     if let toggle = dailySection.toggleControl { focusChain.append(toggle) }
                     if dailyExpanded { focusChain.append(dailySection.chartCanvas) }
-                case .mcp:
+                case .history:
                     focusChain.append(historyHeader)
                     if let canvas = historyCanvas { focusChain.append(canvas) }
+                case .mcp:
                     focusChain.append(mcpSection)
                 case .quota, .peak, .resetCards:
                     break // 其他卡片内现有按钮继续由 AppKit 按几何与控件策略处理
                 }
-            }
-            if !panelLayout.isVisible(.mcp) {
-                focusChain.append(historyHeader)
-                if let canvas = historyCanvas { focusChain.append(canvas) }
             }
             for (current, next) in zip(focusChain, focusChain.dropFirst()) {
                 current.nextKeyView = next
@@ -4174,8 +4170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             else if toolsStale { addContent(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange), to: mcpCard) }
             register(mcpCard, as: .mcp)
 
-            // 按用户布局的可见顺序安装卡片；全部隐藏时给出可恢复空态，不留无法解释的空白。
-            // 额度周期回顾为固定卡片：默认布局插在 MCP 之前，MCP 隐藏或全部隐藏时排在可见内容末尾
+            // 按用户布局的可见顺序安装七张独立卡片；全部隐藏时给出可恢复空态。
             let visibleCards = panelLayout.visibleOrder.compactMap { cardViews[$0] }
             if visibleCards.isEmpty {
                 let emptyCard = GLMPanelCard()
@@ -4184,15 +4179,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let restore = button("恢复默认卡片布局", #selector(restoreDefaultPanelLayout))
                 addContent(restore, to: emptyCard)
                 add(emptyCard)
-                add(historyCard)
-            } else if let mcpView = cardViews[.mcp] {
-                for card in visibleCards {
-                    if card === mcpView { add(historyCard) }
-                    add(card)
-                }
             } else {
                 for card in visibleCards { add(card) }
-                add(historyCard)
             }
         }
 
@@ -4437,7 +4425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 NSApp.sendEvent(event)
             }
         }
-        // 六张卡片增加了固定外框高度：连续展开多个模型窗会顶到最大高度，
+        // 七张卡片增加了固定外框高度：连续展开多个模型窗会顶到最大高度，
         // 截断区内继续展开不会改变窗口高。逐项开/收可让每步都在非截断区验证真实增减；
         // 收起 Token 表后，再验证 MCP 与 footer（刷新提示行）的增减。
         let steps: [(HeightChange, () -> Void)] = [
@@ -4682,7 +4670,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         func allViews(_ root: NSView) -> [NSView] { [root] + root.subviews.flatMap(allViews) }
         func cardOrder() -> [String] {
             panelRoot.arrangedSubviews.compactMap { view in
-                guard view is GLMPanelCard, let raw = view.identifier?.rawValue else { return nil }
+                guard view is GLMPanelCard, let raw = view.identifier?.rawValue,
+                      raw.hasPrefix("GLMPanelCard.") else { return nil }
                 return raw.replacingOccurrences(of: "GLMPanelCard.", with: "")
             }
         }
@@ -4702,10 +4691,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panelLayout.setVisible(false, for: .mcp)
         panelLayout.move(.daily, direction: .up)
         rebuildPanel()
-        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage"] else { fail("custom visible order \(cardOrder())") }
-        // 全部隐藏必须出现可恢复空态，而不是留下无法解释的空白
+        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage", "history"] else { fail("custom visible order \(cardOrder())") }
+        // 隐藏 MCP 不得连带隐藏历史；全部隐藏（含历史）必须只留可恢复空态。
         for id in GLMPanelCardID.allCases { panelLayout.setVisible(false, for: id) }
         rebuildPanel()
+        guard cardOrder().isEmpty else { fail("all-hidden left cards \(cardOrder())") }
         guard allViews(panelController.view).contains(where: { $0.identifier?.rawValue == "GLMPanelEmptyState" }) else { fail("all-hidden empty state") }
         restoreDefaultPanelLayout()
         guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
@@ -4723,7 +4713,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panelLayout.move(.daily, direction: .up)
         panelLayout.move(.mcp, to: 0)
         rebuildPanel()
-        guard cardOrder() == ["mcp", "quota", "peak", "resetCards", "daily", "usage"] else { fail("key chain setup order \(cardOrder())") }
+        guard cardOrder() == ["mcp", "quota", "peak", "resetCards", "daily", "usage", "history"] else { fail("key chain setup order \(cardOrder())") }
         guard let mcpToggle = actionToggle("MCP 工具") else { fail("key chain views missing: mcp") }
         guard let dailyToggle = actionToggle("每日用量") else { fail("key chain views missing: daily") }
         guard let usageToggle = actionToggle("用量情况") else { fail("key chain views missing: usage") }
@@ -4735,9 +4725,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panelLayout.setVisible(false, for: .daily)
         rebuildPanel()
         guard chartCanvas() == nil else { fail("hidden daily canvas still in hierarchy") }
-        guard let mcpToggle2 = actionToggle("MCP 工具"), let usageToggle2 = actionToggle("用量情况") else { fail("hidden daily chain views") }
+        guard let mcpToggle2 = actionToggle("MCP 工具"), let usageToggle2 = actionToggle("用量情况"),
+              let historyToggle2 = actionToggle("额度周期回顾") else { fail("hidden daily chain views") }
         guard mcpToggle2.nextKeyView === usageToggle2 else { fail("hidden daily left chart link") }
-        guard usageToggle2.nextKeyView == nil else { fail("hidden daily chain tail") }
+        guard usageToggle2.nextKeyView === historyToggle2 else { fail("hidden daily broke usage → history") }
         // 折叠 daily（真实点击 toggle）：toggle 保留在链中，chartCanvas 不在层级也不被链接
         panelLayout.setVisible(true, for: .daily)
         rebuildPanel()
@@ -4822,13 +4813,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let responder = panelController.view.window?.firstResponder {
             guard responder === editor.table else { fail("settings editor not initial first responder: \(responder)") }
         } else { fail("settings editor window missing first responder") }
-        guard editor.layout.order.count == 6 else { fail("settings row count \(editor.layout.order.count)") }
+        guard editor.layout.order.count == 7 else { fail("settings row count \(editor.layout.order.count)") }
         // 设置页 key view loop：表格 → 复选框 → 上移/下移 → 恢复默认 → 完成，逐环可达。
         guard let firstRowView = editor.table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? GLMCardSettingRowView else { fail("settings row view missing") }
         guard editor.table.nextKeyView === firstRowView.checkbox,
               firstRowView.checkbox.nextKeyView === firstRowView.upButton,
               firstRowView.upButton.nextKeyView === firstRowView.downButton else { fail("settings key loop broken") }
-        // 拖放数据边界：六行 writer 只写本表卡片 ID；validateDrop 接受本表、拒绝外部文本与外部来源。
+        // 拖放数据边界：七行 writer 只写本表卡片 ID；validateDrop 接受本表、拒绝外部文本与外部来源。
         // 注意：这是直接调用 table data source 方法的模型级验证，真实鼠标拖拽由 Cua 验收（Task 7）。
         guard let table = allViews(editor).compactMap({ $0 as? NSTableView }).first,
               table.dataSource === editor else { fail("settings table missing") }
@@ -4853,16 +4844,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let mcpToggle = buttonWithID("CardToggle.mcp") else { fail("mcp toggle missing") }
         mcpToggle.performClick(nil)
         guard editor.layout.isVisible(.mcp) == false else { fail("mcp not hidden via checkbox") }
-        guard editor.layout.visibleOrder == [.quota, .peak, .resetCards, .usage, .daily] else { fail("hide touched other cards") }
+        guard editor.layout.visibleOrder == [.quota, .peak, .resetCards, .usage, .daily, .history] else { fail("hide touched other cards") }
         // 真实上移按钮事件：每日用量上移一格
         guard let dailyUp = buttonWithID("CardMoveUp.daily") else { fail("daily up button missing") }
         dailyUp.performClick(nil)
-        guard editor.layout.order == [.quota, .peak, .resetCards, .daily, .usage, .mcp] else { fail("daily not moved via button") }
+        guard editor.layout.order == [.quota, .peak, .resetCards, .daily, .usage, .history, .mcp] else { fail("daily not moved via button") }
         // 真实「完成」按钮：退出设置页并应用布局到实际卡片
         guard let doneButton = allViews(panelController.view).compactMap({ $0 as? NSButton }).first(where: { $0.title == "完成" }) else { fail("done button missing") }
         doneButton.performClick(nil)
         guard !showingCardSettings else { fail("settings did not close") }
-        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage"] else { fail("settings changes not applied \(cardOrder())") }
+        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage", "history"] else { fail("settings changes not applied \(cardOrder())") }
         // 重开设置页：必须重建新视图、保留内存布局与开关状态
         showCardSettings()
         guard let reopenedEditor = editorView() else { fail("reopened settings view missing") }
@@ -4881,7 +4872,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         guard popover.isShown else { fail("popover did not reopen") }
         guard showingCardSettings == false else { fail("settings leaked after popover reopen") }
-        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage"] else { fail("layout lost after popover reopen \(cardOrder())") }
+        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage", "history"] else { fail("layout lost after popover reopen \(cardOrder())") }
         restoreDefaultPanelLayout()
         guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
         guard UserDefaults.standard.data(forKey: GLMPanelLayout.defaultsKey) == productionLayoutData else { fail("preview wrote production layout defaults") }
@@ -6167,8 +6158,8 @@ enum GLMOfflineRegression {
             var customLayout = defaultLayout
             customLayout.setVisible(false, for: .mcp)
             customLayout.move(.daily, direction: .up)
-            try expect(customLayout.visibleOrder == [.quota, .peak, .resetCards, .daily, .usage], "layout hide or move")
-            try expect(!customLayout.isVisible(.mcp) && customLayout.order.count == 6, "hidden card removed from editor order")
+            try expect(customLayout.visibleOrder == [.quota, .peak, .resetCards, .daily, .usage, .history], "layout hide or move")
+            try expect(!customLayout.isVisible(.mcp) && customLayout.order.count == 7, "hidden card removed from editor order")
 
             let roundTrip = GLMPanelLayout.decode(try customLayout.encoded())
             try expect(roundTrip == customLayout, "layout JSON round trip")
@@ -6176,24 +6167,24 @@ enum GLMOfflineRegression {
 
             let legacyJSON = #"{"order":["usage","quota","daily","usage","futureCard"],"hidden":["mcp","futureCard"]}"#.data(using: .utf8)
             let migrated = GLMPanelLayout.decode(legacyJSON)
-            try expect(migrated.order == [.peak, .resetCards, .usage, .quota, .daily, .mcp], "legacy order/new card insertion")
+            try expect(migrated.order == [.peak, .resetCards, .usage, .quota, .daily, .history, .mcp], "legacy order/new card insertion")
             try expect(migrated.hidden == [.mcp], "unknown hidden ID retained")
-            try expect(migrated.isVisible(.peak) && migrated.isVisible(.resetCards), "missing new cards hidden by default")
+            try expect(migrated.isVisible(.peak) && migrated.isVisible(.resetCards) && migrated.isVisible(.history), "missing new cards hidden by default")
 
             var allHidden = GLMPanelLayout.default
             for id in GLMPanelCardID.allCases { allHidden.setVisible(false, for: id) }
-            try expect(allHidden.visibleOrder.isEmpty && allHidden.order.count == 6, "all-hidden state rejected")
+            try expect(allHidden.visibleOrder.isEmpty && allHidden.order.count == 7, "all-hidden state rejected")
 
             // 拖放目标位置等价模型：首项移到末尾、末项移到开头、同位置不变、越界钳制
             var moveLayout = GLMPanelLayout.default
             moveLayout.move(.quota, to: 99)
-            try expect(moveLayout.order == [.peak, .resetCards, .usage, .daily, .mcp, .quota], "move first to end")
+            try expect(moveLayout.order == [.peak, .resetCards, .usage, .daily, .history, .mcp, .quota], "move first to end")
             moveLayout.move(.quota, to: -3)
             try expect(moveLayout.order == GLMPanelCardID.allCases, "move last back to start clamps to 0")
             moveLayout.move(.peak, to: 1)
             try expect(moveLayout.order == GLMPanelCardID.allCases, "move to same position is a no-op")
             moveLayout.move(.mcp, to: 3)
-            try expect(moveLayout.order == [.quota, .peak, .resetCards, .mcp, .usage, .daily], "move to middle")
+            try expect(moveLayout.order == [.quota, .peak, .resetCards, .mcp, .usage, .daily, .history], "move to middle")
 
             let suite = "GLMLayoutTest.\(UUID().uuidString)"
             let defaults = UserDefaults(suiteName: suite)!
