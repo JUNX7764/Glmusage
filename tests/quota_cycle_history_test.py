@@ -15,6 +15,7 @@ class QuotaCycleHistoryTest(unittest.TestCase):
                         str(ROOT / "Sources/GLMQuotaCycleContext.swift"),
                         str(ROOT / "Sources/GLMQuotaCycleStore.swift"),
                         str(ROOT / "Sources/GLMQuotaCycleCoordinator.swift"),
+                        str(ROOT / "Sources/GLMPanelVisuals.swift"),
                         str(ROOT / "Sources/GLMQuotaCycleHistoryView.swift"),
                         str(ROOT / "tests/fixtures/quota-cycle-history/main.swift"),
                         "-o", str(cls.binary)], cwd=ROOT, check=True, timeout=120)

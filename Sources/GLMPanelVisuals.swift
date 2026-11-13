@@ -25,4 +25,18 @@ enum GLMPanelVisuals {
         isZero ? NSBezierPath(rect: rect)
                : topRoundedPath(in: rect, radius: dailyCornerRadius)
     }
+    static func historyBar(in column: NSRect, baseline: CGFloat, usedPercent: Double)
+        -> (track: NSRect, fill: NSRect?) {
+        let width = min(CGFloat(12), max(0, column.width - 4))
+        let height = max(0, column.height - baseline - 4)
+        let track = NSRect(x: column.midX - width / 2, y: baseline,
+                           width: width, height: height)
+        guard usedPercent.isFinite, usedPercent > 0, !track.isEmpty else {
+            return (track, nil)
+        }
+        let fraction = CGFloat(min(100, max(0, usedPercent)) / 100)
+        let fill = NSRect(x: track.minX, y: track.minY,
+                          width: track.width, height: track.height * fraction)
+        return (track, fill)
+    }
 }

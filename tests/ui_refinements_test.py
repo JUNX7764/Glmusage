@@ -33,3 +33,6 @@ class UIRefinementsTest(unittest.TestCase):
 
     def test_delta_chip(self):
         self.case("deltaChip")
+
+    def test_history_track(self):
+        self.case("historyTrack")

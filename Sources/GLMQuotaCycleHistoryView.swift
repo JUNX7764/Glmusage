@@ -73,7 +73,6 @@ final class GLMQuotaHistoryCanvas: NSView {
         for (i, rect) in frames.enumerated() {
             let record = records[i], highlighted = (hover ?? selected) == record.id
             let baseline = GLMQuotaHistoryGeometry.plotBaseline
-            let chartHeight = max(0, rect.height - baseline - 4)
             if record.end == nil || record.id == selected || highlighted {
                 accent.withAlphaComponent(highlighted ? 0.11 : record.id == selected ? 0.08 : 0.05).setFill()
                 let background = NSRect(x: rect.minX + 1, y: baseline - 2,
@@ -81,11 +80,20 @@ final class GLMQuotaHistoryCanvas: NSView {
                 NSBezierPath(roundedRect: background, xRadius: 4, yRadius: 4).fill()
             }
             let center = rect.midX
+            let geometry = GLMPanelVisuals.historyBar(in: rect,
+                baseline: GLMQuotaHistoryGeometry.plotBaseline,
+                usedPercent: record.lastObservation.usedPercent)
+            let trackPath = NSBezierPath(roundedRect: geometry.track, xRadius: 2, yRadius: 2)
             NSColor.secondaryLabelColor.withAlphaComponent(0.25).setFill()
-            NSBezierPath(roundedRect: NSRect(x: center - 8, y: baseline, width: 6, height: chartHeight), xRadius: 2, yRadius: 2).fill()
-            let usedHeight = chartHeight * CGFloat(max(0, min(100, record.lastObservation.usedPercent))) / 100
-            accent.withAlphaComponent(highlighted ? 1 : 0.72).setFill()
-            NSBezierPath(roundedRect: NSRect(x: center + 2, y: baseline, width: 6, height: max(2, usedHeight)), xRadius: 2, yRadius: 2).fill()
+            trackPath.fill()
+            if let fill = geometry.fill {
+                NSGraphicsContext.saveGraphicsState()
+                trackPath.addClip()
+                accent.withAlphaComponent(highlighted ? 1 : 0.72).setFill()
+                // 填充与灰槽完全同位，底部被 trackPath 裁剪为同一轮廓。
+                GLMPanelVisuals.topRoundedPath(in: fill, radius: 2).fill()
+                NSGraphicsContext.restoreGraphicsState()
+            }
             let text = GLMQuotaCycleDetails.dateLabel(record)
             let size = (text as NSString).size(withAttributes: labelAttributes)
             let dateFrame = GLMQuotaHistoryGeometry.dateFrame(in: rect)
@@ -112,7 +120,7 @@ final class GLMQuotaHistorySectionView: NSStackView {
         orientation = .vertical; alignment = .leading; spacing = 3; translatesAutoresizingMaskIntoConstraints = false
         let range = browser.visibleRange(records)
         let controls = NSStackView(); controls.orientation = .horizontal; controls.alignment = .centerY; controls.spacing = 5
-        let legend = NSTextField(labelWithString: "上限 / 已用"); legend.font = .systemFont(ofSize: 10); legend.textColor = .secondaryLabelColor
+        let legend = NSTextField(labelWithString: "已用 / 距上限"); legend.font = .systemFont(ofSize: 10); legend.textColor = .secondaryLabelColor
         controls.addArrangedSubview(legend)
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal); controls.addArrangedSubview(spacer)
         for (title, selector) in [("‹", #selector(older)), ((browser.pageAnchorID == nil ? "最近" : "历史") + "\(range.count)轮", #selector(latest)), ("›", #selector(newer)), ("更早", #selector(earlier))] {

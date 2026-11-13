@@ -259,6 +259,11 @@ case "chartGeometry":
         check(frames.count == 6, "six columns")
         check(frames.allSatisfy { $0.minX >= 0 && $0.maxX <= width && $0.width > 12 }, "columns in bounds")
         check(zip(frames, frames.dropFirst()).allSatisfy { $0.maxX <= $1.minX }, "no overlap")
+        for column in frames {
+            let bar = GLMPanelVisuals.historyBar(in: column, baseline: 31, usedPercent: 68)
+            check(bar.track.width == 12 && bar.track.minX >= column.minX && bar.track.maxX <= column.maxX, "slot within column")
+            check(bar.track.minY == 31 && bar.fill!.minY == 31 && bar.track.midX == column.midX, "aligned baseline and center")
+        }
     }
     print("PASS: chartGeometry")
 case "clockRollbackPending":

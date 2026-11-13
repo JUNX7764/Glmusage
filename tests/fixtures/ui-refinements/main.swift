@@ -48,6 +48,20 @@ case "deltaChip":
     check(!GLMDeltaChip.requiresTwoRows(halfWidth: 135, captionWidth: 40, chipWidth: 65), "normal width stays one row")
     check(GLMDeltaChip.requiresTwoRows(halfWidth: 105, captionWidth: 40, chipWidth: 77), "narrow long values must not truncate numbers")
     print("PASS: deltaChip")
+case "historyTrack":
+    let column = NSRect(x: 20, y: 0, width: 43, height: 92)
+    let zero = GLMPanelVisuals.historyBar(in: column, baseline: 31, usedPercent: 0)
+    check(zero.track.width == 12 && zero.track.midX == column.midX, "one centered 12pt slot")
+    check(zero.fill == nil, "0% does not fabricate usage")
+    let half = GLMPanelVisuals.historyBar(in: column, baseline: 31, usedPercent: 50)
+    check(abs(half.fill!.height / half.track.height - 0.5) < 0.0001, "fill is normalized")
+    check(half.fill!.minY == half.track.minY && half.fill!.width == half.track.width, "fill shares baseline and x")
+    let full = GLMPanelVisuals.historyBar(in: column, baseline: 31, usedPercent: 100)
+    check(full.fill == full.track, "100% fills the slot")
+    let tiny = GLMPanelVisuals.historyBar(in: column, baseline: 31, usedPercent: 0.4)
+    check(tiny.fill!.height < 1, "tiny use is not inflated to a 2pt bar")
+    check(GLMPanelVisuals.historyBar(in: column, baseline: 31, usedPercent: .nan).fill == nil, "nonfinite does not fill")
+    print("PASS: historyTrack")
 default:
     fputs("FAIL: unknown visual fixture\n", stderr); exit(1)
 }
