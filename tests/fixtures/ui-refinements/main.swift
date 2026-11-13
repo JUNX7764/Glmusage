@@ -39,6 +39,15 @@ case "tokenTransition":
     s.set(.nan, at: 14, animated: true)
     check(s.target == nil && !s.isAnimating, "nonfinite values do not animate")
     print("PASS: tokenTransition")
+case "deltaChip":
+    let font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+    for value in ["+100.0%", "-22.5%", "持平", "新增 9.99B", "数据不足"] {
+        let size = GLMDeltaChip.size(for: value, font: font)
+        check(size.height == 20 && size.width > 12, "chip has text and padding")
+    }
+    check(!GLMDeltaChip.requiresTwoRows(halfWidth: 135, captionWidth: 40, chipWidth: 65), "normal width stays one row")
+    check(GLMDeltaChip.requiresTwoRows(halfWidth: 105, captionWidth: 40, chipWidth: 77), "narrow long values must not truncate numbers")
+    print("PASS: deltaChip")
 default:
     fputs("FAIL: unknown visual fixture\n", stderr); exit(1)
 }

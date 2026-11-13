@@ -30,3 +30,6 @@ class UIRefinementsTest(unittest.TestCase):
 
     def test_token_transition(self):
         self.case("tokenTransition")
+
+    def test_delta_chip(self):
+        self.case("deltaChip")

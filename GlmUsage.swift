@@ -2416,80 +2416,117 @@ final class GLMDailyChartCanvas: NSView {
 // 两项比较：单行浅底圆角条 + 中间竖分隔线，两半各「标签+数值」靠近并整体居中，
 // 高约 30pt；数值按变化方向着色，缺数文案留在对应半区，不串组。
 final class GLMComparisonStrip: NSView {
+    private struct Entry {
+        let caption: NSTextField
+        let chip: GLMDeltaChip
+        let row: NSStackView
+    }
+    private var entries: [Entry] = []
+    private var stripHeight: NSLayoutConstraint!
+    private var stackHeight: NSLayoutConstraint!
+    private var dividerHeights: [NSLayoutConstraint] = []
+    private var isTwoRows = false
+
     init(pairs: [(label: String, outcome: GLMUsageComparison.Outcome)]) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        wantsLayer = true
-        layer?.cornerRadius = 6
-        heightAnchor.constraint(equalToConstant: 30).isActive = true
-        let strip = GLMPillBackground()
-        strip.radius = 6
-        strip.backgroundAlpha = 0.06
-        strip.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(strip)
-        NSLayoutConstraint.activate([strip.topAnchor.constraint(equalTo: topAnchor), strip.bottomAnchor.constraint(equalTo: bottomAnchor),
-                                     strip.leadingAnchor.constraint(equalTo: leadingAnchor), strip.trailingAnchor.constraint(equalTo: trailingAnchor)])
+        stripHeight = heightAnchor.constraint(equalToConstant: 30)
+        stripHeight.isActive = true
+        let background = GLMPillBackground()
+        background.radius = 6; background.backgroundAlpha = 0.02
+        background.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(background)
+        NSLayoutConstraint.activate([
+            background.leadingAnchor.constraint(equalTo: leadingAnchor),
+            background.trailingAnchor.constraint(equalTo: trailingAnchor),
+            background.topAnchor.constraint(equalTo: topAnchor),
+            background.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
         let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.distribution = .fillEqually
-        stack.spacing = 0
+        stack.orientation = .horizontal; stack.distribution = .fill
+        stack.alignment = .centerY; stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
-        NSLayoutConstraint.activate([stack.centerYAnchor.constraint(equalTo: centerYAnchor),
-                                     stack.heightAnchor.constraint(equalToConstant: 30),
-                                     stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-                                     stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4)])
+        stackHeight = stack.heightAnchor.constraint(equalToConstant: 30)
+        NSLayoutConstraint.activate([
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor), stackHeight,
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4)
+        ])
+        var firstHalf: NSView?
         for (index, pair) in pairs.enumerated() {
             if index > 0 {
-                let divider = NSBox()
-                divider.boxType = .separator
+                let divider = NSBox(); divider.boxType = .separator
                 divider.translatesAutoresizingMaskIntoConstraints = false
                 stack.addArrangedSubview(divider)
-                divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
-                divider.heightAnchor.constraint(equalToConstant: 18).isActive = true
+                let h = divider.heightAnchor.constraint(equalToConstant: 18)
+                dividerHeights.append(h)
+                NSLayoutConstraint.activate([divider.widthAnchor.constraint(equalToConstant: 1), h])
             }
             let half = NSView()
             half.translatesAutoresizingMaskIntoConstraints = false
             half.toolTip = index == 0 ? "今日（未结束）与前一日比较" : "最近 7 天（含今日）与此前 7 天比较"
-            let row = NSStackView()
-            row.orientation = .horizontal
-            row.alignment = .centerY
-            row.spacing = 4
-            row.translatesAutoresizingMaskIntoConstraints = false
-            let caption = NSTextField(wrappingLabelWithString: pair.label)
+            stack.addArrangedSubview(half)
+            half.heightAnchor.constraint(equalTo: stack.heightAnchor).isActive = true
+            if let firstHalf {
+                half.widthAnchor.constraint(equalTo: firstHalf.widthAnchor).isActive = true
+            } else { firstHalf = half }
+            let caption = NSTextField(labelWithString: pair.label)
             caption.font = .systemFont(ofSize: 10)
             caption.textColor = .secondaryLabelColor
-            caption.lineBreakMode = .byTruncatingTail
-            caption.maximumNumberOfLines = 1
-            let value = NSTextField(wrappingLabelWithString: pair.outcome.text)
-            value.font = .systemFont(ofSize: 11, weight: .semibold)
+            let valueColor: NSColor
             switch pair.outcome.direction {
             case .increase:
-                value.textColor = NSColor(name: nil) { appearance in
+                valueColor = NSColor(name: nil) { appearance in
                     let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
                     return dark ? NSColor(srgbRed: 0.44, green: 0.78, blue: 0.61, alpha: 1)
                                 : NSColor(srgbRed: 0.13, green: 0.45, blue: 0.31, alpha: 1)
                 }
             case .decrease:
-                value.textColor = NSColor(name: nil) { appearance in
+                valueColor = NSColor(name: nil) { appearance in
                     let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
                     return dark ? NSColor(srgbRed: 0.91, green: 0.64, blue: 0.37, alpha: 1)
                                 : NSColor(srgbRed: 0.64, green: 0.32, blue: 0.08, alpha: 1)
                 }
-            case .neutral:
-                value.textColor = .secondaryLabelColor
+            case .neutral: valueColor = .secondaryLabelColor
             }
-            value.lineBreakMode = .byTruncatingTail
-            value.maximumNumberOfLines = 1
-            row.addArrangedSubview(caption)
-            row.addArrangedSubview(value)
+            let chip = GLMDeltaChip(text: pair.outcome.text, foreground: valueColor)
+            let row = NSStackView(views: [caption, chip])
+            row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 4
+            row.translatesAutoresizingMaskIntoConstraints = false
             half.addSubview(row)
-            NSLayoutConstraint.activate([row.centerXAnchor.constraint(equalTo: half.centerXAnchor),
-                                         row.centerYAnchor.constraint(equalTo: half.centerYAnchor)])
-            stack.addArrangedSubview(half)
+            NSLayoutConstraint.activate([
+                row.centerXAnchor.constraint(equalTo: half.centerXAnchor),
+                row.centerYAnchor.constraint(equalTo: half.centerYAnchor),
+                row.widthAnchor.constraint(lessThanOrEqualTo: half.widthAnchor)
+            ])
+            entries.append(Entry(caption: caption, chip: chip, row: row))
         }
     }
-    required init?(coder: NSCoder) { fatalError() }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
+
+    override func layout() {
+        super.layout()
+        guard bounds.width > 0, !entries.isEmpty else { return }
+        let available = bounds.width - 8 - CGFloat(max(0, entries.count - 1))
+        let halfWidth = max(0, available / CGFloat(entries.count))
+        let next = entries.contains {
+            GLMDeltaChip.requiresTwoRows(halfWidth: halfWidth,
+                captionWidth: $0.caption.intrinsicContentSize.width,
+                chipWidth: $0.chip.intrinsicContentSize.width)
+        }
+        guard next != isTwoRows else { return }
+        isTwoRows = next
+        for entry in entries {
+            entry.row.orientation = next ? .vertical : .horizontal
+            entry.row.alignment = next ? .centerX : .centerY
+            entry.row.spacing = next ? 2 : 4
+        }
+        stripHeight.constant = next ? 44 : 30
+        stackHeight.constant = next ? 44 : 30
+        dividerHeights.forEach { $0.constant = next ? 30 : 18 }
+    }
 }
 
 // 「每日用量」整块：标题行 + 选中行 + 柱图 + 刻度 + 比较条。
