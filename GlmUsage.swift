@@ -2343,10 +2343,10 @@ final class GLMDailyChartCanvas: NSView {
             let x = CGFloat(index) * columnWidth + inset
             accent.withAlphaComponent(index == selectedIndex ? 1 : 0.4).setFill()
             if tokens == 0 {
-                NSRect(x: x, y: 1, width: width, height: 2).fill()   // 有记录的零日 = 基线短柱
+                GLMPanelVisuals.dailyPath(in: NSRect(x: x, y: 1, width: width, height: 2), isZero: true).fill()   // 有记录的零日 = 基线短柱
             } else {
                 let height = maxTokens > 0 ? max(3, chartHeight * CGFloat(tokens / maxTokens)) : 3
-                NSRect(x: x, y: 1, width: width, height: min(chartHeight, height)).fill()
+                GLMPanelVisuals.dailyPath(in: NSRect(x: x, y: 1, width: width, height: min(chartHeight, height)), isZero: false).fill()
             }
         }
     }
