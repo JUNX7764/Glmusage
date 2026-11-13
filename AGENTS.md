@@ -2,7 +2,7 @@
 
 ## 工作区状态
 
-GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏工具，用于展示 GLM Coding Plan 额度、用量、峰谷与重置卡。当前源码集中在 `GlmUsage.swift`，无第三方依赖；构建需要 macOS 26+ SDK 与 Xcode CLT。
+GlmUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏工具，用于展示 GLM Coding Plan 额度、用量、峰谷与重置卡。应用入口与面板组装在 `GlmUsage.swift`，卡片布局与设置视图在 `PanelCustomization.swift`；无第三方依赖，构建需要 macOS 26+ SDK 与 Xcode CLT。
 
 ## 构建与验证
 
