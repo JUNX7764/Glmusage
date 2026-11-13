@@ -5390,6 +5390,37 @@ enum GLMOfflineRegression {
             try expect(GLMPanelBackgroundStyle.parse(nil) == .solid && GLMPanelBackgroundStyle.parse("bad") == .solid, "background default")
             try expect(GLMPanelBackgroundStyle.liquidGlass.effective(liquidSupported: false, reduceTransparency: false) == .classicMaterial, "background legacy fallback")
             try expect(GLMPanelBackgroundStyle.liquidGlass.effective(liquidSupported: true, reduceTransparency: true) == .solid, "background transparency fallback")
+
+            let defaultLayout = GLMPanelLayout.default
+            try expect(defaultLayout.order == GLMPanelCardID.allCases, "layout default order")
+            try expect(defaultLayout.visibleOrder == GLMPanelCardID.allCases, "layout default visibility")
+
+            var customLayout = defaultLayout
+            customLayout.setVisible(false, for: .mcp)
+            customLayout.move(.daily, direction: .up)
+            try expect(customLayout.visibleOrder == [.quota, .peak, .resetCards, .daily, .usage], "layout hide or move")
+            try expect(!customLayout.isVisible(.mcp) && customLayout.order.count == 6, "hidden card removed from editor order")
+
+            let roundTrip = GLMPanelLayout.decode(try customLayout.encoded())
+            try expect(roundTrip == customLayout, "layout JSON round trip")
+            try expect(GLMPanelLayout.decode(Data("bad".utf8)) == .default, "invalid layout did not fall back")
+
+            let legacyJSON = #"{"order":["usage","quota","daily","usage","futureCard"],"hidden":["mcp","futureCard"]}"#.data(using: .utf8)
+            let migrated = GLMPanelLayout.decode(legacyJSON)
+            try expect(migrated.order == [.peak, .resetCards, .usage, .quota, .daily, .mcp], "legacy order/new card insertion")
+            try expect(migrated.hidden == [.mcp], "unknown hidden ID retained")
+            try expect(migrated.isVisible(.peak) && migrated.isVisible(.resetCards), "missing new cards hidden by default")
+
+            var allHidden = GLMPanelLayout.default
+            for id in GLMPanelCardID.allCases { allHidden.setVisible(false, for: id) }
+            try expect(allHidden.visibleOrder.isEmpty && allHidden.order.count == 6, "all-hidden state rejected")
+
+            let suite = "GLMLayoutTest.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            customLayout.save(to: defaults)
+            try expect(GLMPanelLayout.load(from: defaults) == customLayout, "UserDefaults layout round trip")
+
             let surfaceCard = GLMPanelCard()
             var previousFill: CGColor?
             for name in [NSAppearance.Name.aqua, .darkAqua] {
