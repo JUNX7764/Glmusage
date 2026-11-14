@@ -220,7 +220,6 @@ struct GLMQuotaCycleReducer {
 struct GLMQuotaHistoryBrowser {
     var loadedLimit = 12
     var selectedCycleID: UUID?
-    var hoveredCycleID: UUID?
     var pageAnchorID: UUID? // nil means follow the latest page
     let pageSize = 6
 
@@ -256,30 +255,46 @@ struct GLMQuotaHistoryBrowser {
 }
 
 enum GLMQuotaCycleDetails {
+    // 展示用 formatter 静态缓存：柱图每帧逐列取日期标签、悬停/选择重建明细行，
+    // 新建 DateFormatter/NumberFormatter 开销大（与主文件 Fmt 同一口径；仅主线程使用）。
+    private static let daySlash: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "MM/dd"
+        return f
+    }()
+    private static let zhDaySlash: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "MM/dd"
+        return f
+    }()
+    private static let fullLocal: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateStyle = .medium; f.timeStyle = .medium
+        return f
+    }()
+    private static let groupedNumber: NumberFormatter = {
+        let n = NumberFormatter(); n.locale = Locale(identifier: "en_US"); n.numberStyle = .decimal; n.maximumFractionDigits = 2
+        return n
+    }()
+
     // A presentation-only estimate; the stored first observation and boundary evidence stay intact.
     static func displayedStart(_ record: GLMQuotaCycleRecord) -> Date {
         record.startKind == .firstObserved ? record.expectedResetAt.addingTimeInterval(-7 * 86400) : record.firstObservedAt
     }
     static func dateLabel(_ record: GLMQuotaCycleRecord) -> String {
-        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "MM/dd"
-        return (record.startKind == .firstObserved ? "~" : "") + f.string(from: displayedStart(record))
+        (record.startKind == .firstObserved ? "~" : "") + daySlash.string(from: displayedStart(record))
     }
     static func startExplanation(_ record: GLMQuotaCycleRecord) -> String {
-        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateStyle = .medium; f.timeStyle = .medium
-        let first = "首次成功观测：" + f.string(from: record.firstObservedAt)
+        let first = "首次成功观测：" + fullLocal.string(from: record.firstObservedAt)
         return record.startKind == .firstObserved
             ? "起点按预计重置时间减7天推算，实际开始时刻未知，不代表完整记录了7天；" + first
             : "开始边界基于观测，非服务端准确时刻；" + first
     }
     static func lines(_ record: GLMQuotaCycleRecord) -> (String, String) {
-        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "MM/dd"
         let prefix: String
         switch record.startKind {
         case .firstObserved: prefix = "推算"
         case .afterGap, .specificationChanged: prefix = "观测"
         case .observedTransition, .redeemed: prefix = "约"
         }
-        let start = prefix + f.string(from: displayedStart(record))
+        let start = prefix + zhDaySlash.string(from: displayedStart(record))
         let reason: String
         switch record.end {
         case .natural: reason = "正常到期"
@@ -291,16 +306,15 @@ enum GLMQuotaCycleDetails {
         }
         let period: String
         if record.end == nil {
-            period = "\(start)–至今（预计\(f.string(from: record.expectedResetAt))）"
+            period = "\(start)–至今（预计\(zhDaySlash.string(from: record.expectedResetAt))）"
         } else {
             let end = record.end == .natural ? record.expectedResetAt : record.boundaryUpper ?? record.lastObservation.observedAt
-            period = "\(start)–\(f.string(from: end))（约）"
+            period = "\(start)–\(zhDaySlash.string(from: end))（约）"
         }
-        let n = NumberFormatter(); n.locale = Locale(identifier: "en_US"); n.numberStyle = .decimal; n.maximumFractionDigits = 2
         let obs = record.lastObservation
-        let remaining = n.string(from: NSNumber(value: obs.remainingCredits)) ?? "—"
-        let limit = n.string(from: NSNumber(value: obs.limitCredits)) ?? "—"
-        let percent = n.string(from: NSNumber(value: obs.usedPercent)) ?? "—"
+        let remaining = groupedNumber.string(from: NSNumber(value: obs.remainingCredits)) ?? "—"
+        let limit = groupedNumber.string(from: NSNumber(value: obs.limitCredits)) ?? "—"
+        let percent = groupedNumber.string(from: NSNumber(value: obs.usedPercent)) ?? "—"
         let label = record.end == nil ? "当前剩余" : "最后观测剩余"
         let full = obs.remainingCredits == 0 ? " · 已用满（观测余额为 0）" : ""
         return ("\(period) · \(reason)", "已用 \(percent)% · \(label) \(remaining) / \(limit) 积分\(full)")

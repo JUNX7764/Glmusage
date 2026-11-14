@@ -113,6 +113,11 @@ final class GLMQuotaHistorySectionView: NSStackView {
     private var records: [GLMQuotaCycleRecord]
     private var browser: GLMQuotaHistoryBrowser
     private let changed: (GLMQuotaHistoryBrowser, Bool) -> Void
+    // 悬停/选择每次重建明细都要拼观测时间；formatter 静态缓存（仅主线程使用）
+    private static let observationTimeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateStyle = .medium; f.timeStyle = .medium
+        return f
+    }()
     init(records: [GLMQuotaCycleRecord], browser: GLMQuotaHistoryBrowser, accent: NSColor,
          pending: Bool, status: String?, changed: @escaping (GLMQuotaHistoryBrowser, Bool) -> Void) {
         self.records = records; self.browser = browser; self.changed = changed
@@ -183,8 +188,7 @@ final class GLMQuotaHistorySectionView: NSStackView {
             + " · 历史按套餐连接保存，更换 Key 不自动合并" + (suffix.isEmpty ? "" : " · " + suffix)
         secondLine.toolTip = lines.1 + (suffix.isEmpty ? "" : " · " + suffix)
         canvas.setAccessibilityLabel("额度周期回顾")
-        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.dateStyle = .medium; formatter.timeStyle = .medium
-        let observationTime = "最后成功观测：" + formatter.string(from: record.lastObservation.observedAt)
+        let observationTime = "最后成功观测：" + Self.observationTimeFormatter.string(from: record.lastObservation.observedAt)
         firstLine.toolTip = (firstLine.toolTip ?? "") + " · " + observationTime
         secondLine.toolTip = (secondLine.toolTip ?? "") + " · " + observationTime
         canvas.setAccessibilityValue(lines.0 + "，" + lines.1 + "，" + GLMQuotaCycleDetails.startExplanation(record)

@@ -578,9 +578,10 @@ echo "build" >> "$MOCK_LOG"
         self.assertIn("--notes-file", gh_line)
 
     def test_missing_or_empty_notes_block_release(self):
+        # prepare_release 的 mkdir 不幂等，项目只建一次，两种说明内容在同一项目上轮换
+        project = self.prepare_release()
+        notes = project / "release-notes" / "v9.9.9.md"
         for content in (None, "   \n"):
-            project = self.prepare_release() if content is None else project
-            notes = project / "release-notes" / "v9.9.9.md"
             if content is None: notes.unlink()
             else: notes.write_text(content)
             result = self.run_release(project)
