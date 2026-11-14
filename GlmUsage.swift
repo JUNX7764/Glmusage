@@ -639,12 +639,12 @@ enum GLMUsageComparison {
         }
     }
 
-    /// 窗口求和：任一日缺失 → nil（缺失不能当 0 参与比较）
-    static func sum(_ buckets: [GLMDayBucket?]) -> Double? {
+    /// 窗口求和：任一日缺失（tokens=nil）→ nil（缺失不能当 0 参与比较）
+    static func sum(_ buckets: [GLMDayBucket]) -> Double? {
         guard !buckets.isEmpty else { return nil }
         var total: Double = 0
         for bucket in buckets {
-            guard let tokens = bucket?.tokens else { return nil }
+            guard let tokens = bucket.tokens else { return nil }
             total += tokens
         }
         return total
@@ -664,8 +664,8 @@ enum GLMUsageComparison {
     static func dailyPair(buckets: [GLMDayBucket]) -> (dayOnDay: Outcome, weekOnWeek: Outcome) {
         let dayOnDay = outcome(current: buckets.last?.tokens,
                                base: buckets.count >= 2 ? buckets[buckets.count - 2].tokens : nil)
-        let weekCurrent = buckets.count >= 7 ? sum(Array(buckets.suffix(7)).map { Optional($0) }) : nil
-        let weekBase = buckets.count >= 14 ? sum(buckets.suffix(14).prefix(7).map { Optional($0) }) : nil
+        let weekCurrent = buckets.count >= 7 ? sum(Array(buckets.suffix(7))) : nil
+        let weekBase = buckets.count >= 14 ? sum(Array(buckets.suffix(14).prefix(7))) : nil
         return (dayOnDay, outcome(current: weekCurrent, base: weekBase))
     }
 }
@@ -2245,7 +2245,6 @@ final class GLMQuotaBar: NSView {
 final class GLMPillBackground: NSView {
     var radius: CGFloat = 4
     var backgroundAlpha: CGFloat = 0.12
-    var useSecondaryLabel: Bool = true
     var planTier: GLMPlanTier?
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -2261,7 +2260,7 @@ final class GLMPillBackground: NSView {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             layer?.cornerRadius = radius
             layer?.masksToBounds = true
-            let base: NSColor = planTier?.theme ?? (useSecondaryLabel ? .secondaryLabelColor : .labelColor)
+            let base: NSColor = planTier?.theme ?? .secondaryLabelColor
             let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             layer?.backgroundColor = base.withAlphaComponent(planTier == nil ? backgroundAlpha : (dark ? 0.19 : 0.10)).cgColor
         }
