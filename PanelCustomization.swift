@@ -1,7 +1,7 @@
 import Foundation
 
 enum GLMPanelCardID: String, CaseIterable, Codable {
-    case quota, peak, resetCards, usage, daily, history, mcp
+    case quota, peak, resetCards, usage, daily, history, mcp, speed, cache
 
     var title: String {
         switch self {
@@ -12,6 +12,8 @@ enum GLMPanelCardID: String, CaseIterable, Codable {
         case .daily: return "每日用量"
         case .history: return "额度周期回顾"
         case .mcp: return "MCP 工具"
+        case .speed: return "模型速度"
+        case .cache: return "缓存命中"
         }
     }
 }
