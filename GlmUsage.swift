@@ -503,6 +503,237 @@ enum GLMStartPlanUsage {
     }
 }
 
+/// 模型速度卡 + 缓存命中卡的本机只读统计（一次窗口查询同时产出两组数据）。
+/// 数据事实（2026-11-15 实测，docs/plans/2026-11-15-speed-cache-cards.md）：
+/// - 表 `model_usage` 每行 = 一次实际请求尝试（重试各占一行），时间戳为毫秒。
+/// - 近 7 天 decode 速度基线：glm-5.3-flashx 153.2 tok/s/首字 2.3s、GLM-5.3-Flash 58.1/3.9s、
+///   k3.1-pro 39.7/8.7s、claude-sonnet-5-5 130.6/6.4s；GLM-5.3-Flash 有 2354 请求仅 1712 个
+///   有效速度样本（73%）——tok/s 只基于有效速度样本计算，非流式/失败的请求不参与。
+/// - `input_tokens` 即总输入、已包含缓存部分（cache_read_input_tokens ⊆ input_tokens，
+///   13739 行含缓存样本中 cache_read > input 反例为 0）；`cache_creation_input_tokens`
+///   本机当前全为 0，但实现不得假设恒为 0，按字段语义并入输入侧理解。
+/// - 近 7 天缓存基线：GLM-5.3-Flash 96%（316.3M/328.4M）、k3.1-pro 98%、glm-5.3-flashx 97%、
+///   claude-sonnet-5-5 76%（24.0M/31.8M）；个别模型整窗无缓存 → 显示 `—` 而非 0%。
+/// 口径（实现逐条对齐计划，不得自行发挥）：
+/// - 剔除行：`cancelled_by_user = 1`、`status = 'running'`；模型按小写分组，显示名保留
+///   首次（最早）出现的大小写（对齐 GLMStartPlanUsage.merging 约定）。
+/// - decode 速度 = 1000 × SUM(output_tokens) / SUM(completed_at − first_token_at)，按模型
+///   分组加权汇总，不做单请求平均；有效样本 = first_token_at 非空且 completed_at > first_token_at
+///   且 output_tokens > 0。
+/// - TTFT = AVG(time_to_first_token_ms)，仅统计 > 0 的行；显示一位小数秒，tok/s 显示整数。
+/// - 命中率 = SUM(cache_read)/SUM(input)（input 为含缓存的总输入，整体行 = 全模型合计比值）；
+///   `input_tokens ≤ 0` 的行不进任何分母；整窗无 cache_read>0 且 cache_creation>0 的模型
+///   命中率为 nil（界面显示 `—`，与真实 0% 严格区分）。
+/// - 缺表/库不存在 → 空快照（旧版 ZCode 合法状态）；schema 不识别（缺列/字段类型异常）→
+///   ReadFailure 明确异常态，绝不静默置零。
+/// - 2026-11-15 视觉对齐修订：明细行统计文案拆为两列右对齐（速度「tok/s|首字」、
+///   缓存「命中|输入」），不再以 " · " 连接整串；仅文案函数返回形态变化，口径不变。
+enum GLMLocalModelStats {
+    struct ReadFailure: Error {}
+
+    /// 两卡共享的统计周期；窗口起点日界对齐 Start Plan 读取器（本地自然日 0 点起算）
+    enum Period: Int, CaseIterable {
+        case today = 0, sevenDays = 1, thirtyDays = 2
+
+        var label: String {
+            switch self {
+            case .today: return "今天"
+            case .sevenDays: return "近 7 天"
+            case .thirtyDays: return "近 30 天"
+            }
+        }
+
+        /// 窗口起点：今天 = 本地自然日 0 点；滚动窗 = now−7/30 天（load 内再做 startOfDay 对齐）
+        func windowStart(now: Date, calendar: Calendar = .current) -> Date {
+            switch self {
+            case .today: return calendar.startOfDay(for: now)
+            case .sevenDays: return now.addingTimeInterval(-7 * 86_400)
+            case .thirtyDays: return now.addingTimeInterval(-30 * 86_400)
+            }
+        }
+
+        /// 空窗口文案（计划 UI 规格）：今天周期显示「今日样本不足」/「今日暂无数据」，均不算异常；
+        /// 非 today 周期用通用文案，不把别的周期误标成「今日」。
+        var emptySpeedText: String { self == .today ? "今日样本不足" : "样本不足" }
+        var emptyCacheText: String { self == .today ? "今日暂无数据" : "暂无数据" }
+    }
+
+    /// 单个模型（或缓存卡「整体」行）在一个窗口内的统计
+    struct ModelRow: Equatable {
+        let name: String              // 首次出现的显示名（大小写保留）
+        let requests: Int             // 通用剔除后的请求总数（有效样本占比的排障参考）
+        let decodeSamples: Int        // 有效速度样本数
+        let decodeTps: Double?        // 1000×Σ输出/Σ毫秒；无有效样本 → nil
+        let avgTtftMs: Double?        // AVG(time_to_first_token_ms)，仅统计 > 0；无 → nil
+        let outputTokens: Double      // 窗口内全部纳入行的输出合计（速度卡排序依据）
+        let inputTokens: Double       // input_tokens>0 行的输入合计（已含缓存；缓存卡排序依据）
+        let cacheReadTokens: Double   // input_tokens>0 行的缓存读取合计
+        let cacheHitRate: Double?     // Σcache_read/Σinput；无缓存活动 → nil（显示 —）
+    }
+
+    /// 一次窗口查询的产出。rows 保持时序首现顺序；两卡各自取所需过滤与排序，
+    /// 共用同一份结果（一次 SQL 同时喂两张卡）。
+    struct Snapshot: Equatable {
+        let rows: [ModelRow]
+        let overall: ModelRow?        // 缓存卡置顶「整体」行；窗口无行 → nil
+
+        /// 速度卡行：窗口内有输出 Token 的模型，按 output_tokens 降序（平局按名称稳定展示）
+        func speedRows() -> [ModelRow] {
+            rows.filter { $0.outputTokens > 0 }
+                .sorted { $0.outputTokens != $1.outputTokens
+                    ? $0.outputTokens > $1.outputTokens
+                    : $0.name.lowercased() < $1.name.lowercased() }
+        }
+
+        /// 缓存卡行：窗口内有输入量的模型，按 input_tokens 降序（缓存与输入量直接相关）
+        func cacheRows() -> [ModelRow] {
+            rows.filter { $0.inputTokens > 0 }
+                .sorted { $0.inputTokens != $1.inputTokens
+                    ? $0.inputTokens > $1.inputTokens
+                    : $0.name.lowercased() < $1.name.lowercased() }
+        }
+    }
+
+    /// 速度卡行统计文案，拆两列返回，等宽数字字体下各列在 statsLine 固定列宽内右对齐成列。
+    /// 列A = "153 tok/s"（无有效样本 → "—"）；列B = "首字2.3s"（无 TTFT → "—"）。
+    /// tok/s 只基于有效速度样本；decodeSamples 保留在读取器输出中供排障与回归使用。
+    static func speedStat(_ row: ModelRow) -> (speed: String, ttft: String) {
+        let speed = row.decodeTps.map { "\(Int($0.rounded())) tok/s" } ?? "—"
+        let ttft = row.avgTtftMs.flatMap { $0.isFinite ? String(format: "首字%.1fs", $0 / 1_000) : nil } ?? "—"
+        return (speed, ttft)
+    }
+
+    /// 缓存卡行统计文案，拆两列：列A = "96% 命中"（无缓存活动模型 → "— 命中"，与 0% 区分）；
+    /// 列B = "输入328M"
+    static func cacheStat(_ row: ModelRow) -> (hit: String, input: String) {
+        let hit = row.cacheHitRate.map { Fmt.pct($0) + " 命中" } ?? "— 命中"
+        return (hit, "输入\(Fmt.compactTokens(row.inputTokens))")
+    }
+
+    /// 读取一个时间窗的统计（两卡共享一次查询）。只读打开 + busy timeout 1s；
+    /// 库文件不存在或 model_usage 缺表 → 空快照（旧版 ZCode 合法状态）；表存在但缺列或
+    /// 字段类型不识别 → ReadFailure（明确异常态，绝不静默置零）。
+    static func load(from: Date, to: Date,
+                     databasePath: String = NSHomeDirectory() + "/.zcode/cli/db/db.sqlite",
+                     calendar: Calendar = .current) throws -> Snapshot {
+        guard FileManager.default.fileExists(atPath: databasePath) else { return Snapshot(rows: [], overall: nil) }
+        var database: OpaquePointer?
+        let opened = sqlite3_open_v2(databasePath, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil)
+        defer { sqlite3_close(database) }
+        guard opened == SQLITE_OK else { throw ReadFailure() }
+        sqlite3_busy_timeout(database, 1_000)
+        // 通用剔除（计划口径）：cancelled_by_user=1 与 status='running' 的行不进任何统计；
+        // 按时间升序读取，保证模型显示名保留首次（最早）出现的大小写。
+        let query = """
+            SELECT started_at, model_id, status, cancelled_by_user, output_tokens,
+                   first_token_at, completed_at, time_to_first_token_ms,
+                   input_tokens, cache_read_input_tokens, cache_creation_input_tokens
+            FROM model_usage
+            WHERE started_at >= ? AND started_at <= ?
+              AND COALESCE(cancelled_by_user, 0) != 1
+              AND COALESCE(status, '') != 'running'
+            ORDER BY started_at ASC
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK else {
+            // 尚无逐次请求表的旧版 ZCode → 空态；表结构不识别（缺列）→ 明确失败，不静默造 0
+            if String(cString: sqlite3_errmsg(database)) == "no such table: model_usage" {
+                return Snapshot(rows: [], overall: nil)
+            }
+            throw ReadFailure()
+        }
+        // 日界对齐 Start Plan 读取器：窗口首日按本地自然日 0 点准入
+        sqlite3_bind_double(statement, 1, calendar.startOfDay(for: from).timeIntervalSince1970 * 1_000)
+        sqlite3_bind_double(statement, 2, to.timeIntervalSince1970 * 1_000)
+        struct Accum {
+            var displayName: String
+            var requests = 0
+            var samples = 0
+            var outputTokens: Double = 0
+            var sampleOutput: Double = 0
+            var sampleDurationMs: Double = 0
+            var ttftSum: Double = 0
+            var ttftCount = 0
+            var inputTokens: Double = 0
+            var cacheReadTokens: Double = 0
+            var hasCacheActivity = false
+        }
+        var order: [String] = []
+        var accums: [String: Accum] = [:]
+        func cell(_ index: Int32) throws -> Double? {
+            switch sqlite3_column_type(statement, index) {
+            case SQLITE_INTEGER, SQLITE_FLOAT: return sqlite3_column_double(statement, index)
+            case SQLITE_NULL: return nil
+            default: throw ReadFailure()   // 字段类型不识别 = schema 守卫，不静默造 0
+            }
+        }
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
+            guard sqlite3_column_type(statement, 0) == SQLITE_INTEGER,
+                  let rawModel = sqlite3_column_text(statement, 1) else { throw ReadFailure() }
+            let model = String(cString: rawModel).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !model.isEmpty else { throw ReadFailure() }
+            let output = try cell(4) ?? 0
+            let firstToken = try cell(5)
+            let completed = try cell(6)
+            let ttft = try cell(7)
+            let input = try cell(8) ?? 0
+            let cacheRead = try cell(9) ?? 0
+            let cacheCreation = try cell(10) ?? 0
+            let key = model.lowercased()
+            if accums[key] == nil { order.append(key); accums[key] = Accum(displayName: model) }
+            var accum = accums[key]!
+            accum.requests += 1
+            accum.outputTokens += output
+            // 有效速度样本：first_token_at 非空且 completed_at > first_token_at 且 output_tokens > 0
+            if firstToken != nil, completed != nil, completed! > firstToken!, output > 0 {
+                accum.samples += 1
+                accum.sampleOutput += output
+                accum.sampleDurationMs += completed! - firstToken!
+            }
+            // TTFT 仅统计 > 0 的行
+            if let ttft, ttft > 0 { accum.ttftSum += ttft; accum.ttftCount += 1 }
+            // 缓存活动 = 任一纳入行 cache_read>0 或 cache_creation>0（与 input 行数无关，计划口径字面）
+            if cacheRead > 0 || cacheCreation > 0 { accum.hasCacheActivity = true }
+            // input_tokens ≤ 0 的行不进任何分母/分子（除零守卫）
+            if input > 0 {
+                accum.inputTokens += input
+                accum.cacheReadTokens += cacheRead
+            }
+            accums[key] = accum
+            step = sqlite3_step(statement)
+        }
+        guard step == SQLITE_DONE else { throw ReadFailure() }
+        let rows = order.map { key -> ModelRow in
+            let a = accums[key]!
+            return ModelRow(name: a.displayName,
+                            requests: a.requests,
+                            decodeSamples: a.samples,
+                            decodeTps: a.samples > 0 ? 1_000 * a.sampleOutput / a.sampleDurationMs : nil,
+                            avgTtftMs: a.ttftCount > 0 ? a.ttftSum / Double(a.ttftCount) : nil,
+                            outputTokens: a.outputTokens,
+                            inputTokens: a.inputTokens,
+                            cacheReadTokens: a.cacheReadTokens,
+                            cacheHitRate: a.hasCacheActivity && a.inputTokens > 0
+                                ? a.cacheReadTokens / a.inputTokens : nil)
+        }
+        if rows.isEmpty { return Snapshot(rows: [], overall: nil) }
+        let totalInput = rows.reduce(0.0) { $0 + $1.inputTokens }
+        let totalCacheRead = rows.reduce(0.0) { $0 + $1.cacheReadTokens }
+        let anyActivity = order.contains { accums[$0]!.hasCacheActivity }
+        let overall = ModelRow(name: "整体",
+                               requests: rows.reduce(0) { $0 + $1.requests },
+                               decodeSamples: rows.reduce(0) { $0 + $1.decodeSamples },
+                               decodeTps: nil, avgTtftMs: nil,
+                               outputTokens: rows.reduce(0.0) { $0 + $1.outputTokens },
+                               inputTokens: totalInput,
+                               cacheReadTokens: totalCacheRead,
+                               cacheHitRate: anyActivity && totalInput > 0 ? totalCacheRead / totalInput : nil)
+        return Snapshot(rows: rows, overall: overall)
+    }
+}
+
 // MARK: - 每日用量（近 30 天，含今日未走完的部分累计）
 //
 // 数据来源：30 天慢刷新的 model-usage 响应 + 本机 Start Plan 逐次用量，不新增请求/定时器。
@@ -1581,6 +1812,25 @@ enum Fmt {
     static func credits(_ v: Double) -> String {
         guard v.isFinite, v >= 0, let n = Int(exactly: v.rounded()) else { return "超出范围" }
         return n.formatted(.number.grouping(.automatic))
+    }
+    // 输入量缩写（缓存命中卡，计划 UI 规格 "输入328M"/"输入2.5M"/"输入864K"）：
+    // 3 位有效数字自适应 K/M/B 并去尾零；与 tokens() 的固定位数缩写并存，各有用途
+    static func compactTokens(_ v: Double) -> String {
+        guard v.isFinite, v >= 0 else { return "超出范围" }
+        func scaled(_ unit: Double, suffix: String) -> String {
+            let s = v / unit
+            let decimals = s >= 100 ? 0 : (s >= 10 ? 1 : 2)
+            var text = String(format: "%.\(decimals)f", s)
+            if text.contains(".") {
+                while text.hasSuffix("0") { text.removeLast() }
+                if text.hasSuffix(".") { text.removeLast() }
+            }
+            return text + suffix
+        }
+        if v >= 1_000_000_000 { return scaled(1_000_000_000, suffix: "B") }
+        if v >= 1_000_000 { return scaled(1_000_000, suffix: "M") }
+        if v >= 1_000 { return scaled(1_000, suffix: "K") }
+        return String(format: "%.0f", v)
     }
     static func count(_ v: Double) -> String {
         guard let n = GLMNumber.integer(v), n >= 0 else { return "超出范围" }
@@ -2850,13 +3100,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var dailyLastOK: Date?
     // 每日图选中日（面板每 10s 重建后沿用；nil = 用默认最新有记录日，通常为今日）
     private var dailySelectedIndex: Int?
-    // 面板七张内容卡的显隐与纵向顺序；preview 进程强制默认基线且不落盘生产偏好
+    // 本机模型速度/缓存命中（两卡共享同一份只读统计；跟随慢项刷新节奏，无新定时器/网络请求）。
+    // 三个周期窗一次读齐，周期切换不重读；读取失败保留旧快照并置异常态，绝不静默造 0。
+    private var localModelStatsToday: GLMLocalModelStats.Snapshot?
+    private var localModelStats7d: GLMLocalModelStats.Snapshot?
+    private var localModelStats30d: GLMLocalModelStats.Snapshot?
+    private var localModelStatsError: String?
+    // 两卡周期选择相互独立（默认近 7 天）；会话内记忆、不落盘，对齐「用量情况」状态不持久化的现状
+    private var speedStatsPeriod = GLMLocalModelStats.Period.sevenDays
+    private var cacheStatsPeriod = GLMLocalModelStats.Period.sevenDays
+    // 两卡明细收起/展开（默认展开）；会话内记忆、不落盘，对齐每日图/历史卡现状
+    private var speedExpanded = true
+    private var cacheExpanded = true
+    // 面板九张内容卡的显隐与纵向顺序；preview 进程强制默认基线且不落盘生产偏好
     private var panelLayout = GLMPanelLayout.load()
     private var showingCardSettings = false
 
     private func persistPanelLayout() {
         if !preview { panelLayout.save() }
     }
+
+    private func localStats(for period: GLMLocalModelStats.Period) -> GLMLocalModelStats.Snapshot? {
+        switch period {
+        case .today: return localModelStatsToday
+        case .sevenDays: return localModelStats7d
+        case .thirtyDays: return localModelStats30d
+        }
+    }
+
+    /// 本机速度/缓存统计刷新：只读 `~/.zcode/cli/db/db.sqlite`（一次窗口一条分组 SQL 同时产出
+    /// 两卡数据），不联网、不碰凭据。挂在 performRefresh(tokens:) 既有节奏（启动 + 每 5 分钟 +
+    /// 手动全量），后台队列执行后回主线程重建面板；不新增定时器。失败保留旧快照并置异常态。
+    private func refreshLocalModelStats() {
+        DispatchQueue.global().async { [weak self] in
+            let calendar = Calendar.current
+            let now = Date()
+            var results: [GLMLocalModelStats.Period: GLMLocalModelStats.Snapshot] = [:]
+            var failed = false
+            for period in GLMLocalModelStats.Period.allCases {
+                do {
+                    results[period] = try GLMLocalModelStats.load(
+                        from: period.windowStart(now: now, calendar: calendar), to: now, calendar: calendar)
+                } catch {
+                    failed = true
+                    break
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if failed {
+                    self.localModelStatsError = "本机数据读取失败"
+                } else {
+                    self.localModelStatsToday = results[.today]
+                    self.localModelStats7d = results[.sevenDays]
+                    self.localModelStats30d = results[.thirtyDays]
+                    self.localModelStatsError = nil
+                }
+                self.rebuildPanel()
+            }
+        }
+    }
+
+    @objc private func onSpeedPeriod(_ sender: NSButton) {
+        guard let period = GLMLocalModelStats.Period(rawValue: sender.tag), speedStatsPeriod != period else { return }
+        speedStatsPeriod = period
+        rebuildPanel()
+    }
+
+    @objc private func onCachePeriod(_ sender: NSButton) {
+        guard let period = GLMLocalModelStats.Period(rawValue: sender.tag), cacheStatsPeriod != period else { return }
+        cacheStatsPeriod = period
+        rebuildPanel()
+    }
+
+    @objc private func toggleSpeed() { speedExpanded.toggle(); rebuildPanel() }
+    @objc private func toggleCache() { cacheExpanded.toggle(); rebuildPanel() }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 恢复上次「结果未知」遗留的幂等 key：跨重启防重复扣卡
@@ -2896,6 +3214,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             installPreviewData()
             // 卡片设置回归的基线必须是默认布局：忽略生产 UserDefaults 里可能存在的自定义顺序
             panelLayout = .default
+            // popover 几何回归的逐项开/收以 7 卡时代的固定高度为前提（每步都保持在非截断区）；
+            // 9 卡基线会顶到屏幕高度上限，让窗口高度差恒为 0。该模式隐藏两张新卡保持原有几何
+            // 前提，两卡的渲染与显隐/排序由 --preview-card-settings-test 在默认 9 卡基线覆盖。
+            if CommandLine.arguments.contains("--preview-popover-test") {
+                panelLayout.setVisible(false, for: .speed)
+                panelLayout.setVisible(false, for: .cache)
+            }
             rebuildPanel()
             statusItem.button?.title = "GLM 预览"
             if previewPopover && CommandLine.arguments.contains("--preview-popover-ui") {
@@ -3067,6 +3392,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func performRefresh(tokens: Bool) {
+        // 本机速度/缓存统计：只读本地库、无凭据依赖，放在凭据守卫之前以保证无连接时也有数据；
+        // 后台执行、异步回主线程重建面板，不参与刷新门（无网络语义，见 refreshLocalModelStats 注释）
+        refreshLocalModelStats()
         let credential = CredStore.loadPlanCredential()
         bindPlanCredential(credential.key)
         guard let key = credential.key else {
@@ -3751,6 +4079,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             usage.accountEmail = CommandLine.arguments.contains("--preview-email-long")
                 ? "long-username.glm.account@example-mail.cn" : "preview@example.com"
         }
+        // 模型速度/缓存命中预览：直接构造快照（绝不读真实库）；数值对齐计划文档 2026-11-15 实测基线，
+        // 行文案由生产 speedStat/cacheStat 生成，供 GUI 回归断言精确匹配。
+        func statsOverall(_ rows: [GLMLocalModelStats.ModelRow]) -> GLMLocalModelStats.ModelRow {
+            let input = rows.reduce(0.0) { $0 + $1.inputTokens }
+            let cacheRead = rows.reduce(0.0) { $0 + $1.cacheReadTokens }
+            let hasActivity = rows.contains { $0.cacheHitRate != nil }
+            return GLMLocalModelStats.ModelRow(name: "整体", requests: rows.reduce(0) { $0 + $1.requests },
+                decodeSamples: 0, decodeTps: nil, avgTtftMs: nil, outputTokens: 0,
+                inputTokens: input, cacheReadTokens: cacheRead,
+                cacheHitRate: hasActivity && input > 0 ? cacheRead / input : nil)
+        }
+        let stats7dRows: [GLMLocalModelStats.ModelRow] = [
+            .init(name: "glm-5.3-flashx", requests: 519, decodeSamples: 503, decodeTps: 153.2, avgTtftMs: 2300,
+                  outputTokens: 9_000_000, inputTokens: 97_000_000, cacheReadTokens: 94_180_000,
+                  cacheHitRate: 94_180_000.0 / 97_000_000.0),
+            .init(name: "GLM-5.3-Flash", requests: 2354, decodeSamples: 1712, decodeTps: 58.1, avgTtftMs: 3900,
+                  outputTokens: 8_000_000, inputTokens: 328_400_000, cacheReadTokens: 316_300_000,
+                  cacheHitRate: 316_300_000.0 / 328_400_000.0),
+            .init(name: "k3.1-pro", requests: 519, decodeSamples: 203, decodeTps: 39.7, avgTtftMs: 8700,
+                  outputTokens: 4_000_000, inputTokens: 84_000_000, cacheReadTokens: 82_000_000,
+                  cacheHitRate: 82_000_000.0 / 84_000_000.0),
+            .init(name: "claude-sonnet-5-5", requests: 300, decodeSamples: 280, decodeTps: 130.6, avgTtftMs: 6400,
+                  outputTokens: 3_000_000, inputTokens: 31_800_000, cacheReadTokens: 24_200_000,
+                  cacheHitRate: 24_200_000.0 / 31_800_000.0),
+            .init(name: "deepseek-flash", requests: 13, decodeSamples: 9, decodeTps: 45.0, avgTtftMs: 5200,
+                  outputTokens: 300_000, inputTokens: 284_000, cacheReadTokens: 0, cacheHitRate: nil)
+        ]
+        let stats7d = GLMLocalModelStats.Snapshot(rows: stats7dRows, overall: statsOverall(stats7dRows))
+        localModelStats7d = stats7d
+        localModelStats30d = stats7d
+        let statsTodayRows: [GLMLocalModelStats.ModelRow] = [
+            .init(name: "GLM-5.3-Flash", requests: 40, decodeSamples: 31, decodeTps: 61.4, avgTtftMs: 3600,
+                  outputTokens: 600_000, inputTokens: 5_200_000, cacheReadTokens: 5_000_000,
+                  cacheHitRate: 5_000_000.0 / 5_200_000.0)
+        ]
+        localModelStatsToday = GLMLocalModelStats.Snapshot(rows: statsTodayRows, overall: statsOverall(statsTodayRows))
+        if empty {
+            localModelStatsToday = nil; localModelStats7d = nil; localModelStats30d = nil; localModelStatsError = nil
+        }
+        if CommandLine.arguments.contains("--preview-errors") {
+            localModelStatsError = "模拟本机数据读取失败"
+        }
     }
 
     /// 合成每日桶（仅预览/离线测试）：确定性伪随机高度 + 固定零日/缺日位点，
@@ -3866,7 +4236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 repair.identifier = NSUserInterfaceItemIdentifier("GLMRepairConnection")
                 add(repair)
             }
-            // 七张内容卡先注册稳定 identifier，再按 panelLayout.visibleOrder 统一安装（全部隐藏时给空态）
+            // 九张内容卡先注册稳定 identifier，再按 panelLayout.visibleOrder 统一安装（全部隐藏时给空态）
             var cardViews: [GLMPanelCardID: GLMPanelCard] = [:]
             func register(_ card: GLMPanelCard, as id: GLMPanelCardID) {
                 card.identifier = NSUserInterfaceItemIdentifier("GLMPanelCard.\(id.rawValue)")
@@ -4183,7 +4553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     if let canvas = historyCanvas { focusChain.append(canvas) }
                 case .mcp:
                     focusChain.append(mcpSection)
-                case .quota, .peak, .resetCards:
+                case .quota, .peak, .resetCards, .speed, .cache:
                     break // 其他卡片内现有按钮继续由 AppKit 按几何与控件策略处理
                 }
             }
@@ -4200,7 +4570,184 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             else if toolsStale { addContent(label("MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))", color: .systemOrange), to: mcpCard) }
             register(mcpCard, as: .mcp)
 
-            // 按用户布局的可见顺序安装七张独立卡片；全部隐藏时给出可恢复空态。
+            // 模型速度 / 缓存命中：同一份本机只读统计（GLMLocalModelStats，口径见其头注）喂两张卡。
+            // 周期选择相互独立（各自记忆，默认近 7 天，会话内记忆对齐「用量情况」现状）；
+            // 行样式：模型名主文字 + 两列统计次要文字右对齐（2026-11-15 拆列对齐，见 statsLine 注释）。
+            func statsPeriodSelector(_ current: GLMLocalModelStats.Period, prefix: String,
+                                     action: Selector, cardName: String) -> NSView {
+                let stack = NSStackView()
+                stack.orientation = .horizontal
+                stack.alignment = .centerY
+                stack.spacing = 2
+                // P2 等宽：三钮统一 minWidth（「近 30 天」按钮自然宽实测 43，再留 pill 呼吸位 → 50，
+                // 文字居中），切换周期时字重 regular/semibold 互换但宽度恒定，按钮零跳动。
+                // 优先级 750（低于标题行文字的 900）：窄面板（--preview-narrow 280）标题行放不下时
+                // 按钮先回落到自然宽，标题不折行。
+                let itemMinWidth: CGFloat = 50
+                for period in GLMLocalModelStats.Period.allCases {
+                    let item = GLMPanelAction(title: period.label, target: self, action: action)
+                    item.isBordered = false
+                    item.focusRingType = .default
+                    item.tag = period.rawValue
+                    item.identifier = NSUserInterfaceItemIdentifier("\(prefix).\(period.rawValue)")
+                    item.font = .systemFont(ofSize: 10, weight: period == current ? .semibold : .regular)
+                    item.contentTintColor = period == current ? GLMPeakTint.accent : .secondaryLabelColor
+                    item.subtleBackground = period == current   // P2 选中态：GLMPanelAction accent 18% pill
+                    item.wantsLayer = true
+                    item.layer?.cornerRadius = 9                // 高 18 的全圆角 pill，与 GLMPeakBadge 同语义
+                    item.heightAnchor.constraint(equalToConstant: 18).isActive = true
+                    let minWidth = item.widthAnchor.constraint(greaterThanOrEqualToConstant: itemMinWidth)
+                    minWidth.priority = .defaultHigh
+                    minWidth.isActive = true
+                    item.setAccessibilityLabel("\(cardName)周期\(period.label)")
+                    item.toolTip = "切换\(cardName)统计周期"
+                    stack.addArrangedSubview(item)
+                }
+                return stack
+            }
+            // 统计列宽（11pt monospacedDigit 实测自然宽 + 一档量级余量，保证当前数据与合理
+            // 下一档都不截断）：速度列A "153 tok/s"=50 / 4 位 tok/s≈57 → 58；列B "首字2.3s"=46.5 /
+            // "首字12.5s"≈51 → 54；缓存列A "97% 命中"=49.5 / "100% 命中"≈55 → 58；列B "输入541M"=54 /
+            // "输入1234M"≈57 → 60。两卡列A同宽，上下两卡的统计列右缘相互对齐。
+            let statsSpeedA: CGFloat = 58, statsSpeedB: CGFloat = 54
+            let statsCacheA: CGFloat = 58, statsCacheB: CGFloat = 60
+            // P1（2026-11-15 视觉对齐）：明细行拆「模型名 | spacer | 统计列A | 统计列B」，
+            // 两列各自固定宽、右对齐，列间距 11pt，等宽数字字体下各列纵向成列；
+            // 模型名压缩阻力 750 低于固定列宽的 required，窄面板下模型名优先截断
+            // （byTruncatingMiddle），统计列不被挤压。
+            func statsLine(_ name: String, _ statA: String, _ statB: String,
+                           aWidth: CGFloat, bWidth: CGFloat, boldName: Bool = false) -> NSView {
+                let line = row()
+                let nameCell = label(name, bold: boldName)
+                nameCell.lineBreakMode = .byTruncatingMiddle
+                nameCell.maximumNumberOfLines = 1
+                nameCell.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+                nameCell.toolTip = name
+                func statCell(_ text: String, width: CGFloat) -> NSTextField {
+                    let cell = label(text, color: .secondaryLabelColor)
+                    cell.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+                    cell.alignment = .right
+                    cell.lineBreakMode = .byTruncatingTail
+                    cell.maximumNumberOfLines = 1
+                    cell.setContentCompressionResistancePriority(.required, for: .horizontal)
+                    cell.widthAnchor.constraint(equalToConstant: width).isActive = true
+                    return cell
+                }
+                let columnA = statCell(statA, width: aWidth)
+                let columnB = statCell(statB, width: bWidth)
+                line.addArrangedSubview(nameCell)
+                line.addArrangedSubview(spacer())
+                line.addArrangedSubview(columnA)
+                line.setCustomSpacing(11, after: columnA)
+                line.addArrangedSubview(columnB)
+                return line
+            }
+            func statsUnavailable(_ text: String, to card: GLMPanelCard) {
+                addContent(label(text, color: .secondaryLabelColor), to: card)
+            }
+            // 收起/展开按钮：独立小按钮。不能照抄每日图「整行可点」的 section 模式——
+            // GLMPanelAction.hitTest 整体吞掉鼠标事件，会把标题行里的周期选择器一并吞掉；
+            // chevron 形态与 section 标题行一致（chevron.up/down，次要色 10pt）。
+            func statsChevron(_ expanded: Bool, action: Selector, cardName: String, identifier: String) -> NSView {
+                let item = GLMPanelAction(title: "", target: self, action: action)
+                item.isBordered = false
+                item.wantsLayer = true
+                item.layer?.cornerRadius = 6
+                item.identifier = NSUserInterfaceItemIdentifier(identifier)
+                let icon = NSImageView(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil) ?? NSImage())
+                icon.contentTintColor = .secondaryLabelColor
+                icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+                icon.translatesAutoresizingMaskIntoConstraints = false
+                item.addSubview(icon)
+                NSLayoutConstraint.activate([icon.centerXAnchor.constraint(equalTo: item.centerXAnchor),
+                                             icon.centerYAnchor.constraint(equalTo: item.centerYAnchor)])
+                item.widthAnchor.constraint(equalToConstant: 24).isActive = true
+                item.heightAnchor.constraint(equalToConstant: 22).isActive = true
+                let actionTitle = (expanded ? "收起" : "展开") + cardName
+                item.setAccessibilityLabel(actionTitle)
+                item.toolTip = actionTitle
+                return item
+            }
+            let speedCard = GLMPanelCard()
+            speedCard.content.spacing = 4
+            let speedHead = row()
+            speedHead.spacing = 6
+            speedHead.addArrangedSubview(symbol("speedometer"))
+            let speedTitle = label("模型速度", size: 12, bold: true)
+            // 窄面板（280）下周期选择器等宽后标题行变紧：标题单行截尾、压缩阻力 900 高于
+            // 周期按钮 minWidth 的 750，空间不足时按钮先回落自然宽、标题最后才截断
+            speedTitle.maximumNumberOfLines = 1
+            speedTitle.lineBreakMode = .byTruncatingTail
+            speedTitle.setContentCompressionResistancePriority(.init(900), for: .horizontal)
+            speedHead.addArrangedSubview(speedTitle)
+            speedHead.addArrangedSubview(spacer())
+            speedHead.addArrangedSubview(statsPeriodSelector(speedStatsPeriod, prefix: "SpeedPeriod",
+                                                             action: #selector(onSpeedPeriod(_:)), cardName: "模型速度"))
+            speedHead.addArrangedSubview(statsChevron(speedExpanded, action: #selector(toggleSpeed),
+                                                      cardName: "模型速度", identifier: "SpeedCollapse"))
+            addContent(speedHead, to: speedCard)
+            if speedExpanded {
+                if let error = localModelStatsError {
+                    addContent(label(error, color: .systemOrange), to: speedCard)   // 异常态，不静默置零
+                } else if let snapshot = localStats(for: speedStatsPeriod) {
+                    let speedRows = snapshot.speedRows()
+                    if speedRows.isEmpty { statsUnavailable(speedStatsPeriod.emptySpeedText, to: speedCard) }
+                    else {
+                        for model in speedRows {
+                            let stat = GLMLocalModelStats.speedStat(model)
+                            addContent(statsLine(model.name, stat.speed, stat.ttft,
+                                                 aWidth: statsSpeedA, bWidth: statsSpeedB), to: speedCard)
+                        }
+                    }
+                } else {
+                    statsUnavailable("暂无数据", to: speedCard)
+                }
+            }
+            register(speedCard, as: .speed)
+
+            let cacheCard = GLMPanelCard()
+            cacheCard.content.spacing = 4
+            let cacheHead = row()
+            cacheHead.spacing = 6
+            cacheHead.addArrangedSubview(symbol("arrow.triangle.2.circlepath"))
+            let cacheTitle = label("缓存命中", size: 12, bold: true)
+            cacheTitle.maximumNumberOfLines = 1
+            cacheTitle.lineBreakMode = .byTruncatingTail
+            cacheTitle.setContentCompressionResistancePriority(.init(900), for: .horizontal)
+            cacheHead.addArrangedSubview(cacheTitle)
+            cacheHead.addArrangedSubview(spacer())
+            cacheHead.addArrangedSubview(statsPeriodSelector(cacheStatsPeriod, prefix: "CachePeriod",
+                                                             action: #selector(onCachePeriod(_:)), cardName: "缓存命中"))
+            cacheHead.addArrangedSubview(statsChevron(cacheExpanded, action: #selector(toggleCache),
+                                                      cardName: "缓存命中", identifier: "CacheCollapse"))
+            addContent(cacheHead, to: cacheCard)
+            if cacheExpanded {
+                if let error = localModelStatsError {
+                    addContent(label(error, color: .systemOrange), to: cacheCard)
+                } else if let snapshot = localStats(for: cacheStatsPeriod) {
+                    let cacheRows = snapshot.cacheRows()
+                    if cacheRows.isEmpty { statsUnavailable(cacheStatsPeriod.emptyCacheText, to: cacheCard) }
+                    else {
+                        // 「整体」行 = 全模型合计命中率，置顶（计划 UI 规格）；
+                        // P3：仅名称 semibold 略强调（比模型行），数据列样式不变
+                        if let overall = snapshot.overall {
+                            let stat = GLMLocalModelStats.cacheStat(overall)
+                            addContent(statsLine("整体", stat.hit, stat.input,
+                                                 aWidth: statsCacheA, bWidth: statsCacheB, boldName: true), to: cacheCard)
+                        }
+                        for model in cacheRows {
+                            let stat = GLMLocalModelStats.cacheStat(model)
+                            addContent(statsLine(model.name, stat.hit, stat.input,
+                                                 aWidth: statsCacheA, bWidth: statsCacheB), to: cacheCard)
+                        }
+                    }
+                } else {
+                    statsUnavailable("暂无数据", to: cacheCard)
+                }
+            }
+            register(cacheCard, as: .cache)
+
+            // 按用户布局的可见顺序安装九张独立卡片；全部隐藏时给出可恢复空态。
             let visibleCards = panelLayout.visibleOrder.compactMap { cardViews[$0] }
             if visibleCards.isEmpty {
                 let emptyCard = GLMPanelCard()
@@ -4455,7 +5002,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 NSApp.sendEvent(event)
             }
         }
-        // 七张卡片增加了固定外框高度：连续展开多个模型窗会顶到最大高度，
+        // 九张卡片增加了固定外框高度：连续展开多个模型窗会顶到最大高度，
         // 截断区内继续展开不会改变窗口高。逐项开/收可让每步都在非截断区验证真实增减；
         // 收起 Token 表后，再验证 MCP 与 footer（刷新提示行）的增减。
         let steps: [(HeightChange, () -> Void)] = [
@@ -4722,13 +5269,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         let expectedDefault = GLMPanelCardID.allCases.map(\.rawValue)
         guard cardOrder() == expectedDefault else { fail("default card order \(cardOrder())") }
+        // ===== 模型速度/缓存命中两卡：fixture 注入快照断言（合成数据，绝不读真实库）=====
+        func allTexts(_ root: NSView) -> [String] { allViews(root).compactMap { ($0 as? NSTextField)?.stringValue } }
+        // 2026-11-15 拆列后每列是独立 NSTextField：断言按明细行聚合（行 = 模型名 + 统计列A + 统计列B）
+        func cardView(_ id: String) -> NSView? {
+            allViews(panelController.view).first { $0.identifier?.rawValue == "GLMPanelCard.\(id)" }
+        }
+        func statRowTexts(_ root: NSView?, _ name: String) -> [String]? {
+            guard let root = root else { return nil }
+            for view in allViews(root) {
+                guard let stack = view as? NSStackView, stack.orientation == .horizontal else { continue }
+                let texts = stack.arrangedSubviews.compactMap { ($0 as? NSTextField)?.stringValue }
+                if texts.first == name, texts.count == 3 { return texts }
+            }
+            return nil
+        }
+        guard statRowTexts(cardView("speed"), "glm-5.3-flashx") == ["glm-5.3-flashx", "153 tok/s", "首字2.3s"] else { fail("speed card fixture row missing") }
+        guard statRowTexts(cardView("speed"), "k3.1-pro") == ["k3.1-pro", "40 tok/s", "首字8.7s"] else { fail("speed card fixture row missing") }
+        guard statRowTexts(cardView("cache"), "GLM-5.3-Flash") == ["GLM-5.3-Flash", "96% 命中", "输入328M"] else { fail("cache card fixture row missing") }
+        guard statRowTexts(cardView("cache"), "deepseek-flash") == ["deepseek-flash", "— 命中", "输入284K"] else { fail("cache-free model dash row missing") }
+        guard statRowTexts(cardView("cache"), "整体") == ["整体", "95% 命中", "输入541M"] else { fail("cache overall row missing") }
+        // 周期选择器：速度卡切「今天」立即换数据，缓存卡周期不受影响（相互独立）；随后切回近 7 天
+        func periodButton(_ identifier: String) -> NSButton? {
+            allViews(panelController.view).first(where: { ($0 as? NSButton)?.identifier?.rawValue == identifier }) as? NSButton
+        }
+        guard let speedToday = periodButton("SpeedPeriod.0") else { fail("speed period buttons missing") }
+        speedToday.performClick(nil)
+        guard speedStatsPeriod == .today else { fail("speed period did not switch") }
+        guard statRowTexts(cardView("speed"), "GLM-5.3-Flash") == ["GLM-5.3-Flash", "61 tok/s", "首字3.6s"] else { fail("speed card today period switch") }
+        // 独立性：速度卡已切「今天」，缓存卡仍显示近 7 天行
+        guard statRowTexts(cardView("cache"), "GLM-5.3-Flash") == ["GLM-5.3-Flash", "96% 命中", "输入328M"] else { fail("cache period changed with speed card") }
+        guard let speedSeven = periodButton("SpeedPeriod.1") else { fail("speed period buttons missing") }
+        speedSeven.performClick(nil)
+        guard speedStatsPeriod == .sevenDays else { fail("speed period did not switch back") }
+        // 收起/展开：chevron 独立按钮真实点击，明细行随之消失/恢复；周期选择器保留在标题行，
+        // 另一张卡不受影响（收起状态与周期选择一样相互独立）
+        func collapseButton(_ identifier: String) -> NSButton? {
+            allViews(panelController.view).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == identifier }
+        }
+        guard let speedCollapse = collapseButton("SpeedCollapse") else { fail("speed collapse button missing") }
+        speedCollapse.performClick(nil)
+        guard speedExpanded == false else { fail("speed card did not collapse") }
+        guard statRowTexts(cardView("speed"), "glm-5.3-flashx") == nil else { fail("speed rows visible after collapse") }
+        guard periodButton("SpeedPeriod.0") != nil else { fail("period selector lost after collapse") }
+        guard statRowTexts(cardView("cache"), "GLM-5.3-Flash") == ["GLM-5.3-Flash", "96% 命中", "输入328M"] else { fail("cache card affected by speed collapse") }
+        speedCollapse.performClick(nil)
+        guard speedExpanded && statRowTexts(cardView("speed"), "glm-5.3-flashx") == ["glm-5.3-flashx", "153 tok/s", "首字2.3s"] else { fail("speed card did not re-expand") }
+        guard let cacheCollapse = collapseButton("CacheCollapse") else { fail("cache collapse button missing") }
+        cacheCollapse.performClick(nil)
+        guard cacheExpanded == false else { fail("cache card did not collapse") }
+        guard statRowTexts(cardView("cache"), "GLM-5.3-Flash") == nil else { fail("cache rows visible after collapse") }
+        guard statRowTexts(cardView("speed"), "glm-5.3-flashx") == ["glm-5.3-flashx", "153 tok/s", "首字2.3s"] else { fail("speed card affected by cache collapse") }
+        cacheCollapse.performClick(nil)
+        guard cacheExpanded && statRowTexts(cardView("cache"), "GLM-5.3-Flash") == ["GLM-5.3-Flash", "96% 命中", "输入328M"] else { fail("cache card did not re-expand") }
+        // 拆列对齐断言：同卡内两行统计列右缘 X 坐标一致（列A、列B 各自成列；坐标统一转换到
+        // popover 内容视图比较）。两卡都处于展开 + 近 7 天状态，等布局稳定后测量。
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        panelScroll.layoutSubtreeIfNeeded()
+        func statCellRightX(_ cardID: String, _ text: String) -> CGFloat? {
+            guard let card = cardView(cardID),
+                  let cell = allViews(card).compactMap({ $0 as? NSTextField }).first(where: { $0.stringValue == text }) else { return nil }
+            return cell.convert(cell.bounds, to: panelController.view).maxX
+        }
+        for (cardID, rowA1, rowB1, rowA2, rowB2) in [("speed", "153 tok/s", "首字2.3s", "40 tok/s", "首字8.7s"),
+                                                     ("cache", "96% 命中", "输入328M", "98% 命中", "输入84M")] {
+            guard let a1 = statCellRightX(cardID, rowA1), let a2 = statCellRightX(cardID, rowA2), abs(a1 - a2) < 0.5 else { fail("\(cardID) column A right edges not aligned") }
+            guard let b1 = statCellRightX(cardID, rowB1), let b2 = statCellRightX(cardID, rowB2), abs(b1 - b2) < 0.5 else { fail("\(cardID) column B right edges not aligned") }
+        }
         // 生产布局偏好基线：preview 全程不得写入，结束前逐字节比对（不假定用户原先没有该配置）
         let productionLayoutData = UserDefaults.standard.data(forKey: GLMPanelLayout.defaultsKey)
         // 隐藏 + 排序后按可见顺序组装：resetCards 不动，daily 上移到 usage 之前，mcp 隐藏
         panelLayout.setVisible(false, for: .mcp)
         panelLayout.move(.daily, direction: .up)
         rebuildPanel()
-        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage", "history"] else { fail("custom visible order \(cardOrder())") }
+        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage", "history", "speed", "cache"] else { fail("custom visible order \(cardOrder())") }
         // 隐藏 MCP 不得连带隐藏历史；全部隐藏（含历史）必须只留可恢复空态。
         for id in GLMPanelCardID.allCases { panelLayout.setVisible(false, for: id) }
         rebuildPanel()
@@ -4750,7 +5364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panelLayout.move(.daily, direction: .up)
         panelLayout.move(.mcp, to: 0)
         rebuildPanel()
-        guard cardOrder() == ["mcp", "quota", "peak", "resetCards", "daily", "usage", "history"] else { fail("key chain setup order \(cardOrder())") }
+        guard cardOrder() == ["mcp", "quota", "peak", "resetCards", "daily", "usage", "history", "speed", "cache"] else { fail("key chain setup order \(cardOrder())") }
         guard let mcpToggle = actionToggle("MCP 工具") else { fail("key chain views missing: mcp") }
         guard let dailyToggle = actionToggle("每日用量") else { fail("key chain views missing: daily") }
         guard let usageToggle = actionToggle("用量情况") else { fail("key chain views missing: usage") }
@@ -4850,7 +5464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let responder = panelController.view.window?.firstResponder {
             guard responder === editor.table else { fail("settings editor not initial first responder: \(responder)") }
         } else { fail("settings editor window missing first responder") }
-        guard editor.layout.order.count == 7 else { fail("settings row count \(editor.layout.order.count)") }
+        guard editor.layout.order.count == 9 else { fail("settings row count \(editor.layout.order.count)") }
         // 设置页 key view loop：表格 → 复选框 → 上移/下移 → 恢复默认 → 完成，逐环可达。
         guard let firstRowView = editor.table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? GLMCardSettingRowView else { fail("settings row view missing") }
         guard editor.table.nextKeyView === firstRowView.checkbox,
@@ -4876,21 +5490,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard editor.tableView(table, validateDrop: dragInfo(GLMPanelCardID.quota.rawValue, source: nil), proposedRow: 0, proposedDropOperation: .above) == [] else { fail("foreign source drag accepted") }
         // 首行上移、末行下移按钮必须禁用
         guard let quotaUp = buttonWithID("CardMoveUp.quota"), !quotaUp.isEnabled else { fail("first row up must be disabled") }
-        guard let mcpDown = buttonWithID("CardMoveDown.mcp"), !mcpDown.isEnabled else { fail("last row down must be disabled") }
+        guard let cacheDown = buttonWithID("CardMoveDown.cache"), !cacheDown.isEnabled else { fail("last row down must be disabled") }
         // 真实复选框事件：隐藏 MCP，其余卡片保持显示
         guard let mcpToggle = buttonWithID("CardToggle.mcp") else { fail("mcp toggle missing") }
         mcpToggle.performClick(nil)
         guard editor.layout.isVisible(.mcp) == false else { fail("mcp not hidden via checkbox") }
-        guard editor.layout.visibleOrder == [.quota, .peak, .resetCards, .usage, .daily, .history] else { fail("hide touched other cards") }
+        guard editor.layout.visibleOrder == [.quota, .peak, .resetCards, .usage, .daily, .history, .speed, .cache] else { fail("hide touched other cards") }
         // 真实上移按钮事件：每日用量上移一格
         guard let dailyUp = buttonWithID("CardMoveUp.daily") else { fail("daily up button missing") }
         dailyUp.performClick(nil)
-        guard editor.layout.order == [.quota, .peak, .resetCards, .daily, .usage, .history, .mcp] else { fail("daily not moved via button") }
+        // editor.layout.order 含隐藏中的 mcp（隐藏只影响 visibleOrder），期望序列保留 .mcp
+        guard editor.layout.order == [.quota, .peak, .resetCards, .daily, .usage, .history, .mcp, .speed, .cache] else { fail("daily not moved via button \(editor.layout.order.map(\.rawValue))") }
         // 真实「完成」按钮：退出设置页并应用布局到实际卡片
         guard let doneButton = allViews(panelController.view).compactMap({ $0 as? NSButton }).first(where: { $0.title == "完成" }) else { fail("done button missing") }
         doneButton.performClick(nil)
         guard !showingCardSettings else { fail("settings did not close") }
-        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage", "history"] else { fail("settings changes not applied \(cardOrder())") }
+        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage", "history", "speed", "cache"] else { fail("settings changes not applied \(cardOrder())") }
         // 重开设置页：必须重建新视图、保留内存布局与开关状态
         showCardSettings()
         guard let reopenedEditor = editorView() else { fail("reopened settings view missing") }
@@ -4909,7 +5524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         guard popover.isShown else { fail("popover did not reopen") }
         guard showingCardSettings == false else { fail("settings leaked after popover reopen") }
-        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage", "history"] else { fail("layout lost after popover reopen \(cardOrder())") }
+        guard cardOrder() == ["quota", "peak", "resetCards", "daily", "usage", "history", "speed", "cache"] else { fail("layout lost after popover reopen \(cardOrder())") }
         restoreDefaultPanelLayout()
         guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
         guard UserDefaults.standard.data(forKey: GLMPanelLayout.defaultsKey) == productionLayoutData else { fail("preview wrote production layout defaults") }
@@ -5908,6 +6523,149 @@ enum GLMOfflineRegression {
             catch { rejectedStartPlanSchema = true }
             try expect(rejectedStartPlanSchema, "unreadable Start Plan silently became zero")
 
+            // ---- 本机模型速度/缓存命中（GLMLocalModelStats）：计划口径 10 项回归，fixture 全在临时目录 ----
+            // 数据事实与口径见 GLMLocalModelStats 头注（docs/plans/2026-11-15-speed-cache-cards.md）。
+            // 10 项断言对照：
+            //  1 加权 decode tps 精确（毫秒→秒换算）          6 命中率加权精确（Σcache_read/Σinput）
+            //  2 cancelled/running 行不进样本与分母           7 input≤0 行不进分母（含 cache_read>0 的负 input 行）
+            //  3 first_token NULL 行只计请求数               8 无缓存活动 → nil（—）而非 0%；全窗无活动 → 整体也 nil
+            //  4 completed≤first 行剔除、不产生除零          9 缺 cache 列 → 抛错；缺表/缺库 → 空快照
+            //  5 大小写模型合并、显示名保留首现              10 毫秒时间戳与 startOfDay 日界、周期外行不进统计
+            let statsPath = root.appendingPathComponent("local-stats.sqlite").path
+            var statsFixtureDB: OpaquePointer?
+            try expect(sqlite3_open(statsPath, &statsFixtureDB) == SQLITE_OK, "cannot create local stats fixture")
+            defer { sqlite3_close(statsFixtureDB) }
+            try expect(sqlite3_exec(statsFixtureDB, """
+                CREATE TABLE model_usage (id INTEGER PRIMARY KEY, started_at INTEGER, model_id TEXT, status TEXT,
+                    cancelled_by_user INTEGER, output_tokens INTEGER, first_token_at INTEGER, completed_at INTEGER,
+                    time_to_first_token_ms INTEGER, input_tokens INTEGER,
+                    cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER);
+                """, nil, nil, nil) == SQLITE_OK, "cannot create local stats table")
+            func insertStats(_ id: Int, _ startedAt: Date, _ model: String, _ status: String, _ cancelled: Int,
+                             _ output: Int, _ firstToken: Date?, _ completed: Date?, _ ttft: Int?,
+                             _ input: Int, _ cacheRead: Int, _ cacheCreation: Int) throws {
+                func ms(_ date: Date?) -> String { date.map { String(Int64($0.timeIntervalSince1970 * 1000)) } ?? "NULL" }
+                let sql = """
+                    INSERT INTO model_usage VALUES (\(id), \(Int64(startedAt.timeIntervalSince1970 * 1000)),
+                        '\(model)', '\(status)', \(cancelled), \(output), \(ms(firstToken)), \(ms(completed)),
+                        \(ttft.map(String.init) ?? "NULL"), \(input), \(cacheRead), \(cacheCreation));
+                    """
+                try expect(sqlite3_exec(statsFixtureDB, sql, nil, nil, nil) == SQLITE_OK,
+                           "cannot insert local stats row \(id)")
+            }
+            // 全部行落在今天自然日内（相对 todayStart 秒级偏移），保证与机器时区无关
+            let statsT0 = todayStart.addingTimeInterval(60)
+            // 1：speed-a 两行 1000tok/10000ms + 640tok/6000ms → 1000×1640/16000 = 102.5（单请求平均同为 90/102.5 混淆，用 5 继续区分）
+            try insertStats(1, statsT0, "speed-a", "completed", 0, 1000, statsT0, statsT0.addingTimeInterval(10), 2300, 400, 384, 0)
+            try insertStats(2, statsT0.addingTimeInterval(10), "speed-a", "completed", 0, 640, statsT0, statsT0.addingTimeInterval(6), 3900, 160, 0, 0)
+            // 5：GLM-5.3（首现）+ glm-5.3 合并；1000tok/10s 与 480tok/6s → 加权 92.5 ≠ 单请求平均 90
+            try insertStats(3, statsT0.addingTimeInterval(20), "GLM-5.3", "completed", 0, 1000, statsT0, statsT0.addingTimeInterval(10), 2300, 400, 384, 0)
+            try insertStats(4, statsT0.addingTimeInterval(30), "glm-5.3", "completed", 0, 480, statsT0, statsT0.addingTimeInterval(6), 500, 60, 0, 0)
+            // 2：cancelled_by_user=1 与 status='running' 行（999/888 不得进任何合计）
+            try insertStats(5, statsT0.addingTimeInterval(40), "GLM-5.3", "completed", 1, 999, statsT0, statsT0.addingTimeInterval(1), 100, 999, 999, 0)
+            try insertStats(6, statsT0.addingTimeInterval(50), "GLM-5.3", "running", 0, 888, statsT0, statsT0.addingTimeInterval(1), 100, 888, 0, 0)
+            // 3：first_token NULL 只计请求；4：completed==first 与 completed<first 剔除（ttft 0/负值也不进均值）
+            try insertStats(7, statsT0.addingTimeInterval(60), "k3.1-pro", "completed", 0, 200, nil, nil, nil, 100, 0, 0)
+            try insertStats(8, statsT0.addingTimeInterval(70), "k3.1-pro", "completed", 0, 300, statsT0, statsT0, 0, 0, 0, 0)
+            try insertStats(9, statsT0.addingTimeInterval(80), "k3.1-pro", "completed", 0, 50, statsT0.addingTimeInterval(2), statsT0.addingTimeInterval(1), -5, 0, 0, 0)
+            // 6/7：claude 命中率 760/1000=0.76；input=0 与 input=-5（带 cache_read 44）的行不进分母/分子
+            try insertStats(10, statsT0.addingTimeInterval(90), "claude-sonnet-5-5", "completed", 0, 800, statsT0, statsT0.addingTimeInterval(8), 6400, 1000, 760, 40)
+            try insertStats(11, statsT0.addingTimeInterval(100), "claude-sonnet-5-5", "completed", 0, 10, statsT0, statsT0.addingTimeInterval(0.1), 10, 0, 0, 0)
+            try insertStats(12, statsT0.addingTimeInterval(110), "claude-sonnet-5-5", "completed", 0, 0, nil, nil, nil, -5, 44, 0)
+            // 8：deepseek 整窗无缓存活动 → 命中率 nil；creation-only 模型是真实 0%（与 — 严格区分）
+            try insertStats(13, statsT0.addingTimeInterval(120), "deepseek-flash", "completed", 0, 0, nil, nil, nil, 284_000, 0, 0)
+            try insertStats(14, statsT0.addingTimeInterval(130), "creation-only", "completed", 0, 0, nil, nil, nil, 70, 0, 15)
+            // 10：todayStart 整点行准入、todayStart−1ms 行只进滚动 7 天窗；now 整点行准入（to 边界含端点）
+            try insertStats(15, todayStart, "boundary-model", "completed", 0, 10, todayStart, todayStart.addingTimeInterval(1), 100, 20, 0, 0)
+            try insertStats(16, todayStart.addingTimeInterval(-0.001), "boundary-model", "completed", 0, 20,
+                            todayStart.addingTimeInterval(-1), todayStart.addingTimeInterval(-0.5), 200, 30, 0, 0)
+            try insertStats(17, now, "GLM-5.3", "completed", 0, 0, nil, nil, nil, 0, 0, 0)
+
+            let todayStats = try GLMLocalModelStats.load(from: todayStart, to: now, databasePath: statsPath, calendar: calendar)
+            try expect(todayStats.rows.count == 7, "local stats model grouping changed")
+            let speedA = todayStats.rows.first { $0.name == "speed-a" }
+            // 1. 已知两组行 → decode tps 精确等于 1000×1640/16000 = 102.5（毫秒→秒换算正确），TTFT 均值 3100ms
+            try expect(speedA?.requests == 2 && speedA?.decodeSamples == 2 && speedA?.decodeTps == 102.5
+                       && speedA?.avgTtftMs == 3100,
+                       "local stats weighted decode tps/ttft changed")
+            let glmMerged = todayStats.rows.first { $0.name == "GLM-5.3" }
+            // 2. cancelled_by_user=1 与 running 行不进样本与分母（999/888 未计入任何合计）
+            // 5. GLM-5.3 与 glm-5.3 合并一组，显示名保留先出现者；加权 1000×1480/16000 = 92.5 ≠ 平均 90
+            try expect(glmMerged?.name == "GLM-5.3" && glmMerged?.requests == 3 && glmMerged?.decodeSamples == 2
+                       && glmMerged?.decodeTps == 92.5 && glmMerged?.avgTtftMs == 1400
+                       && glmMerged?.inputTokens == 460 && glmMerged?.cacheReadTokens == 384,
+                       "cancelled/running rows leaked into local stats or the case-insensitive model merge broke")
+            let k3 = todayStats.rows.first { $0.name == "k3.1-pro" }
+            // 3/4. first_token NULL 行只计请求数不进样本；completed≤first 行被剔除，不产生除零（tps/ttft 均 nil）
+            try expect(k3?.requests == 3 && k3?.decodeSamples == 0 && k3?.decodeTps == nil
+                       && k3?.avgTtftMs == nil && k3?.outputTokens == 550,
+                       "first_token NULL or completed<=first rows broke the sample guards")
+            let claude = todayStats.rows.first { $0.name == "claude-sonnet-5-5" }
+            // 6. 加权命中率精确 = 760/1000；7. input=0 与 input=-5 行不进任何分母/分子
+            try expect(claude?.requests == 3 && claude?.decodeTps == 100 && claude?.avgTtftMs == 3205
+                       && claude?.inputTokens == 1000 && claude?.cacheReadTokens == 760
+                       && claude?.cacheHitRate == 0.76,
+                       "cache hit rate weighting or the input<=0 denominator guard changed")
+            let deepseek = todayStats.rows.first { $0.name == "deepseek-flash" }
+            // 8a. 整窗无任何 cache_read>0/cache_creation>0 → 命中率 nil（显示 —），不是 0%
+            try expect(deepseek?.cacheHitRate == nil && deepseek?.inputTokens == 284_000,
+                       "cache-free model must keep hit rate nil (—), not 0%")
+            let creationOnly = todayStats.rows.first { $0.name == "creation-only" }
+            // 8b. 仅有 cache_creation>0 的模型有缓存活动 → 真实 0%，与 — 严格区分
+            try expect(creationOnly?.cacheHitRate == 0.0 && creationOnly?.inputTokens == 70,
+                       "creation-only cache activity must be a real 0%, distinct from —")
+            let boundaryToday = todayStats.rows.first { $0.name == "boundary-model" }
+            // 10a. todayStart 整点行（from 边界含端点）准入；todayStart−1ms 行不进今天窗口
+            try expect(boundaryToday?.requests == 1 && boundaryToday?.decodeSamples == 1
+                       && boundaryToday?.decodeTps == 10,
+                       "millisecond day boundary or window filtering changed")
+            // 整体行 = 全模型合计比值（加权，非平均）：1528/286210
+            try expect(todayStats.overall?.requests == 14 && todayStats.overall?.inputTokens == 286_210
+                       && todayStats.overall?.cacheReadTokens == 1528
+                       && todayStats.overall?.cacheHitRate == 1528.0 / 286_210.0,
+                       "overall cache hit rate must be the all-model weighted ratio")
+            let sevenStats = try GLMLocalModelStats.load(from: now.addingTimeInterval(-7 * 86_400), to: now,
+                                                         databasePath: statsPath, calendar: calendar)
+            let boundarySeven = sevenStats.rows.first { $0.name == "boundary-model" }
+            // 10b. 滚动 7 天窗含昨日尾行（todayStart−1ms）：两行 30tok/1500ms → 20.0，TTFT 均值 150ms
+            try expect(boundarySeven?.requests == 2 && boundarySeven?.decodeSamples == 2
+                       && boundarySeven?.decodeTps == 20 && boundarySeven?.avgTtftMs == 150,
+                       "rolling 7-day window lost the previous day's tail")
+            // 8c. 全部模型无缓存活动 → 整体行命中率也为 nil（独立 fixture 库）
+            let overallNilPath = root.appendingPathComponent("local-stats-overall-nil.sqlite").path
+            var overallNilDB: OpaquePointer?
+            try expect(sqlite3_open(overallNilPath, &overallNilDB) == SQLITE_OK, "cannot create overall-nil fixture")
+            defer { sqlite3_close(overallNilDB) }
+            let overallNilMs = Int64(todayStart.timeIntervalSince1970 * 1000)
+            try expect(sqlite3_exec(overallNilDB, """
+                CREATE TABLE model_usage (id INTEGER PRIMARY KEY, started_at INTEGER, model_id TEXT, status TEXT,
+                    cancelled_by_user INTEGER, output_tokens INTEGER, first_token_at INTEGER, completed_at INTEGER,
+                    time_to_first_token_ms INTEGER, input_tokens INTEGER,
+                    cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER);
+                INSERT INTO model_usage VALUES (1, \(overallNilMs), 'm-x', 'completed', 0, 0, NULL, NULL, NULL, 80, 0, 0),
+                                               (2, \(overallNilMs), 'm-y', 'completed', 0, 0, NULL, NULL, NULL, 40, 0, 0);
+                """, nil, nil, nil) == SQLITE_OK, "cannot seed overall-nil fixture")
+            let overallNilStats = try GLMLocalModelStats.load(from: todayStart, to: now, databasePath: overallNilPath, calendar: calendar)
+            try expect(overallNilStats.rows.allSatisfy { $0.cacheHitRate == nil }
+                       && overallNilStats.overall?.cacheHitRate == nil
+                       && overallNilStats.overall?.inputTokens == 120,
+                       "a cache-free window must keep the overall hit rate nil")
+            // 9. 缺 cache 列的 fixture → 抛错（不静默置零）；缺表/缺库 → 空快照
+            try expect(sqlite3_exec(statsFixtureDB, "DROP TABLE model_usage", nil, nil, nil) == SQLITE_OK,
+                       "cannot prepare missing-table local stats fixture")
+            let missingTableStats = try GLMLocalModelStats.load(from: todayStart, to: now, databasePath: statsPath, calendar: calendar)
+            try expect(missingTableStats.rows.isEmpty && missingTableStats.overall == nil,
+                       "missing local stats table must be an empty snapshot")
+            try expect(sqlite3_exec(statsFixtureDB, "CREATE TABLE model_usage (unrecognized TEXT)", nil, nil, nil) == SQLITE_OK,
+                       "cannot prepare incompatible local stats fixture")
+            var rejectedStatsSchema = false
+            do { _ = try GLMLocalModelStats.load(from: todayStart, to: now, databasePath: statsPath, calendar: calendar) }
+            catch { rejectedStatsSchema = true }
+            try expect(rejectedStatsSchema, "unreadable local stats silently became zero")
+            let missingStatsFile = try GLMLocalModelStats.load(from: todayStart, to: now,
+                databasePath: root.appendingPathComponent("missing-local-stats.sqlite").path, calendar: calendar)
+            try expect(missingStatsFile.rows.isEmpty, "missing local stats database was rejected")
+
             let visibleModels = TokenModelList.visible([
                 (name: "GLM-5.3", tokens: 13_980_000),
                 (name: "GLM-5.3-Flash", tokens: 39_830_000),
@@ -6253,12 +7011,19 @@ enum GLMOfflineRegression {
             let defaultLayout = GLMPanelLayout.default
             try expect(defaultLayout.order == GLMPanelCardID.allCases, "layout default order")
             try expect(defaultLayout.visibleOrder == GLMPanelCardID.allCases, "layout default visibility")
+            // 9 张卡：模型速度/缓存命中默认可见，依次位于末两位（旧配置迁移时同样追加末尾）
+            try expect(GLMPanelCardID.allCases.count == 9
+                       && defaultLayout.order.suffix(2) == [.speed, .cache]
+                       && defaultLayout.isVisible(.speed) && defaultLayout.isVisible(.cache)
+                       && GLMPanelCardID.speed.title == "模型速度" && GLMPanelCardID.cache.title == "缓存命中",
+                       "speed/cache cards must be visible last two of the default 9-card layout")
 
             var customLayout = defaultLayout
             customLayout.setVisible(false, for: .mcp)
             customLayout.move(.daily, direction: .up)
-            try expect(customLayout.visibleOrder == [.quota, .peak, .resetCards, .daily, .usage, .history], "layout hide or move")
-            try expect(!customLayout.isVisible(.mcp) && customLayout.order.count == 7, "hidden card removed from editor order")
+            try expect(customLayout.visibleOrder == [.quota, .peak, .resetCards, .daily, .usage, .history, .speed, .cache],
+                       "layout hide or move")
+            try expect(!customLayout.isVisible(.mcp) && customLayout.order.count == 9, "hidden card removed from editor order")
 
             let roundTrip = GLMPanelLayout.decode(try customLayout.encoded())
             try expect(roundTrip == customLayout, "layout JSON round trip")
@@ -6266,24 +7031,27 @@ enum GLMOfflineRegression {
 
             let legacyJSON = #"{"order":["usage","quota","daily","usage","futureCard"],"hidden":["mcp","futureCard"]}"#.data(using: .utf8)
             let migrated = GLMPanelLayout.decode(legacyJSON)
-            try expect(migrated.order == [.peak, .resetCards, .usage, .quota, .daily, .history, .mcp], "legacy order/new card insertion")
+            try expect(migrated.order == [.peak, .resetCards, .usage, .quota, .daily, .history, .mcp, .speed, .cache],
+                       "legacy order/new card insertion")
             try expect(migrated.hidden == [.mcp], "unknown hidden ID retained")
             try expect(migrated.isVisible(.peak) && migrated.isVisible(.resetCards) && migrated.isVisible(.history), "missing new cards hidden by default")
 
             var allHidden = GLMPanelLayout.default
             for id in GLMPanelCardID.allCases { allHidden.setVisible(false, for: id) }
-            try expect(allHidden.visibleOrder.isEmpty && allHidden.order.count == 7, "all-hidden state rejected")
+            try expect(allHidden.visibleOrder.isEmpty && allHidden.order.count == 9, "all-hidden state rejected")
 
             // 拖放目标位置等价模型：首项移到末尾、末项移到开头、同位置不变、越界钳制
             var moveLayout = GLMPanelLayout.default
             moveLayout.move(.quota, to: 99)
-            try expect(moveLayout.order == [.peak, .resetCards, .usage, .daily, .history, .mcp, .quota], "move first to end")
+            try expect(moveLayout.order == [.peak, .resetCards, .usage, .daily, .history, .mcp, .speed, .cache, .quota],
+                       "move first to end")
             moveLayout.move(.quota, to: -3)
             try expect(moveLayout.order == GLMPanelCardID.allCases, "move last back to start clamps to 0")
             moveLayout.move(.peak, to: 1)
             try expect(moveLayout.order == GLMPanelCardID.allCases, "move to same position is a no-op")
             moveLayout.move(.mcp, to: 3)
-            try expect(moveLayout.order == [.quota, .peak, .resetCards, .mcp, .usage, .daily, .history], "move to middle")
+            try expect(moveLayout.order == [.quota, .peak, .resetCards, .mcp, .usage, .daily, .history, .speed, .cache],
+                       "move to middle")
 
             let suite = "GLMLayoutTest.\(UUID().uuidString)"
             let defaults = UserDefaults(suiteName: suite)!
