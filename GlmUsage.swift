@@ -3331,6 +3331,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.checkForUpdate() }
     }
 
+    // 退出前等 status.json 待写快照排空：同步写盘时代「最后一次状态落盘」的行为保持不变
+    // （有界等待，写盘卡住最多 2s，不拖死退出）
+    func applicationWillTerminate(_ notification: Notification) {
+        _ = statusWriter.waitForIdle(timeout: 2)
+    }
+
     // 拉取数据
     private func refresh(tokens: Bool, manual: Bool = false) {
         GLMRefreshDispatch.start(slowDue: tokens || manual, quota: { refreshQuota(manual: manual) }, slow: {
@@ -3700,16 +3706,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     peakLine: peak.line)
     }
 
-    // status.json 写盘限频：更新下载期间进度行高频触发 renderBar，避免写盘被抬到 0.25s 级
-    private var lastStatusWrite = Date.distantPast
+    // status.json 写盘（2026-11-21 加固）：主线程只构造不可变快照提交；原子写、内容去重与
+    // ≥60s 心跳、写盘合并都由 GLMStatusWriter 在专用串行队列完成，不再占用主线程。
+    // 旧 1s 限频由写盘器去重取代（时间戳字段剔除出比对 payload，更新下载高频 renderBar 不再触发写盘）。
+    private lazy var statusWriter: GLMStatusWriter = {
+        // 预览/GUI 回归进程与自检同款隔离：不写真实自诊断文件（临时目录，系统自动回收）
+        GLMStatusWriter(directory: preview ? NSTemporaryDirectory() + "GlmUsage-preview-status" : Self.supportDir)
+    }()
 
-    // 自诊断：把渲染内容写到本地，便于排查
+    // 自诊断：把渲染内容经 GLMStatusWriter 写到本地，便于排查
     private func writeStatus(line1: String, line2: String, peakLine: String) {
         let now = Date()
-        guard now.timeIntervalSince(lastStatusWrite) >= 1 else { return }
-        lastStatusWrite = now
-        let dir = Self.supportDir
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         // 重置卡/套餐自诊断（只含到期时间与名称，不含任何密钥）
         var cardsStatus: [String] = []
         if let c = usage.resetCards {
@@ -3765,9 +3772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             "subscription": usage.subscription?.name ?? "",
             "subscriptionExpire": usage.subscription?.expireDate.map { Fmt.iso8601.string(from: $0) } ?? ""
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted]) {
-            try? data.write(to: URL(fileURLWithPath: dir + "/status.json"))
-        }
+        statusWriter.submit(GLMStatusWriter.Snapshot(payload: info))
     }
 
     // 下拉面板
@@ -6679,6 +6684,107 @@ enum GLMOfflineRegression {
                 databasePath: root.appendingPathComponent("missing-local-stats.sqlite").path, calendar: calendar)
             try expect(missingStatsFile.rows.isEmpty, "missing local stats database was rejected")
 
+            // ---- status.json 写盘器（GLMStatusWriter）：临时根 + 注入时钟/写入器，不读真实 status.json ----
+            // 断言对照：原子写选项、心跳窗口内内容去重、内容变化立即写、≥60s 心跳必写并刷新时间戳、
+            // 写盘异常不崩不污染指纹、写盘进行中新快照合并为「待写最新」不排队多次。
+            // 等待排空必须用 waitForIdle：排空块在提交块内异步排期，直接 queue.sync 会排在它之前。
+            var statusClock = Date(timeIntervalSince1970: 1_800_000_000)
+            func statusPayload(updatedAt: String, marker: String) -> [String: Any] {
+                ["updatedAt": updatedAt, "lastAttemptAt": updatedAt, "line1": "5H 42%", "marker": marker,
+                 "lastSuccess": ["fiveHour": "2026-01-01T00:00:00Z"], "stale": ["fiveHour": false],
+                 "resetCards": ["5h:2026-01-02 00:00"], "pendingResets": ["k2", "k1"]]
+            }
+            var statusWrites: [(options: Data.WritingOptions, updatedAt: String, lastAttemptAt: String, marker: String)] = []
+            let statusWriter = GLMStatusWriter(directory: root.appendingPathComponent("status-writer").path,
+                queue: DispatchQueue(label: "GlmUsage.self-test.status"), clock: { statusClock },
+                performWrite: { data, _, options in
+                    let json = (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+                    statusWrites.append((options, json["updatedAt"] as? String ?? "",
+                                         json["lastAttemptAt"] as? String ?? "", json["marker"] as? String ?? ""))
+                })
+            // 1. 首次提交即写盘，且必须带 .atomic 选项
+            statusWriter.submit(.init(payload: statusPayload(updatedAt: "T0", marker: "a")))
+            try expect(statusWriter.waitForIdle() && statusWrites.count == 1 && statusWrites[0].options == [.atomic],
+                       "status writer must persist with the .atomic option")
+            // 2. 心跳窗口内内容未变（仅 updatedAt/lastAttemptAt 逐周期时间戳不同）→ 去重跳过
+            statusClock = statusClock.addingTimeInterval(10)
+            statusWriter.submit(.init(payload: statusPayload(updatedAt: "T10", marker: "a")))
+            try expect(statusWriter.waitForIdle() && statusWrites.count == 1,
+                       "unchanged status payload within the heartbeat window must be deduplicated")
+            // 3. 内容变化 → 立即写
+            statusWriter.submit(.init(payload: statusPayload(updatedAt: "T10", marker: "b")))
+            try expect(statusWriter.waitForIdle() && statusWrites.count == 2
+                       && statusWrites[1].marker == "b" && statusWrites[1].updatedAt == "T10",
+                       "changed status payload must write immediately")
+            // 4. 距上次成功写盘 ≥60s 心跳必写，并以最新快照刷新时间戳字段
+            statusClock = statusClock.addingTimeInterval(61)
+            statusWriter.submit(.init(payload: statusPayload(updatedAt: "T72", marker: "b")))
+            try expect(statusWriter.waitForIdle() && statusWrites.count == 3 && statusWrites[2].updatedAt == "T72"
+                       && statusWrites[2].lastAttemptAt == "T72",
+                       "60s heartbeat must rewrite the timestamp fields for liveness")
+            // 5. 心跳后窗口内再次去重（心跳时刻按成功写盘重置）
+            statusClock = statusClock.addingTimeInterval(5)
+            statusWriter.submit(.init(payload: statusPayload(updatedAt: "T77", marker: "b")))
+            try expect(statusWriter.waitForIdle() && statusWrites.count == 3,
+                       "post-heartbeat unchanged payload must be deduplicated again")
+            // 6. 默认写入器：真实落盘可读、去重跳过时不改写文件（updatedAt 保留旧值）
+            let realStatusDir = root.appendingPathComponent("status-writer-real").path
+            let realWriter = GLMStatusWriter(directory: realStatusDir,
+                queue: DispatchQueue(label: "GlmUsage.self-test.status-real"), clock: { statusClock })
+            func readRealStatus() -> [String: Any] {
+                (try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: realStatusDir + "/status.json")))
+                    as? [String: Any]) ?? [:]
+            }
+            realWriter.submit(.init(payload: statusPayload(updatedAt: "R1", marker: "real")))
+            try expect(realWriter.waitForIdle()
+                       && readRealStatus()["marker"] as? String == "real"
+                       && readRealStatus()["updatedAt"] as? String == "R1",
+                       "default status writer must persist readable JSON in the temp root")
+            realWriter.submit(.init(payload: statusPayload(updatedAt: "R2", marker: "real")))
+            try expect(realWriter.waitForIdle() && readRealStatus()["updatedAt"] as? String == "R1",
+                       "deduplicated submit must not touch status.json")
+            // 7. 写盘异常不崩、不污染指纹：失败后同内容再次提交按原样重试并成功
+            struct StatusWriteBoom: Error {}
+            var statusFailures = 0
+            let flakyWriter = GLMStatusWriter(directory: root.appendingPathComponent("status-writer-flaky").path,
+                queue: DispatchQueue(label: "GlmUsage.self-test.status-flaky"), clock: { statusClock },
+                performWrite: { _, _, _ in
+                    if statusFailures == 0 { statusFailures += 1; throw StatusWriteBoom() }
+                    statusFailures += 1
+                })
+            flakyWriter.submit(.init(payload: statusPayload(updatedAt: "F1", marker: "flaky")))
+            try expect(flakyWriter.waitForIdle() && statusFailures == 1,
+                       "status write failure must be swallowed, not crash")
+            flakyWriter.submit(.init(payload: statusPayload(updatedAt: "F1", marker: "flaky")))
+            try expect(flakyWriter.waitForIdle() && statusFailures == 2,
+                       "failed status write must retry on the next submit")
+            // 8. 写盘进行中到来的新快照合并为「待写最新」：首写阻塞期间连提 3 次 → 总写 2 次（首 + 最新）
+            let mergeQueue = DispatchQueue(label: "GlmUsage.self-test.status-merge")
+            let mergeEntered = DispatchSemaphore(value: 0)
+            let mergeGate = DispatchSemaphore(value: 0)
+            let mergeDone = DispatchSemaphore(value: 0)
+            var mergePayloads: [String] = []
+            var mergeWriteCount = 0
+            let mergeWriter = GLMStatusWriter(directory: root.appendingPathComponent("status-writer-merge").path,
+                queue: mergeQueue, clock: { statusClock },
+                performWrite: { data, _, _ in
+                    let json = (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+                    mergePayloads.append(json["marker"] as? String ?? "")
+                    mergeWriteCount += 1
+                    if mergeWriteCount == 1 { mergeEntered.signal(); mergeGate.wait() }
+                    if mergeWriteCount == 2 { mergeDone.signal() }
+                })
+            mergeWriter.submit(.init(payload: statusPayload(updatedAt: "M0", marker: "m-first")))
+            _ = mergeEntered.wait(timeout: .now() + 5)   // 等首次写盘真正进入并阻塞
+            mergeWriter.submit(.init(payload: statusPayload(updatedAt: "M1", marker: "m-2")))
+            mergeWriter.submit(.init(payload: statusPayload(updatedAt: "M2", marker: "m-3")))
+            mergeWriter.submit(.init(payload: statusPayload(updatedAt: "M3", marker: "m-latest")))
+            mergeGate.signal()
+            _ = mergeDone.wait(timeout: .now() + 5)
+            mergeQueue.sync {}
+            try expect(mergePayloads == ["m-first", "m-latest"],
+                       "in-flight status writes must coalesce pending snapshots into the latest one")
+
             let visibleModels = TokenModelList.visible([
                 (name: "GLM-5.3", tokens: 13_980_000),
                 (name: "GLM-5.3-Flash", tokens: 39_830_000),
@@ -7398,7 +7504,7 @@ enum GLMOfflineRegression {
             try expect(!CredStore.isValidEmail(String(repeating: "a", count: 250) + "@example.com"),
                        "over-length email accepted")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration)")
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, status writer atomic/dedup/heartbeat/coalesce)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)

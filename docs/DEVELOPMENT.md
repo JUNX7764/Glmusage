@@ -92,7 +92,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./GlmUsage.app/Contents/MacOS/GlmUsage --once
 ```
 
-无 ZCode 凭证库时，可在真实网络验收中通过 `GLM_API_KEY` 提供 key；不得把真实 key 写入命令记录、文档或提交。运行状态诊断写入 `~/Library/Application Support/GlmUsage/status.json`。
+无 ZCode 凭证库时，可在真实网络验收中通过 `GLM_API_KEY` 提供 key；不得把真实 key 写入命令记录、文档或提交。运行状态诊断写入 `~/Library/Application Support/GlmUsage/status.json`；写盘为原子写，主线程只提交快照，内容未变（剔除逐周期时间戳字段后比对）时跳过，距上次成功写盘 ≥60s 强制心跳刷新 `updatedAt`/文件 mtime——部署验收以 `updatedAt`/mtime 判活仍成立（最长 60s 刷新一次）。
 
 每日图所选 Token 值在交互切换时以 320ms ease-out 过渡，日期与辅助功能目标值即时更新；首次显示、缺失及恢复、减少动态效果或移出窗口时即时到位。环比胶囊在窄版长值下可增高为双行，保留完整文字。
 
