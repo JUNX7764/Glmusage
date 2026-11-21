@@ -85,7 +85,8 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 # 卡片显隐/排序/统一菜单/空态/滚动与动态键盘链（其他 GUI 测试错开 ≥5s）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-card-settings-test
 
-# 面板增量渲染回归：无变化刷新不重建、关闭期标脏打开即最新、结构变化立即重排（其他 GUI 测试错开 ≥5s）
+# 面板增量渲染回归：无变化刷新不重建、数值变化仅替换目标卡、关闭期标脏打开即最新、
+# 焦点在被替换卡内恢复、结构变化立即重排（其他 GUI 测试错开 ≥5s）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-perf-test
 
 # 更新流程预览（进度行原位展示；不执行真实更新）
