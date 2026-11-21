@@ -622,6 +622,35 @@ enum GLMLocalModelStats {
         defer { sqlite3_close(database) }
         guard opened == SQLITE_OK else { throw ReadFailure() }
         sqlite3_busy_timeout(database, 1_000)
+        return try queryWindow(from: from, to: to, calendar: calendar, database: database)
+    }
+
+    /// 一次刷新的三个周期共用一个只读连接（2026-11-21 性能：原实现逐周期独立 sqlite3_open_v2/close）。
+    /// 每个周期仍执行与 load 逐字节相同的查询、过滤与累计（顺序同 Period.allCases），聚合口径、
+    /// 行过滤、排序语义不变——这是第 8/9 张卡的数据源，口径红线。任一周期抛错即整体失败，
+    /// 上层保留旧快照并置异常态（与原循环 break 语义一致）。
+    static func loadAll(now: Date,
+                        databasePath: String = NSHomeDirectory() + "/.zcode/cli/db/db.sqlite",
+                        calendar: Calendar = .current) throws -> [Period: Snapshot] {
+        guard FileManager.default.fileExists(atPath: databasePath) else {
+            return Dictionary(uniqueKeysWithValues: Period.allCases.map { ($0, Snapshot(rows: [], overall: nil)) })
+        }
+        var database: OpaquePointer?
+        let opened = sqlite3_open_v2(databasePath, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil)
+        defer { sqlite3_close(database) }
+        guard opened == SQLITE_OK else { throw ReadFailure() }
+        sqlite3_busy_timeout(database, 1_000)
+        var results: [Period: Snapshot] = [:]
+        for period in Period.allCases {
+            results[period] = try queryWindow(from: period.windowStart(now: now, calendar: calendar),
+                                              to: now, calendar: calendar, database: database)
+        }
+        return results
+    }
+
+    /// 单个时间窗的查询与累计（原 load 主体逐字节保留，仅改为接收已打开的连接）。
+    private static func queryWindow(from: Date, to: Date, calendar: Calendar,
+                                    database: OpaquePointer?) throws -> Snapshot {
         // 通用剔除（计划口径）：cancelled_by_user=1 与 status='running' 的行不进任何统计；
         // 按时间升序读取，保证模型显示名保留首次（最早）出现的大小写。
         let query = """
@@ -3016,8 +3045,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItemAppearanceObs: NSKeyValueObservation?
     private var barThemeDark: Bool?
     // 菜单栏可因深色壁纸、双屏或全屏而与 App 外观合法地不同，不能用 App 外观覆盖菜单栏。
-    // 每 5s 对账，不一致时仅重建不缓存的动态颜色图片，不切换 isVisible、不钉死绘制外观。
-    private var appearancePollTimer: Timer?
+    // 2026-11-21 起 App 级 effectiveAppearance KVO 取代 5s 轮询 timer：系统深浅色两个方向
+    // 切换都会触发同一套对账路径 reconcileBarAppearance，不一致时仅重建不缓存的动态颜色图片，
+    // 不切换 isVisible、不钉死绘制外观；深浅切换防重复仍由 renderBarIfThemeChanged 承担。
+    private var appAppearanceObs: NSKeyValueObservation?
     // 重置卡使用：进行中防重入；结果未知（网络/5xx）时按类型保留同一幂等 key，重试不重复扣卡
     private var resetUseInFlight = false
     private var pendingResetKeys: [String: GLMPendingResetStore.Entry] = [:]
@@ -3053,7 +3084,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var updateMessageDismissal: DispatchWorkItem?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
-    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-connection-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-connection-test") || CommandLine.arguments.contains("--preview-appearance-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
     private var updateTimer: Timer?
@@ -3141,23 +3172,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    /// 本机速度/缓存统计刷新：只读 `~/.zcode/cli/db/db.sqlite`（一次窗口一条分组 SQL 同时产出
-    /// 两卡数据），不联网、不碰凭据。挂在 performRefresh(tokens:) 既有节奏（启动 + 每 5 分钟 +
-    /// 手动全量），后台队列执行后回主线程重建面板；不新增定时器。失败保留旧快照并置异常态。
+    /// 本机速度/缓存统计刷新：只读 `~/.zcode/cli/db/db.sqlite`（三个周期共用一次只读连接，
+    /// 一次窗口一条分组 SQL 同时产出两卡数据），不联网、不碰凭据。挂在 performRefresh(tokens:)
+    /// 既有节奏（启动 + 每 5 分钟 + 手动全量），后台队列执行后回主线程重建面板；不新增定时器。
+    /// 失败保留旧快照并置异常态。
     private func refreshLocalModelStats() {
         DispatchQueue.global().async { [weak self] in
             let calendar = Calendar.current
             let now = Date()
             var results: [GLMLocalModelStats.Period: GLMLocalModelStats.Snapshot] = [:]
             var failed = false
-            for period in GLMLocalModelStats.Period.allCases {
-                do {
-                    results[period] = try GLMLocalModelStats.load(
-                        from: period.windowStart(now: now, calendar: calendar), to: now, calendar: calendar)
-                } catch {
-                    failed = true
-                    break
-                }
+            do {
+                results = try GLMLocalModelStats.loadAll(now: now, calendar: calendar)
+            } catch {
+                failed = true
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
@@ -3224,6 +3252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 几何测试需保留展开模型所需的高度余量；每日图交互由独立测试覆盖。
             if CommandLine.arguments.contains("--preview-popover-test") { dailyExpanded = false; historyExpanded = false }
             if CommandLine.arguments.contains("--preview-quota-history-test") { try? FileManager.default.removeItem(atPath: "/tmp/glm_quota_history_test_result.txt") }
+            if CommandLine.arguments.contains("--preview-appearance-test") { try? FileManager.default.removeItem(atPath: "/tmp/glm_appearance_test_result.txt") }
             installPreviewData()
             // 卡片设置回归的基线必须是默认布局：忽略生产 UserDefaults 里可能存在的自定义顺序
             panelLayout = .default
@@ -3276,6 +3305,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if CommandLine.arguments.contains("--preview-connection-test") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in self?.testConnectionPresentation() }
             }
+            if CommandLine.arguments.contains("--preview-appearance-test") {
+                // 外观观察回归：接上与生产一致的按钮 + App 双 KVO，程序化翻转外观验证两个方向
+                attachBarAppearanceObserver()
+                attachAppAppearanceObserver()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in self?.testAppearanceObservation() }
+            }
             if let i = CommandLine.arguments.firstIndex(of: "--preview-screenshot"), CommandLine.arguments.count > i + 1 {
                 let shotPath = CommandLine.arguments[i + 1]
                 fputs("GLM preview screenshot: scheduled\n", stderr)
@@ -3305,12 +3340,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             forName: UpdateProgressController.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.updateProgressDidChange() }
         // 状态栏底色变化（全屏进出/深浅模式切换）时立即按新外观重画两行余量，不再等下一次数据刷新；
-        // 仅在明暗主题实际变化时执行（setImage 会再次触发 KVO，不去重会形成重画循环）
+        // 仅在明暗主题实际变化时执行（setImage 会再次触发 KVO，不去重会形成重画循环）。
+        // 菜单栏按钮 + App 级 effectiveAppearance 双 KVO 取代旧 5s 轮询 timer（2026-11-21），
+        // 系统深浅色两个方向切换都进入同一套对账路径 reconcileBarAppearance
         attachBarAppearanceObserver()
-        appearancePollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.reconcileBarAppearance()
-        }
-        appearancePollTimer?.tolerance = 1
+        attachAppAppearanceObserver()
         // Startup and polling stay non-interactive. Only an explicit repair/settings click
         // may open a Keychain authorization dialog; a locked item must not stall the menu bar.
         refresh(tokens: true)
@@ -3632,6 +3666,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func attachBarAppearanceObserver() {
         statusItemAppearanceObs = statusItem.button?.observe(\.effectiveAppearance) { [weak self] _, _ in
             DispatchQueue.main.async { self?.renderBarIfThemeChanged() }
+        }
+    }
+
+    /// App 级 effectiveAppearance KVO（取代旧 5s 轮询 timer）：系统深浅色切换、App 外观覆盖
+    /// 变化都会触发；处理路径与轮询完全一致（reconcileBarAppearance）。
+    private func attachAppAppearanceObserver() {
+        appAppearanceObs = NSApp.observe(\.effectiveAppearance, options: []) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.reconcileBarAppearance() }
         }
     }
 
@@ -5187,6 +5229,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         exit(0)
     }
 
+    // 外观观察回归：不动系统设置，程序化翻转 App/按钮外观覆盖（两者一起翻，任一 KVO 先到都收敛），
+    // 断言 KVO 触发同一套重画路径（reconcileBarAppearance / renderBarIfThemeChanged），
+    // 深浅两个方向 barThemeDark 快照都要翻转。不依赖 key window（纯菜单栏图渲染）。
+    // ⚠️ 检查必须用 asyncAfter 链而非嵌套 RunLoop 等待：KVO 处理走 main.async，而主队列
+    // 在当前 main-queue 块（本测试自身）排空中不会重入，嵌套 RunLoop 永远等不到它们。
+    private func testAppearanceObservation() {
+        let resultFile = "/tmp/glm_appearance_test_result.txt"
+        func fail(_ message: String) -> Never {
+            fputs("GLM appearance test: FAIL \(message)\n", stderr)
+            try? "FAIL \(message)".write(toFile: resultFile, atomically: true, encoding: .utf8)
+            exit(1)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        renderBar()   // 建立基线：barThemeDark 快照与菜单栏图
+        guard let baseline = barThemeDark, let button = statusItem.button else { fail("baseline render unavailable") }
+        let target = NSAppearance(named: baseline ? NSAppearance.Name.aqua : NSAppearance.Name.darkAqua)
+        let passMessage = "GLM appearance test: PASS (effectiveAppearance KVO drives menubar rerender in both directions)"
+        var phase = 0          // 0 = 等待翻转到相反主题；1 = 等待翻回基线主题
+        var attempts = 0       // 每 0.1s 检查一次，60 次（6s）超时
+        func check() {
+            attempts += 1
+            guard attempts <= 60 else { fail(phase == 0
+                ? "appearance flip did not trigger the menubar rerender via KVO"
+                : "appearance flip back did not trigger the menubar rerender via KVO") }
+            if phase == 0 {
+                if barThemeDark != nil && barThemeDark != baseline {
+                    phase = 1; attempts = 0
+                    // 方向二：恢复系统跟随（两个方向都必须再次触发）
+                    NSApp.appearance = nil
+                    button.appearance = nil
+                }
+            } else if barThemeDark == baseline {
+                print(passMessage)
+                try? "PASS".write(toFile: resultFile, atomically: true, encoding: .utf8)
+                exit(0)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { check() }
+        }
+        NSApp.appearance = target
+        button.appearance = target
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { check() }
+    }
+
     private func testConnectionPresentation() {
         func fail(_ message: String) -> Never { fputs("GLM connection test: FAIL \(message)\n", stderr); exit(1) }
         func buttons(_ view: NSView) -> [NSButton] {
@@ -6541,14 +6627,15 @@ enum GLMOfflineRegression {
             catch { rejectedStartPlanSchema = true }
             try expect(rejectedStartPlanSchema, "unreadable Start Plan silently became zero")
 
-            // ---- 本机模型速度/缓存命中（GLMLocalModelStats）：计划口径 10 项回归，fixture 全在临时目录 ----
+            // ---- 本机模型速度/缓存命中（GLMLocalModelStats）：计划口径 11 项回归，fixture 全在临时目录 ----
             // 数据事实与口径见 GLMLocalModelStats 头注（docs/plans/2026-11-15-speed-cache-cards.md）。
-            // 10 项断言对照：
+            // 11 项断言对照：
             //  1 加权 decode tps 精确（毫秒→秒换算）          6 命中率加权精确（Σcache_read/Σinput）
             //  2 cancelled/running 行不进样本与分母           7 input≤0 行不进分母（含 cache_read>0 的负 input 行）
             //  3 first_token NULL 行只计请求数               8 无缓存活动 → nil（—）而非 0%；全窗无活动 → 整体也 nil
             //  4 completed≤first 行剔除、不产生除零          9 缺 cache 列 → 抛错；缺表/缺库 → 空快照
             //  5 大小写模型合并、显示名保留首现              10 毫秒时间戳与 startOfDay 日界、周期外行不进统计
+            //  11 单连接批量读三周期与逐周期独立 load 逐字节一致（口径红线）
             let statsPath = root.appendingPathComponent("local-stats.sqlite").path
             var statsFixtureDB: OpaquePointer?
             try expect(sqlite3_open(statsPath, &statsFixtureDB) == SQLITE_OK, "cannot create local stats fixture")
@@ -6649,6 +6736,14 @@ enum GLMOfflineRegression {
             try expect(boundarySeven?.requests == 2 && boundarySeven?.decodeSamples == 2
                        && boundarySeven?.decodeTps == 20 && boundarySeven?.avgTtftMs == 150,
                        "rolling 7-day window lost the previous day's tail")
+            // 11. 一次连接批量读三周期（生产 refreshLocalModelStats 路径）：与逐周期独立 load
+            //     逐字节一致（同库同查询同累计，口径红线）
+            let batchedStats = try GLMLocalModelStats.loadAll(now: now, databasePath: statsPath, calendar: calendar)
+            let thirtyStats = try GLMLocalModelStats.load(from: now.addingTimeInterval(-30 * 86_400), to: now,
+                                                          databasePath: statsPath, calendar: calendar)
+            try expect(batchedStats.count == 3 && batchedStats[.today] == todayStats
+                       && batchedStats[.sevenDays] == sevenStats && batchedStats[.thirtyDays] == thirtyStats,
+                       "single-connection batched stats must match per-period loads byte for byte")
             // 8c. 全部模型无缓存活动 → 整体行命中率也为 nil（独立 fixture 库）
             let overallNilPath = root.appendingPathComponent("local-stats-overall-nil.sqlite").path
             var overallNilDB: OpaquePointer?
@@ -6674,15 +6769,27 @@ enum GLMOfflineRegression {
             let missingTableStats = try GLMLocalModelStats.load(from: todayStart, to: now, databasePath: statsPath, calendar: calendar)
             try expect(missingTableStats.rows.isEmpty && missingTableStats.overall == nil,
                        "missing local stats table must be an empty snapshot")
+            let missingTableBatch = try GLMLocalModelStats.loadAll(now: now, databasePath: statsPath, calendar: calendar)
+            try expect(missingTableBatch.count == 3
+                       && missingTableBatch.values.allSatisfy { $0.rows.isEmpty && $0.overall == nil },
+                       "missing local stats table must batch-load as empty snapshots")
             try expect(sqlite3_exec(statsFixtureDB, "CREATE TABLE model_usage (unrecognized TEXT)", nil, nil, nil) == SQLITE_OK,
                        "cannot prepare incompatible local stats fixture")
             var rejectedStatsSchema = false
             do { _ = try GLMLocalModelStats.load(from: todayStart, to: now, databasePath: statsPath, calendar: calendar) }
             catch { rejectedStatsSchema = true }
             try expect(rejectedStatsSchema, "unreadable local stats silently became zero")
+            var rejectedBatchSchema = false
+            do { _ = try GLMLocalModelStats.loadAll(now: now, databasePath: statsPath, calendar: calendar) }
+            catch { rejectedBatchSchema = true }
+            try expect(rejectedBatchSchema, "unreadable local stats silently became zero (batched)")
             let missingStatsFile = try GLMLocalModelStats.load(from: todayStart, to: now,
                 databasePath: root.appendingPathComponent("missing-local-stats.sqlite").path, calendar: calendar)
             try expect(missingStatsFile.rows.isEmpty, "missing local stats database was rejected")
+            let missingStatsBatch = try GLMLocalModelStats.loadAll(now: now,
+                databasePath: root.appendingPathComponent("missing-local-stats.sqlite").path, calendar: calendar)
+            try expect(missingStatsBatch.count == 3 && missingStatsBatch.values.allSatisfy { $0.rows.isEmpty },
+                       "missing local stats database must batch-load as empty snapshots")
 
             // ---- status.json 写盘器（GLMStatusWriter）：临时根 + 注入时钟/写入器，不读真实 status.json ----
             // 断言对照：原子写选项、心跳窗口内内容去重、内容变化立即写、≥60s 心跳必写并刷新时间戳、
@@ -7504,7 +7611,7 @@ enum GLMOfflineRegression {
             try expect(!CredStore.isValidEmail(String(repeating: "a", count: 250) + "@example.com"),
                        "over-length email accepted")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, status writer atomic/dedup/heartbeat/coalesce)")
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)

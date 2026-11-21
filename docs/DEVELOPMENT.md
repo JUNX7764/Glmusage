@@ -62,6 +62,9 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-connection-test
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-connection-test --preview-narrow
 
+# 菜单栏外观观察回归：程序化翻转 App/按钮外观（不动系统设置），深浅两个方向都要触发重画
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-appearance-test
+
 # 原生 Popover 假数据交互回归（与其他GUI进程错开至少5秒）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-popover-test
 
