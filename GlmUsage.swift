@@ -288,14 +288,21 @@ enum CredStore {
         return zcodeAccountEmail(record: obj)
     }
 
+    /// 解密 ZCode OAuth 记录的 access_token 与 user_info（同一 enc 格式）。
+    /// user_info 无 enc 前缀时按明文处理；字段缺失返回 nil，不做任何同源判断。
+    static func decryptZCodeOAuthRecord(_ record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> (token: String?, userInfoJSON: String?) {
+        let token = decrypt(record["oauth:bigmodel:access_token"] ?? "", secret: secret, systemKey: systemKey)
+        let rawUserInfo = record["oauth:bigmodel:user_info"] ?? ""
+        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:") ? decrypt(rawUserInfo, secret: secret, systemKey: systemKey) : rawUserInfo)
+        return (token, userInfoJSON)
+    }
+
     // 手动连接的 Key 可能属于另一个账号：仅把邮箱作为 ZCode 登录身份展示，不能归属给套餐。
     // 不请求网络、不交互式访问钥匙串；读取失败即隐藏，不复用旧邮箱。
     static func zcodeAccountEmail(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> String? {
-        let oauthToken = decrypt(record["oauth:bigmodel:access_token"] ?? "", secret: secret, systemKey: systemKey)
-        let rawUserInfo = record["oauth:bigmodel:user_info"] ?? ""
-        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:") ? decrypt(rawUserInfo, secret: secret, systemKey: systemKey) : rawUserInfo)
+        let parts = decryptZCodeOAuthRecord(record, secret: secret, systemKey: systemKey)
         return resolveAccountEmail(envValue: nil, credentialKeyCandidates: 0,
-                                   oauthAccessToken: oauthToken, userInfoJSON: userInfoJSON)
+                                   oauthAccessToken: parts.token, userInfoJSON: parts.userInfoJSON)
     }
     static func loadZCodeAccountEmail() -> String? {
         guard let record = credentialRecord() else { return nil }
@@ -308,11 +315,9 @@ enum CredStore {
     /// 返回值仅用于分区哈希：不写 status.json、不打日志、不进 JSON 内容。
     static func oauthHistoryIdentity(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> String? {
         guard preferredApiKey(record: record) == nil else { return nil }
-        let oauthToken = decrypt(record["oauth:bigmodel:access_token"] ?? "", secret: secret, systemKey: systemKey)
-        guard let token = oauthToken?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return nil }
-        let rawUserInfo = record["oauth:bigmodel:user_info"] ?? ""
-        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:") ? decrypt(rawUserInfo, secret: secret, systemKey: systemKey) : rawUserInfo)
-        guard let jsonString = userInfoJSON, !jsonString.isEmpty,
+        let parts = decryptZCodeOAuthRecord(record, secret: secret, systemKey: systemKey)
+        guard let token = parts.token?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return nil }
+        guard let jsonString = parts.userInfoJSON, !jsonString.isEmpty,
               let info = (try? JSONSerialization.jsonObject(with: Data(jsonString.utf8))) as? [String: Any],
               let id = info["id"] as? String else { return nil }
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
