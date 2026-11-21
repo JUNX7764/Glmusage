@@ -37,6 +37,8 @@
 - **订阅**：通过 `/api/biz/subscription/list` 获取有效套餐与到期时间；明确无有效订阅时清除旧套餐数据，普通失败保留旧值并提示。
 - **重置卡**：通过 ZCode `/api/v1/coding-plan/reset/status` 查询 5 小时卡和周卡。手动使用走 `/reset/use`，必须由用户点击并二次确认；结果未知时按卡类型复用原幂等 key，禁止生成新请求盲目重试。
 - **Peak**：按 Asia/Shanghai 计算工作日高峰、周末和活动时段。活动日期修改后必须运行 `--peak-test`。
+- **开机自启**：偏好记录 = `~/Library/LaunchAgents/com.local.glm-usage.plist` 的存在与否。切换时 App 只读探测（`launchctl print` + plist 存在性，决策矩阵见 `Sources/GLMLaunchAgent.swift`）；需要立即生效的两种结果弹三键确认（立即重启并生效 / 仅保存偏好 / ESC 取消），受控重启固定为「写/删 plist → 派生 detach helper → App 正常 exit(0) → helper 等进程消失后 bootstrap（ON）或 bootout+`open -n`（OFF）」，App 内绝不直接 bootstrap/bootout 自己；helper 失败写固定回执文件，下次启动提示一次后清除。已加载任务指向其他副本（身份不匹配）时只落盘偏好并报错，绝不碰别人的 job。
+- **更新脚本接管规则**：`scripts/update.sh` 的 bootout 判定保持「已加载且身份匹配」；替换后的启动判定为 plist 偏好存在或原 job 已加载 → bootstrap（回滚同规则），两者皆无 → `open -n`。曾加载但偏好缺失的遗留状态按 App 同款定义恢复 plist 保守保留托管语义；plist 指向其他副本一律中止。
 - **刷新**：额度每 10 秒，慢项每 5 分钟；失败保留旧值与原成功时间，并显示错误或过期状态。
 
 凭据保存在本机，但查询智谱／ZCode 时会作为必要认证信息发送给对应服务；不会上传到开发者自有服务器。更新检查会连接 GitHub。应用只读取 ZCode 凭据，不修改凭据文件。
@@ -62,6 +64,9 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-connection-test
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-connection-test --preview-narrow
 
+# 菜单栏外观观察回归：程序化翻转 App/按钮外观（不动系统设置），深浅两个方向都要触发重画
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-appearance-test
+
 # 原生 Popover 假数据交互回归（与其他GUI进程错开至少5秒）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-popover-test
 
@@ -73,13 +78,18 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-popover --preview-quota-history --preview-quota-history-test
 
 # 可附加 --preview-dark / --preview-narrow；状态用 --preview-quota-history-state=empty|short|long|unsaved|volatile|protected
-# 每日图空态/缺口/基期0/数据不足变体（与 --preview-daily-test 错开 ≥5s 逐个跑）
-./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-unavailable
-./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-basezero
-./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-insufficient
+# 每日图空态/缺口/基期0/数据不足变体（与 --preview-daily-test 错开 ≥5s 逐个跑；
+# 假数据离线预览，可加 --preview-screenshot <path> 渲染后自动退出）
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-unavailable --preview-screenshot /tmp/glm_daily_unavailable.png
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-basezero --preview-screenshot /tmp/glm_daily_basezero.png
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-insufficient --preview-screenshot /tmp/glm_daily_insufficient.png
 
 # 卡片显隐/排序/统一菜单/空态/滚动与动态键盘链（其他 GUI 测试错开 ≥5s）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-card-settings-test
+
+# 面板增量渲染回归：无变化刷新不重建、数值变化仅替换目标卡、关闭期标脏打开即最新、
+# 焦点在被替换卡内恢复、结构变化立即重排（其他 GUI 测试错开 ≥5s）
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-perf-test
 
 # 更新流程预览（进度行原位展示；不执行真实更新）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-updating
@@ -92,7 +102,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./GlmUsage.app/Contents/MacOS/GlmUsage --once
 ```
 
-无 ZCode 凭证库时，可在真实网络验收中通过 `GLM_API_KEY` 提供 key；不得把真实 key 写入命令记录、文档或提交。运行状态诊断写入 `~/Library/Application Support/GlmUsage/status.json`。
+无 ZCode 凭证库时，可在真实网络验收中通过 `GLM_API_KEY` 提供 key；不得把真实 key 写入命令记录、文档或提交。运行状态诊断写入 `~/Library/Application Support/GlmUsage/status.json`；写盘为原子写，主线程只提交快照，内容未变（剔除逐周期时间戳字段后比对）时跳过，距上次成功写盘 ≥60s 强制心跳刷新 `updatedAt`/文件 mtime——部署验收以 `updatedAt`/mtime 判活仍成立（最长 60s 刷新一次）。
 
 每日图所选 Token 值在交互切换时以 320ms ease-out 过渡，日期与辅助功能目标值即时更新；首次显示、缺失及恢复、减少动态效果或移出窗口时即时到位。环比胶囊在窄版长值下可增高为双行，保留完整文字。
 
@@ -103,6 +113,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `GlmUsage.swift` | 应用入口、数据层、刷新调度与面板组装 |
 | `PanelCustomization.swift` | 面板卡片布局模型（`GLMPanelLayout`）与卡片设置视图（`GLMCardSettingsView`） |
 | `Sources/GLMQuotaCycle*.swift` | 周额度历史的模型、上下文、存储、协调器与原生视图 |
+| `Sources/GLMLaunchAgent.swift` | 开机自启开关的决策矩阵、只读探测、受控重启 helper 与失败回执 |
 | `Sources/GLMPanelVisuals.swift`、`Sources/GLMAnimatedTokenValue.swift`、`Sources/GLMDeltaChip.swift` | 绘图几何、每日 Token 数值过渡和比较值胶囊 |
 | `tests/ui_refinements_test.py` | 独立 Swift 视觉几何、数值过渡、胶囊和图标离线夹具 |
 | `tests/quota_cycle_history_test.py` | 假数据与临时目录中的周额度历史测试 |

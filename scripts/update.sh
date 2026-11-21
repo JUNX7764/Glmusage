@@ -16,6 +16,8 @@ WORK=""
 BACKUP=""
 INSTALLED=""
 AGENT=0
+JOB_LOADED=0
+PREF_PLIST=0
 STOPPED=0
 SUCCESS=0
 NEW_VERSION=""
@@ -68,7 +70,9 @@ JXA
 }
 
 start_and_wait() {
-    if [ "$AGENT" = 1 ]; then
+    # 启动判定按用户意图：plist 偏好存在或原 job 已加载 → bootstrap 接管拉起
+    # （回滚路径同规则）；两者皆无（用户意图无记录）→ open -n 普通启动，不猜测
+    if [ "$AGENT" = 1 ] || [ "$PREF_PLIST" = 1 ]; then
         launchctl bootstrap "gui/${MYUID}" "$AGENT_PLIST" || { echo "!! LaunchAgent 加载失败，无法启动应用"; return 1; }
     else
         open -n "$INSTALLED" || { echo "!! 应用启动命令失败"; return 1; }
@@ -238,14 +242,42 @@ if other_copy_running; then
     echo "!! 检测到另一应用副本正在运行，已中止"
     exit 1
 fi
+# 只读探测：job 是否已加载（print + program 精确比对）与 plist 偏好是否存在。
+# bootout 判定保持「已加载且身份匹配」（AGENT）；替换后的启动判定改为
+# plist 偏好存在或原 job 已加载 → bootstrap，两者皆无 → open -n（用户意图无记录不猜测）。
+JOB_LOADED=0
+PREF_PLIST=0
 if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
     LOADED_BINARY="$(printf '%s\n' "$JOB_INFO" | awk '/^[[:space:]]*program = / { sub(/^[[:space:]]*program = /, ""); print; exit }')"
     [ "$LOADED_BINARY" = "$BINARY" ] || { echo "!! 已加载的 LaunchAgent 指向另一副本或无法确认，已中止"; exit 1; }
-    [ -f "$AGENT_PLIST" ] || { echo "!! LaunchAgent plist 不存在"; exit 1; }
-    AGENT_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null || true)"
-    [ "$AGENT_BINARY" = "$BINARY" ] || { echo "!! LaunchAgent 指向另一副本，已中止"; exit 1; }
-    AGENT=1
+    JOB_LOADED=1
 fi
+if [ -f "$AGENT_PLIST" ]; then
+    AGENT_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null || true)"
+    [ "$AGENT_BINARY" = "$BINARY" ] || { echo "!! LaunchAgent 指向另一副本，已中止（若确要更新此副本，请先移除或修正 ~/Library/LaunchAgents/com.local.glm-usage.plist）"; exit 1; }
+    PREF_PLIST=1
+elif [ "$JOB_LOADED" = 1 ]; then
+    # 曾加载但偏好缺失（旧版关闭开关只删 plist、不解除托管的遗留状态）：保守保留托管
+    # 语义，按 App 同款定义恢复 plist，保证 bootout 后 bootstrap 能把应用接管拉回；
+    # 回滚路径的 bootstrap 同样依赖该文件。
+    mkdir -p "$(dirname "$AGENT_PLIST")" || { echo "!! 无法创建 LaunchAgents 目录，已中止"; exit 1; }
+    cat > "$AGENT_PLIST" <<PLIST || { echo "!! 无法恢复 LaunchAgent 配置，已中止"; exit 1; }
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array><string>${BINARY}</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict><key>SuccessfulExit</key><false/></dict>
+</dict>
+</plist>
+PLIST
+    PREF_PLIST=1
+fi
+AGENT="$JOB_LOADED"
 
 echo "==> 3/5 在安装位置旁暂存新版本"
 WORK="$(mktemp -d "$(dirname "$INSTALLED")/.${APP_NAME}.update.XXXXXX")" || { echo "!! 无法在应用旁创建暂存目录（磁盘空间或位置权限不足），已中止"; exit 1; }
