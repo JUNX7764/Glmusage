@@ -5337,6 +5337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let settingsButton = NSButton(image: NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "面板设置") ?? NSImage(), target: self, action: #selector(showPanelSettingsMenu(_:)))
         settingsButton.isBordered = false; settingsButton.contentTintColor = .secondaryLabelColor
         settingsButton.toolTip = "面板设置"; settingsButton.setAccessibilityLabel("面板设置")
+        settingsButton.identifier = NSUserInterfaceItemIdentifier("GLMRole.header.settings")   // 稳定身份：header 原位重建后焦点可恢复
         settingsButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
         settingsButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         header.addArrangedSubview(settingsButton)
@@ -8324,14 +8325,20 @@ enum GLMOfflineRegression {
                 try body.write(to: target, atomically: true, encoding: .utf8)
                 try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target.path)
             }
-            func runHelper(_ direction: GLMLaunchAgent.Direction, pid: Int32, bootstrapFails: Bool) throws -> TimeInterval {
+            func runHelper(_ direction: GLMLaunchAgent.Direction, pid: Int32, bootstrapFails: Bool,
+                           instanceFound: Bool = false, maxpolls: Int = 50) throws -> TimeInterval {
                 try writeMock("launchctl", fails: bootstrapFails)
                 try writeMock("open", fails: false)
+                // pgrep mock：instanceFound=true 模拟「动作前仍有 GlmUsage 实例在跑」
+                let pgrep = mockBin.appendingPathComponent("pgrep")
+                try "#!/bin/sh\nexit \(instanceFound ? 0 : 1)\n".write(to: pgrep, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: pgrep.path)
+                try "".write(to: lcLogPath, atomically: true, encoding: .utf8)
                 let helper = Process()
                 helper.executableURL = URL(fileURLWithPath: "/bin/sh")
                 helper.arguments = ["-c", GLMLaunchAgent.helperScript(direction), "self-test-helper",
                                     "\(pid)", fakePlist.path, "/tmp/fixture/GlmUsage.app",
-                                    receiptForHelper.path, GLMLaunchAgent.label]
+                                    receiptForHelper.path, GLMLaunchAgent.label, "GlmUsage", "\(maxpolls)"]
                 var env = ProcessInfo.processInfo.environment
                 env["PATH"] = mockBin.path + ":/usr/bin:/bin:/usr/sbin:/sbin"
                 helper.environment = env
@@ -8373,6 +8380,34 @@ enum GLMOfflineRegression {
             try expect(GLMLaunchAgent.consumeResultLog(path: receiptForHelper.path)?
                 .contains("launchd 接管失败") == true, "兜底回执未映射提示")
             try expect(!FileManager.default.fileExists(atPath: receiptForHelper.path), "回执消费后必须删除")
+            // 对抗审查 P1 修复红绿：实例守卫与等待超时——宁可放弃接管，不冒双实例叠死风险
+            let _ = try runHelper(.bootstrap, pid: 999_999, bootstrapFails: false, instanceFound: true)
+            try expect(!lcLogLines().contains { $0.contains("bootstrap") }
+                       && !lcLogLines().contains { $0.contains("open -n") },
+                       "实例守卫必须放弃 bootstrap 与兜底 open")
+            try expect(GLMLaunchAgent.consumeResultLog(path: receiptForHelper.path)?
+                .contains("跳过接管动作") == true, "实例守卫必须写回执提示")
+            let _ = try runHelper(.bootoutThenOpen, pid: 999_999, bootstrapFails: false, instanceFound: true)
+            try expect(!lcLogLines().contains { $0.contains("bootout") }
+                       && !lcLogLines().contains { $0.contains("open -n") },
+                       "OFF 方向实例守卫必须放弃 bootout 与 open")
+            try expect(GLMLaunchAgent.consumeResultLog(path: receiptForHelper.path)?
+                .contains("跳过接管动作") == true, "OFF 实例守卫必须写回执")
+            let stubborn = Process()
+            stubborn.executableURL = URL(fileURLWithPath: "/bin/sh")
+            stubborn.arguments = ["-c", "sleep 5"]
+            try stubborn.run()
+            let timeoutElapsed = try runHelper(.bootstrap, pid: stubborn.processIdentifier,
+                                               bootstrapFails: false, maxpolls: 3)
+            stubborn.terminate(); stubborn.waitUntilExit()
+            try expect(timeoutElapsed >= 0.4 && timeoutElapsed < 10, "超时分支应快速放弃（实测 \(timeoutElapsed)s）")
+            try expect(!lcLogLines().contains { $0.contains("bootstrap") }, "等待超时不得执行 launchctl 动作")
+            try expect(GLMLaunchAgent.consumeResultLog(path: receiptForHelper.path)?
+                .contains("退出超时") == true, "等待超时必须写回执提示")
+            let _ = try runHelper(.bootstrap, pid: 999_999, bootstrapFails: true, instanceFound: true)
+            try expect(!lcLogLines().contains { $0.contains("open -n") }, "实例已出现时不得 open 兜底")
+            try expect(GLMLaunchAgent.consumeResultLog(path: receiptForHelper.path)?
+                .contains("跳过接管动作") == true, "实例出现时的回执应为准确实例提示")
 
             print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, panel snapshot equality/quantization/structural classification, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence, launch agent toggle decision matrix/helper script/receipt)")
             return 0

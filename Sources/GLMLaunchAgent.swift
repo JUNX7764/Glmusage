@@ -9,8 +9,9 @@ import Foundation
 // - 「立即生效」= 受控重启：App 绝不直接 bootstrap/bootout 自己（bootout 会终止
 //   自己，bootstrap 未加载 job 会拉起第二实例造成同坐标 NSStatusItem 叠死）。
 //   流程固定为：写/删 plist → 派生 detach helper 子进程 → App 正常 exit(0)
-//   （KeepAlive=SuccessfulExit:false 对成功退出不复活）→ helper 等本进程消失后
-//   执行 launchctl 动作 → 失败写结果回执，下次启动提示一次，不静默。
+//   （KeepAlive=SuccessfulExit:false 对成功退出不复活）→ helper 等本进程消失
+//   （超时即放弃动作写回执）且 pgrep -x 确认无其他实例后，执行 launchctl 动作
+//   → 失败写结果回执，下次启动提示一次，不静默。
 // - 探测阶段只做只读操作（launchctl print 与查看 plist），绝不写生产 LaunchAgent；
 //   身份比对用 launchctl print 的 program 路径与可执行文件路径精确比对，
 //   已加载任务指向其他副本时绝不动作（绝不碰别人的 job）。
@@ -129,39 +130,59 @@ enum GLMLaunchAgent {
     }
 
     /// helper 参数布局（两个方向统一）：$1=等待退出的 PID $2=plist 路径 $3=App 路径
-    /// $4=失败回执路径 $5=job label。等待上限约 10s（App 卡在收尾时不无限等待），
-    /// 再加 0.5s 余量等进程完全消失，避免 bootstrap 拉起第二实例造成图标叠位。
+    /// $4=失败回执路径 $5=job label $6=进程名（pgrep -x 精确守卫用）$7=轮询上限。
+    /// 等待上限 50×0.2s≈10s（App 卡在收尾时不无限等待）；超时或动作前发现仍有
+    /// GlmUsage 实例（pgrep -x 精确匹配进程名，绝不按路径模糊匹配）一律放弃
+    /// launchctl 动作并写回执——宁可本次不接管，也不冒双实例叠死图标的风险
+    /// （对抗审查 P1：等待超时后照常 bootstrap / 窗口期用户手动开 App 都会双实例）。
+    /// 余量 0.5s 等进程完全消失后再动作。
     static func helperScript(_ direction: Direction) -> String {
-        let waitLoop = """
-        pid="$1"; plist="$2"; app="$3"; log="$4"; label="$5"
+        let waitAndGuard = """
+        pid="$1"; plist="$2"; app="$3"; log="$4"; label="$5"; procname="$6"; maxpolls="$7"
+        stamp() { date '+%Y-%m-%d %H:%M:%S'; }
         n=0
         while kill -0 "$pid" 2>/dev/null; do
           n=$((n+1))
-          [ "$n" -ge 50 ] && break
+          [ "$n" -ge "$maxpolls" ] && break
           sleep 0.2
         done
+        if kill -0 "$pid" 2>/dev/null; then
+          printf 'wait-timeout\\t%s\\n' "$(stamp)" > "$log" 2>/dev/null
+          exit 0
+        fi
         sleep 0.5
+        if pgrep -x "$procname" >/dev/null 2>&1; then
+          printf 'instance-exists\\t%s\\n' "$(stamp)" > "$log" 2>/dev/null
+          exit 0
+        fi
         """
         switch direction {
         case .bootstrap:
-            return waitLoop + """
+            return waitAndGuard + """
 
             if launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then
               exit 0
             fi
-            printf 'bootstrap-failed\\t%s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "$log" 2>/dev/null
+            if pgrep -x "$procname" >/dev/null 2>&1; then
+              printf 'instance-exists\\t%s\\n' "$(stamp)" > "$log" 2>/dev/null
+              exit 0
+            fi
+            printf 'bootstrap-failed\\t%s\\n' "$(stamp)" > "$log" 2>/dev/null
             if ! open -n "$app" >/dev/null 2>&1; then
-              printf 'open-failed\\t%s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$log" 2>/dev/null
+              printf 'open-failed\\t%s\\n' "$(stamp)" >> "$log" 2>/dev/null
             fi
             """
         case .bootoutThenOpen:
-            return waitLoop + """
+            return waitAndGuard + """
 
             launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || {
-              printf 'bootout-failed\\t%s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "$log" 2>/dev/null
+              printf 'bootout-failed\\t%s\\n' "$(stamp)" > "$log" 2>/dev/null
             }
+            if pgrep -x "$procname" >/dev/null 2>&1; then
+              exit 0
+            fi
             if ! open -n "$app" >/dev/null 2>&1; then
-              printf 'open-failed\\t%s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$log" 2>/dev/null
+              printf 'open-failed\\t%s\\n' "$(stamp)" >> "$log" 2>/dev/null
             fi
             """
         }
@@ -183,6 +204,10 @@ enum GLMLaunchAgent {
             return "开机自启已关闭，但解除 launchd 接管未成功；可再次切换确认或注销后检查"
         case "open-failed":
             return "开机自启设置已保存，但应用未能自动重新打开，请手动启动"
+        case "wait-timeout":
+            return "应用退出超时，本次「立即生效」已取消；偏好已保存，下次登录或更新时生效"
+        case "instance-exists":
+            return "检测到另一个正在运行的实例，已跳过接管动作以避免重复；偏好已保存，下次登录或更新时生效"
         default: return nil
         }
     }
@@ -206,11 +231,13 @@ enum GLMLaunchAgent {
 
     /// 派生 detach helper（/bin/sh -c，独立于本进程存活）。调用方随后自行正常退出；
     /// 返回 false 表示派生失败，调用方不得退出，改走「仅保存偏好」并提示。
+    /// 进程名取 App 路径末段（pgrep -x 精确守卫），轮询上限 50×0.2s≈10s。
     static func spawnExitHelper(direction: Direction, waitingPID: Int32, appPath: String) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", helperScript(direction), "glm-launchctl-helper",
-                             "\(waitingPID)", plistPath, appPath, resultLogPath, label]
+                             "\(waitingPID)", plistPath, appPath, resultLogPath, label,
+                             (appPath as NSString).lastPathComponent, "50"]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return false }

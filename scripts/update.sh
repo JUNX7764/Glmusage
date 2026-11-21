@@ -254,7 +254,7 @@ if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
 fi
 if [ -f "$AGENT_PLIST" ]; then
     AGENT_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null || true)"
-    [ "$AGENT_BINARY" = "$BINARY" ] || { echo "!! LaunchAgent 指向另一副本，已中止"; exit 1; }
+    [ "$AGENT_BINARY" = "$BINARY" ] || { echo "!! LaunchAgent 指向另一副本，已中止（若确要更新此副本，请先移除或修正 ~/Library/LaunchAgents/com.local.glm-usage.plist）"; exit 1; }
     PREF_PLIST=1
 elif [ "$JOB_LOADED" = 1 ]; then
     # 曾加载但偏好缺失（旧版关闭开关只删 plist、不解除托管的遗留状态）：保守保留托管
