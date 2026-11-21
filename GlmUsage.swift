@@ -3097,7 +3097,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var cycle = 0
     private let refreshGate = RefreshGate()
     private let quotaGate = RefreshGate()
-    private let launchAgentLabel = "com.local.glm-usage"
     // token 统计每 N 个刷新周期拉一次（主循环 10s × 30 = 5 分钟；额度窗口每轮都刷）
     private let tokenEveryCycles = 30
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
@@ -3349,6 +3348,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             return
+        }
+        // 上次开关切换受控重启 helper 的失败回执：消费一次并提示（不静默），
+        // 成功路径不产生回执文件，启动时无额外开销
+        if let helperMessage = GLMLaunchAgent.consumeResultLog() {
+            setUpdateMessage(helperMessage, dismissAfter: 10)
         }
         rebuildPanel()
         renderBar()
@@ -5350,7 +5354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let msg = s.updateMessage { footer.addArrangedSubview(panelLabel(msg, color: .secondaryLabelColor)) }
         let actions = panelRow(); actions.spacing = 6
         let refresh = panelButton("立即刷新", #selector(onRefresh), prominent: true); refresh.keyEquivalent = "r"; refresh.keyEquivalentModifierMask = .command; refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true; refresh.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.refresh"); actions.addArrangedSubview(refresh)
-        let login = NSButton(checkboxWithTitle: "开机自启", target: self, action: #selector(onToggleLogin)); login.font = .systemFont(ofSize: 12); login.state = s.loginItemEnabled ? .on : .off; login.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.login"); actions.addArrangedSubview(login); actions.addArrangedSubview(panelSpacer())
+        let login = NSButton(checkboxWithTitle: "开机自启", target: self, action: #selector(onToggleLogin(_:))); login.font = .systemFont(ofSize: 12); login.state = s.loginItemEnabled ? .on : .off; login.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.login"); actions.addArrangedSubview(login); actions.addArrangedSubview(panelSpacer())
         let quit = panelButton("退出", #selector(onQuit)); quit.keyEquivalent = "q"; quit.keyEquivalentModifierMask = .command; quit.widthAnchor.constraint(equalToConstant: 40).isActive = true; quit.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.quit"); actions.addArrangedSubview(quit)
         footer.addArrangedSubview(actions); actions.widthAnchor.constraint(equalToConstant: inner).isActive = true
         return footer
@@ -6393,42 +6397,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     // MARK: 开机自启（LaunchAgent）
-
-    private var launchAgentPath: String {
-        NSHomeDirectory() + "/Library/LaunchAgents/\(launchAgentLabel).plist"
-    }
+    //
+    // 决策矩阵与受控重启见 Sources/GLMLaunchAgent.swift。需要受控重启的两种结果
+    // 先弹三键确认：立即重启并生效（helper 托底重启）/ 仅保存偏好（旧行为，下次
+    // 登录或更新生效）/ ESC 取消不动；其余结果直接落盘并提示。
 
     private func isLoginItemEnabled() -> Bool {
-        FileManager.default.fileExists(atPath: launchAgentPath)
+        FileManager.default.fileExists(atPath: GLMLaunchAgent.plistPath)
     }
 
-    @objc private func onToggleLogin() {
-        if preview { setUpdateMessage("预览模式不会修改开机自启"); return }
-        if isLoginItemEnabled() {
-            try? FileManager.default.removeItem(atPath: launchAgentPath)
+    /// 偏好落盘：与 scripts/update.sh 恢复分支同款定义；写入前确保目录存在
+    private func writeLaunchAgentPlist(executablePath: String) {
+        try? FileManager.default.createDirectory(
+            atPath: NSHomeDirectory() + "/Library/LaunchAgents", withIntermediateDirectories: true)
+        try? GLMLaunchAgent.plistContent(executablePath: executablePath)
+            .write(toFile: GLMLaunchAgent.plistPath, atomically: true, encoding: .utf8)
+    }
+
+    private func applyLoginPreference(turningOn: Bool) {
+        if turningOn {
+            writeLaunchAgentPlist(executablePath: Bundle.main.executablePath ?? "")
         } else {
-            let exec = Bundle.main.executablePath ?? ""
-            // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
-            let plist = """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-                <key>Label</key><string>\(launchAgentLabel)</string>
-                <key>ProgramArguments</key>
-                <array><string>\(exec)</string></array>
-                <key>RunAtLoad</key><true/>
-                <key>KeepAlive</key>
-                <dict><key>SuccessfulExit</key><false/></dict>
-            </dict>
-            </plist>
-            """
-            try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+            try? FileManager.default.removeItem(atPath: GLMLaunchAgent.plistPath)
         }
-        updateUI()
-        // 只写 plist 不做 launchctl bootstrap：本会话不生效，明示而非静默
-        setUpdateMessage(isLoginItemEnabled() ? "已开启开机自启（下次登录生效）" : "已关闭开机自启（下次登录生效）",
-                         dismissAfter: 4)
+    }
+
+    @objc private func onToggleLogin(_ sender: NSButton) {
+        if preview { setUpdateMessage("预览模式不会修改开机自启"); return }
+        let action = GLMLaunchAgent.decide(
+            wantEnabled: sender.state == .on,
+            state: GLMLaunchAgent.probe(binaryPath: Bundle.main.executablePath ?? ""))
+        switch action {
+        case .writeAndBootstrap, .removeAndRelaunch:
+            presentLoginRestartConfirmation(action, checkbox: sender)
+        case .writeSynced:
+            applyLoginPreference(turningOn: true)
+            setUpdateMessage("已开启开机自启（当前实例已由 launchd 接管，立即生效）", dismissAfter: 4)
+        case .removeOnly:
+            applyLoginPreference(turningOn: false)
+            setUpdateMessage("已关闭开机自启（当前无受管任务，无需重启）", dismissAfter: 4)
+        case .writeForeignConflict, .removeForeignConflict:
+            applyLoginPreference(turningOn: action == .writeForeignConflict)
+            setUpdateMessage("系统已加载的同名任务指向其他副本，本会话不改动 launchd 状态；偏好已保存",
+                             dismissAfter: 8)
+        }
+    }
+
+    /// 受控重启方向的三键确认：主键立即重启并生效，副键仅保存偏好（旧行为），ESC 取消不动
+    private func presentLoginRestartConfirmation(_ action: GLMLaunchAgent.Action, checkbox: NSButton) {
+        let turningOn = action == .writeAndBootstrap
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = turningOn ? "开启开机自启？" : "关闭开机自启？"
+        alert.informativeText = turningOn
+            ? "立即生效需要退出当前实例，由 launchd 接管后重新拉起，菜单栏图标会短暂消失后恢复。\n也可以仅保存偏好，下次登录时生效。"
+            : "立即生效需要退出当前实例、解除 launchd 接管后自动重新打开（本次会话继续使用）。\n也可以仅保存偏好，下次登录时生效。"
+        alert.alertStyle = turningOn ? .informational : .warning
+        alert.addButton(withTitle: "立即重启并生效")
+        alert.addButton(withTitle: "仅保存偏好")
+        alert.addButton(withTitle: "取消")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            applyLoginPreference(turningOn: turningOn)
+            let spawned = GLMLaunchAgent.spawnExitHelper(
+                direction: turningOn ? .bootstrap : .bootoutThenOpen,
+                waitingPID: ProcessInfo.processInfo.processIdentifier,
+                appPath: Bundle.main.bundlePath)
+            guard spawned else {
+                setUpdateMessage("无法安排受控重启，已仅保存偏好（下次登录生效）", dismissAfter: 6)
+                return
+            }
+            // helper 会轮询等待本进程消失；让弹窗闭合与状态写盘收尾完成后再正常退出
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { NSApp.terminate(nil) }
+        case .alertSecondButtonReturn:
+            applyLoginPreference(turningOn: turningOn)
+            setUpdateMessage(turningOn ? "已开启开机自启（下次登录生效）" : "已关闭开机自启（下次登录生效）",
+                             dismissAfter: 4)
+        default:
+            // 取消不动：恢复复选框与偏好一致（此处未写/删 plist，状态未变）
+            checkbox.state = isLoginItemEnabled() ? .on : .off
+        }
     }
 
     private var connectingPlan = false
@@ -8199,7 +8247,134 @@ enum GLMOfflineRegression {
             try expect(!CredStore.isValidEmail(String(repeating: "a", count: 250) + "@example.com"),
                        "over-length email accepted")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, panel snapshot equality/quantization/structural classification, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence)")
+            // 开机自启决策矩阵（纯函数；偏好写入/删除在所有分支无条件执行，
+            // 动作只由「是否已加载 + 身份是否匹配」分流）：临时构造，不碰真实 plist
+            for plistExists in [false, true] {
+                let stateUnloaded = GLMLaunchAgent.MachineState(plistExists: plistExists, jobLoaded: false, jobMatches: false)
+                try expect(GLMLaunchAgent.decide(wantEnabled: true, state: stateUnloaded) == .writeAndBootstrap,
+                           "ON + 未加载必须走 bootstrap 方向受控重启")
+                try expect(GLMLaunchAgent.decide(wantEnabled: false, state: stateUnloaded) == .removeOnly,
+                           "OFF + 未加载只删偏好不重启")
+                for jobMatches in [false, true] {
+                    let stateLoaded = GLMLaunchAgent.MachineState(plistExists: plistExists, jobLoaded: true, jobMatches: jobMatches)
+                    try expect(GLMLaunchAgent.decide(wantEnabled: true, state: stateLoaded) == (jobMatches ? .writeSynced : .writeForeignConflict),
+                               "ON + 已加载必须按身份分流")
+                    try expect(GLMLaunchAgent.decide(wantEnabled: false, state: stateLoaded) == (jobMatches ? .removeAndRelaunch : .removeForeignConflict),
+                               "OFF + 已加载必须按身份分流")
+                }
+            }
+            try expect(GLMLaunchAgent.Action.writeAndBootstrap.needsRestart && GLMLaunchAgent.Action.removeAndRelaunch.needsRestart,
+                       "两个受控重启方向需要确认弹窗")
+            try expect(!GLMLaunchAgent.Action.writeSynced.needsRestart && !GLMLaunchAgent.Action.removeOnly.needsRestart
+                       && !GLMLaunchAgent.Action.writeForeignConflict.needsRestart && !GLMLaunchAgent.Action.removeForeignConflict.needsRestart,
+                       "非重启方向不得弹确认框")
+            try expect(GLMLaunchAgent.Action.writeForeignConflict.conflictsForeignJob
+                       && GLMLaunchAgent.Action.removeForeignConflict.conflictsForeignJob
+                       && !GLMLaunchAgent.Action.writeSynced.conflictsForeignJob,
+                       "身份不匹配分支绝不碰 launchd")
+            // launchctl print 的 program 解析与身份比对判据（与 scripts/update.sh 同口径）
+            let printedFixture = """
+            com.local.glm-usage = {
+            \tprogram = /Applications/GlmUsage.app/Contents/MacOS/GlmUsage
+            \tstate = not running
+            }
+            """
+            try expect(GLMLaunchAgent.parsePrintedProgram(printedFixture) == "/Applications/GlmUsage.app/Contents/MacOS/GlmUsage",
+                       "launchctl print program 解析失真")
+            try expect(GLMLaunchAgent.parsePrintedProgram("com.local.glm-usage = {\n\tstate = running\n}") == nil,
+                       "缺 program 行必须归为未加载而非误匹配")
+            // helper 脚本方向隔离：ON 只 bootstrap（失败 open 兜底），OFF 先 bootout 再 open
+            let onScript = GLMLaunchAgent.helperScript(.bootstrap)
+            try expect(onScript.contains("launchctl bootstrap") && onScript.contains("open -n \"$app\"")
+                       && !onScript.contains("bootout") && onScript.contains("kill -0 \"$pid\""),
+                       "ON 方向 helper 缺 bootstrap 或兜底拉回")
+            let offScript = GLMLaunchAgent.helperScript(.bootoutThenOpen)
+            try expect(offScript.contains("launchctl bootout") && offScript.contains("open -n \"$app\"")
+                       && !offScript.contains("bootstrap") && offScript.contains("gui/$(id -u)/$label"),
+                       "OFF 方向 helper 缺 bootout 或拉回")
+            // plist 定义与历史版本/update.sh 恢复分支同款：RunAtLoad + KeepAlive 仅非正常退出复活
+            let fixturePlist = GLMLaunchAgent.plistContent(executablePath: "/tmp/fixture/GlmUsage.app/Contents/MacOS/GlmUsage")
+            try expect(fixturePlist.contains("<key>Label</key><string>com.local.glm-usage</string>")
+                       && fixturePlist.contains("<key>RunAtLoad</key><true/>")
+                       && fixturePlist.contains("<key>SuccessfulExit</key><false/>")
+                       && fixturePlist.contains("/tmp/fixture/GlmUsage.app/Contents/MacOS/GlmUsage"),
+                       "LaunchAgent plist 定义漂移")
+            // helper 失败回执：已知标签映射提示、未知内容静默清除、消费即删除
+            let receiptPath = root.appendingPathComponent("launch-helper-receipt").path
+            try "bootstrap-failed\t2026-11-21 10:00:00\n".write(toFile: receiptPath, atomically: true, encoding: .utf8)
+            try expect(GLMLaunchAgent.consumeResultLog(path: receiptPath)?
+                .contains("launchd 接管失败") == true, "bootstrap 失败回执未映射提示")
+            try expect(!FileManager.default.fileExists(atPath: receiptPath), "回执消费后未删除（会重复提示）")
+            try "unknown-garbage".write(toFile: receiptPath, atomically: true, encoding: .utf8)
+            try expect(GLMLaunchAgent.consumeResultLog(path: receiptPath) == nil, "未知回执内容不得冒充提示")
+            try expect(GLMLaunchAgent.consumeResultLog(path: receiptPath) == nil, "缺失回执必须静默")
+            // helper 端到端离线驱动：PATH 前置 mock 的 launchctl/open，绝不触真实 LaunchAgent；
+            // 三个场景覆盖 ON 成功（等待目标进程消失后再动作）、OFF 先 bootout 再 open、
+            // ON 失败写回执并 open 兜底
+            let mockBin = root.appendingPathComponent("helper-mockbin", isDirectory: true)
+            try FileManager.default.createDirectory(at: mockBin, withIntermediateDirectories: true)
+            let lcLogPath = root.appendingPathComponent("helper-launchctl.log")
+            let receiptForHelper = root.appendingPathComponent("helper-receipt")
+            let fakePlist = root.appendingPathComponent("fake-agent.plist")
+            try GLMLaunchAgent.plistContent(executablePath: "/tmp/fixture/GlmUsage")
+                .write(toFile: fakePlist.path, atomically: true, encoding: .utf8)
+            func writeMock(_ name: String, fails: Bool) throws {
+                let body = "#!/bin/sh\necho \"\(name) $*\" >> \"\(lcLogPath.path)\"\nexit \(fails ? 1 : 0)\n"
+                let target = mockBin.appendingPathComponent(name)
+                try body.write(to: target, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target.path)
+            }
+            func runHelper(_ direction: GLMLaunchAgent.Direction, pid: Int32, bootstrapFails: Bool) throws -> TimeInterval {
+                try writeMock("launchctl", fails: bootstrapFails)
+                try writeMock("open", fails: false)
+                let helper = Process()
+                helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+                helper.arguments = ["-c", GLMLaunchAgent.helperScript(direction), "self-test-helper",
+                                    "\(pid)", fakePlist.path, "/tmp/fixture/GlmUsage.app",
+                                    receiptForHelper.path, GLMLaunchAgent.label]
+                var env = ProcessInfo.processInfo.environment
+                env["PATH"] = mockBin.path + ":/usr/bin:/bin:/usr/sbin:/sbin"
+                helper.environment = env
+                helper.standardOutput = FileHandle.nullDevice
+                helper.standardError = FileHandle.nullDevice
+                let startedAt = Date()
+                try helper.run()
+                helper.waitUntilExit()
+                return Date().timeIntervalSince(startedAt)
+            }
+            func lcLogLines() -> [String] {
+                (try? String(contentsOfFile: lcLogPath.path, encoding: .utf8))?.split(separator: "\n").map(String.init) ?? []
+            }
+            func receiptText() -> String? {
+                let raw = try? String(contentsOfFile: receiptForHelper.path, encoding: .utf8)
+                try? FileManager.default.removeItem(atPath: receiptForHelper.path)
+                return raw
+            }
+            let sleeper = Process()
+            sleeper.executableURL = URL(fileURLWithPath: "/bin/sh")
+            sleeper.arguments = ["-c", "sleep 0.7"]
+            try sleeper.run()
+            let onElapsed = try runHelper(.bootstrap, pid: sleeper.processIdentifier, bootstrapFails: false)
+            sleeper.waitUntilExit()
+            try expect(onElapsed >= 0.9 && onElapsed < 15, "helper 必须等目标进程消失再动作（实测 \(onElapsed)s）")
+            try expect(receiptText() == nil, "ON 成功不得写失败回执")
+            try expect(lcLogLines().contains { $0.contains("bootstrap gui/\(getuid())") && $0.contains(fakePlist.path) },
+                       "ON 方向未以真实 plist 路径 bootstrap")
+            let _ = try runHelper(.bootoutThenOpen, pid: 999_999, bootstrapFails: false)
+            try expect(!FileManager.default.fileExists(atPath: receiptForHelper.path), "OFF 成功不得写失败回执")
+            try expect(lcLogLines().contains { $0.contains("bootout gui/\(getuid())/\(GLMLaunchAgent.label)") }
+                       && lcLogLines().contains { $0.contains("open -n /tmp/fixture/GlmUsage.app") },
+                       "OFF 方向缺 bootout 接管解除或 open 拉回")
+            let failElapsed = try runHelper(.bootstrap, pid: 999_999, bootstrapFails: true)
+            try expect(failElapsed < 10, "bootstrap 失败路径不得卡死")
+            try expect(FileManager.default.fileExists(atPath: receiptForHelper.path), "bootstrap 失败必须写回执")
+            try expect(lcLogLines().contains { $0.contains("open -n /tmp/fixture/GlmUsage.app") },
+                       "bootstrap 失败必须 open 兜底拉回")
+            try expect(GLMLaunchAgent.consumeResultLog(path: receiptForHelper.path)?
+                .contains("launchd 接管失败") == true, "兜底回执未映射提示")
+            try expect(!FileManager.default.fileExists(atPath: receiptForHelper.path), "回执消费后必须删除")
+
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, panel snapshot equality/quantization/structural classification, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence, launch agent toggle decision matrix/helper script/receipt)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)

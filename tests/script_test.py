@@ -326,13 +326,19 @@ exit 0
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
         self.assertTrue(self.state.exists())
 
-    def test_update_without_launchagent_stops_and_starts_via_open(self):
-        installed = self.prepare_update()
-        # 无 LaunchAgent（关闭开机自启）时走 open -n 路径；mock 的 ps 以状态文件代替真实进程，
-        # 用 BASH_ENV 注入 kill shim 让 stop_target 的 kill 移除状态文件（kill 是内建命令无法走 PATH mock）
+    def _kill_shim_env(self):
+        # mock 的 ps 以状态文件代替真实进程，用 BASH_ENV 注入 kill shim 让
+        # stop_target 的 kill 移除状态文件（kill 是内建命令无法走 PATH mock）
         killshim = self.base / "kill-env.sh"
         killshim.write_text(f'kill() {{ echo "kill $*" >> "{self.log}"; rm -f "{self.state}"; return 0; }}\n')
-        result = self.run_update(MOCK_AGENT_ACTIVE="0", BASH_ENV=str(killshim))
+        return {"BASH_ENV": str(killshim)}
+
+    def test_update_without_preference_or_job_stops_and_starts_via_open(self):
+        # 偏好缺失 + job 未加载（两者皆无）→ 用户意图无记录不猜测，走 open -n
+        installed = self.prepare_update()
+        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        plist.unlink()
+        result = self.run_update(MOCK_AGENT_ACTIVE="0", **self._kill_shim_env())
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.marker(installed), "new")
         opens = [line for line in self.log_lines() if line.startswith("open ")]
@@ -340,6 +346,48 @@ exit 0
         launch_lines = [line for line in self.log_lines() if line.startswith("launchctl")]
         self.assertFalse(any("bootout" in line or "bootstrap" in line for line in launch_lines))
         self.assertTrue(self.state.exists())
+
+    def test_plist_preference_without_loaded_job_bootstraps(self):
+        # 偏好存在 + job 未加载 → 按偏好接管：bootstrap 拉起（旧实现走 open -n，会失败）
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_AGENT_ACTIVE="0", **self._kill_shim_env())
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        launch_lines = [line for line in self.log_lines() if line.startswith("launchctl")]
+        self.assertTrue(any("bootstrap" in line for line in launch_lines))
+        self.assertFalse(any("bootout" in line for line in launch_lines))
+        self.assertTrue(self.state.exists())
+        # 偏好文件未被改动（指向本副本的既有定义原样保留）
+        with (self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist").open("rb") as handle:
+            info = plistlib.load(handle)
+        self.assertEqual(info["ProgramArguments"],
+                         [str(installed / "Contents" / "MacOS" / EXECUTABLE)])
+
+    def test_loaded_job_without_preference_restores_plist_and_bootstraps(self):
+        # 偏好缺失 + job 曾加载（旧版关开关只删 plist 的遗留状态）→ 保守保留托管语义：
+        # 恢复同款 plist → bootout 解除 → bootstrap 接管拉回（旧实现直接中止）
+        installed = self.prepare_update()
+        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        plist.unlink()
+        result = self.run_update(MOCK_AGENT_ACTIVE="1")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        launch_lines = [line for line in self.log_lines() if line.startswith("launchctl")]
+        self.assertTrue(any("bootout" in line for line in launch_lines))
+        self.assertTrue(any("bootstrap" in line for line in launch_lines))
+        self.assertTrue(self.state.exists())
+        # 恢复的 plist 与 App 开关写入的定义同款：指向本副本、RunAtLoad、KeepAlive 非正常退出才复活
+        self.assertTrue(plist.exists())
+        with plist.open("rb") as handle:
+            info = plistlib.load(handle)
+        self.assertEqual(info["ProgramArguments"],
+                         [str(installed / "Contents" / "MacOS" / EXECUTABLE)])
+        self.assertTrue(info["RunAtLoad"])
+        self.assertEqual(info["KeepAlive"], {"SuccessfulExit": False})
+        for line in launch_lines:
+            self.assertIn(LABEL, line)
+            for other in OTHER_LABELS:
+                self.assertNotIn(other, line)
 
     def test_release_api_failure_preserves_old_app_and_service(self):
         installed = self.prepare_update()
