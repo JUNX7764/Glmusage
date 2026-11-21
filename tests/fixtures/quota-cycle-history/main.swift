@@ -92,6 +92,17 @@ case "partitionAndAttribution":
     check(GLMQuotaHistoryContext.oauth.mayAttributeReset(planCredential: "x", resetCredential: "x"), "same OAuth")
     check(!GLMQuotaHistoryContext.oauth.mayAttributeReset(planCredential: "x", resetCredential: "y"), "different token")
     print("PASS: partitionAndAttribution")
+case "oauthPartitionFactory":
+    let a = GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1")
+    let b = GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-2")
+    let k = GLMQuotaHistoryContext.apiKey("fixture-acct-1")
+    check(a.partition?.count == 64 && a.partition!.allSatisfy({ "0123456789abcdef".contains($0) }), "oauth partition 64-hex")
+    check(a == GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1"), "same id stable, token rotation does not fork")
+    check(a.partition != b.partition, "different ids isolated")
+    check(a.partition != k.partition, "oauth material differs from apiKey material")
+    check(a.mode == .oauth && a.mayAttributeReset(planCredential: "x", resetCredential: "x"), "oauth mode attribution unchanged")
+    check(GLMQuotaHistoryContext.oauth.partition == nil, "session fallback unchanged when identity unprovable")
+    print("PASS: oauthPartitionFactory")
 case "captureGate":
     let context = GLMQuotaHistoryContext.apiKey("fixture-plan-a")
     let a = GLMQuotaCaptureToken(context: context, activation: 1, epoch: 0, requestStartedAt: t)

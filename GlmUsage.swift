@@ -168,9 +168,12 @@ enum CredStore {
         let key: String?
         let error: String
         let mode: GLMQuotaHistoryContext.Mode?
+        // OAuth 回退模式下可证明的同源账号 id（user_info 顶层服务端 id）；nil = 退回会话历史
+        var oauthHistoryIdentity: String? = nil
         var context: GLMQuotaHistoryContext? {
             guard let key, let mode else { return nil }
-            return mode == .apiKey ? .apiKey(key) : .oauth
+            if mode == .apiKey { return .apiKey(key) }
+            return oauthHistoryIdentity.map { .oauth(userInfoId: $0) } ?? .oauth
         }
     }
     static func loadPlanCredential() -> (key: String?, error: String) {
@@ -192,7 +195,8 @@ enum CredStore {
         let result = resolvePlanCredential(envValue: envValue, record: record, secret: secret, systemKey: systemKey)
         guard result.key != nil else { return .init(key: nil, error: result.error, mode: nil) }
         let mode: GLMQuotaHistoryContext.Mode = (envValue?.trimmingCharacters(in: .whitespaces).isEmpty == false || preferredApiKey(record: record) != nil) ? .apiKey : .oauth
-        return .init(key: result.key, error: result.error, mode: mode)
+        let identity = mode == .oauth ? oauthHistoryIdentity(record: record, secret: secret, systemKey: systemKey) : nil
+        return .init(key: result.key, error: result.error, mode: mode, oauthHistoryIdentity: identity)
     }
 
     private static func credentialRecord() -> [String: String]? {
@@ -284,18 +288,40 @@ enum CredStore {
         return zcodeAccountEmail(record: obj)
     }
 
+    /// 解密 ZCode OAuth 记录的 access_token 与 user_info（同一 enc 格式）。
+    /// user_info 无 enc 前缀时按明文处理；字段缺失返回 nil，不做任何同源判断。
+    static func decryptZCodeOAuthRecord(_ record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> (token: String?, userInfoJSON: String?) {
+        let token = decrypt(record["oauth:bigmodel:access_token"] ?? "", secret: secret, systemKey: systemKey)
+        let rawUserInfo = record["oauth:bigmodel:user_info"] ?? ""
+        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:") ? decrypt(rawUserInfo, secret: secret, systemKey: systemKey) : rawUserInfo)
+        return (token, userInfoJSON)
+    }
+
     // 手动连接的 Key 可能属于另一个账号：仅把邮箱作为 ZCode 登录身份展示，不能归属给套餐。
     // 不请求网络、不交互式访问钥匙串；读取失败即隐藏，不复用旧邮箱。
     static func zcodeAccountEmail(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> String? {
-        let oauthToken = decrypt(record["oauth:bigmodel:access_token"] ?? "", secret: secret, systemKey: systemKey)
-        let rawUserInfo = record["oauth:bigmodel:user_info"] ?? ""
-        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:") ? decrypt(rawUserInfo, secret: secret, systemKey: systemKey) : rawUserInfo)
+        let parts = decryptZCodeOAuthRecord(record, secret: secret, systemKey: systemKey)
         return resolveAccountEmail(envValue: nil, credentialKeyCandidates: 0,
-                                   oauthAccessToken: oauthToken, userInfoJSON: userInfoJSON)
+                                   oauthAccessToken: parts.token, userInfoJSON: parts.userInfoJSON)
     }
     static func loadZCodeAccountEmail() -> String? {
         guard let record = credentialRecord() else { return nil }
         return zcodeAccountEmail(record: record)
+    }
+
+    /// OAuth 回退历史的同源身份证明：与邮箱展示同一套守卫哲学——
+    /// 存在任何 api-key 候选（key 无法证明与 user_info 同账号）、token 缺失/解密失败、
+    /// 或 user_info 无非空顶层服务端 id 时一律 nil（历史退回会话模式，不落盘）。
+    /// 返回值仅用于分区哈希：不写 status.json、不打日志、不进 JSON 内容。
+    static func oauthHistoryIdentity(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> String? {
+        guard preferredApiKey(record: record) == nil else { return nil }
+        let parts = decryptZCodeOAuthRecord(record, secret: secret, systemKey: systemKey)
+        guard let token = parts.token?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return nil }
+        guard let jsonString = parts.userInfoJSON, !jsonString.isEmpty,
+              let info = (try? JSONSerialization.jsonObject(with: Data(jsonString.utf8))) as? [String: Any],
+              let id = info["id"] as? String else { return nil }
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// 宽松但足够的邮箱格式校验（x@y.z，总长 ≤254），防止把昵称/用户 ID 当邮箱展示
@@ -3078,6 +3104,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var updateConfirmation: (tag: String, notes: String)?
     private var globalClickMonitor: Any?
     private var localClickMonitor: Any?
+    // 悬停显示状态面板（Sources/PanelHover.swift）：panelPresentedByHover 仅在 hover 打开
+    // 且未 pin 时为真；点击图标、面板内点击、面板关闭任一者即复位
+    private var panelHoverController: PanelHoverController?
+    private var panelPresentedByHover = false
     private var panelConfigured = false
     private var previewWindow: NSWindow?
     private weak var activeScroll: NSScrollView?
@@ -3089,8 +3119,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var updateMessageDismissal: DispatchWorkItem?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
-    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-daily-unavailable") || CommandLine.arguments.contains("--preview-daily-basezero") || CommandLine.arguments.contains("--preview-daily-insufficient") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-connection-test") || CommandLine.arguments.contains("--preview-appearance-test") || CommandLine.arguments.contains("--preview-perf-test") || CommandLine.arguments.contains("--preview-updating") || CommandLine.arguments.contains("--preview-updating-install") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
-    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-daily-unavailable") || CommandLine.arguments.contains("--preview-daily-basezero") || CommandLine.arguments.contains("--preview-daily-insufficient") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-connection-test") || CommandLine.arguments.contains("--preview-hover-test") || CommandLine.arguments.contains("--preview-appearance-test") || CommandLine.arguments.contains("--preview-perf-test") || CommandLine.arguments.contains("--preview-updating") || CommandLine.arguments.contains("--preview-updating-install") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") || CommandLine.arguments.contains("--preview-hover-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
@@ -3258,8 +3288,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.animates = false
         // 仅离线 GUI 回归进程：改用 applicationDefined，避免测试期间的真实鼠标点击
         // （用户正在用机）把 transient Popover 关掉造成几何断言误报；生产与普通预览不变
-        if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") {
+        if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") || CommandLine.arguments.contains("--preview-hover-test") {
             popover.behavior = .applicationDefined
+        }
+        // 悬停显示状态面板（Sources/PanelHover.swift）：驻留 0.2s 开、离组 0.30s 收、首次点击 pin。
+        // preview 进程仅在 --preview-hover-test 启用，其余 GUI 回归不受真实鼠标驻留干扰
+        panelHoverController = PanelHoverController(iconView: statusItem.button)
+        if let hover = panelHoverController {
+            hover.isPanelShown = { [weak self] in self?.popover.isShown ?? false }
+            hover.presentedByHover = { [weak self] in self?.panelPresentedByHover ?? false }
+            hover.statusItemFrame = { [weak self] in self?.statusItemButtonScreenFrame() }
+            hover.panelFrame = { [weak self] in self?.panelController.view.window?.frame }
+            hover.panelView = { [weak self] in self?.panelController.view }
+            hover.performShow = { [weak self] in self?.openPanel(byHover: true) }
+            hover.performHide = { [weak self] in self?.popover.performClose(nil) }
+            let enabled = preview
+                ? CommandLine.arguments.contains("--preview-hover-test")
+                : GLMPanelHoverPreference.load()
+            if enabled { hover.setEnabled(true) }
         }
         if preview {
             if CommandLine.arguments.contains("--preview-dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
@@ -3294,7 +3340,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 previewWindow?.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
             }
-            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
+            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") || CommandLine.arguments.contains("--preview-hover-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self = self else { return }
                     self.togglePanel()
@@ -3313,6 +3359,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                     if CommandLine.arguments.contains("--preview-perf-test") {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.testPreviewPanelPerf() }
+                    }
+                    if CommandLine.arguments.contains("--preview-hover-test") {
+                        // 必须用 Timer 而非 dispatch 调度：本块处于 didFinishLaunching 的主队列
+                        // drain 链中，测试内的 RunLoop.run(until:) 嵌套运行不会服务被外层
+                        // dispatch 块占住（latch）的主队列，asyncAfter 的 show/hide 定时会饿死；
+                        // Timer 是 run loop callout，嵌套 run 期间主队列空闲、定时可正常触发
+                        let hoverTimer = Timer(timeInterval: 0.8, repeats: false) { [weak self] _ in
+                            self?.testHoverPresentation()
+                        }
+                        RunLoop.main.add(hoverTimer, forMode: .default)
                     }
                 }
             }
@@ -4081,7 +4137,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func togglePanel() {
-        if popover.isShown { popover.performClose(nil); return }
+        if popover.isShown {
+            // hover 打开且未固定：首次点击转常开（pin，Status Trio 语义，防误关），不关闭
+            if panelPresentedByHover {
+                panelPresentedByHover = false
+                panelHoverController?.cancelPending()
+                return
+            }
+            popover.performClose(nil)
+            return
+        }
+        openPanel(byHover: false)
+    }
+
+    /// 打开面板。hover 打开与点击打开共用全路径（打开即最新、门控去重的刷新与更新检查），
+    /// 仅来源标记与 panelPresentedByHover 语义不同。
+    private func openPanel(byHover: Bool) {
+        panelPresentedByHover = byHover
         dailySelectedIndex = nil
         if !preview { refresh(tokens: false); checkForUpdate() }
         // 打开即最新：dailySelectedIndex 重置与关闭期间的数据变化都在此刻落树。
@@ -4097,10 +4169,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let button = statusItem.button {
             applyBackgroundStyle()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            if popover.isShown { installClickMonitors() }
+            if popover.isShown {
+                installClickMonitors()
+                panelHoverController?.installPanelTrackingIfNeeded()
+            }
         }
-        tracePopover("open")
+        tracePopover(byHover ? "hover-open" : "open")
     }
+
+    /// 状态栏图标的屏幕矩形（悬停几何与点击判定的共用基准）。
+    private func statusItemButtonScreenFrame() -> NSRect? {
+        guard let button = statusItem.button, let window = button.window else { return nil }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        return frame.width > 0 && frame.height > 0 ? frame : nil
+    }
+
     private func installClickMonitors() {
         removeClickMonitors()
         globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
@@ -4121,7 +4204,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 合成事件（离线回归）可能没有 event.window，按 windowNumber 解析；
             // 真实用户事件语义不变：点击面板/状态栏窗口内不关，窗外关闭
             let eventWindow = event.window ?? NSApp.window(withWindowNumber: event.windowNumber)
-            if eventWindow === self.panelController.view.window || eventWindow === self.statusItem.button?.window { return event }
+            if eventWindow === self.panelController.view.window || eventWindow === self.statusItem.button?.window {
+                // 面板内点击即固定为常开（hover 呈现语义）；图标点击由 togglePanel 分派
+                if eventWindow === self.panelController.view.window { self.panelPresentedByHover = false }
+                return event
+            }
             self.popover.performClose(nil)
             return event
         }
@@ -4135,6 +4222,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         updateConfirmation = nil
         showingCardSettings = false
+        panelPresentedByHover = false
+        panelHoverController?.panelDidClose()
         removeClickMonitors()
         if previewPopover && CommandLine.arguments.contains("--preview-trace") {
             print("GLM_POPOVER_TRACE closed")
@@ -5522,6 +5611,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         run(0)
     }
 
+    /// 悬停开合时序回归：几何与指针位置全部注入固定值，不依赖真实鼠标/屏幕。
+    /// 真实 tracking 事件（鼠标划过图标/面板）仍可能扰动，测试须逐个运行、勿在菜单栏上移动鼠标。
+    private func testHoverPresentation() {
+        func fail(_ message: String) -> Never { fputs("GLM hover test: FAIL \(message)\n", stderr); exit(1) }
+        guard let hover = panelHoverController, hover.isEnabled else {
+            fail("hover controller missing or disabled")
+        }
+        // 断开真实 tracking：预览图标会真的出现在菜单栏，真实光标的 enter/exit 会取消合成时序
+        hover.detachTrackingForTesting()
+        let iconRect = NSRect(x: 1200, y: 1055, width: 40, height: 24)
+        let panelRect = NSRect(x: 1180, y: 640, width: 340, height: 400)
+        hover.statusItemFrame = { iconRect }
+        hover.panelFrame = { panelRect }
+        func wait(_ seconds: Double) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
+        func expectShown(_ shown: Bool, _ step: String) {
+            guard popover.isShown == shown else {
+                fail("\(step): expected shown=\(shown), actual=\(popover.isShown), hoverMarked=\(panelPresentedByHover), controllerEnabled=\(hover.isEnabled)")
+            }
+            print("GLM_HOVER_TEST \(step): ok")
+        }
+        // 固定指针位置的便捷写法
+        func pointAt(_ x: CGFloat, _ y: CGFloat) { hover.pointerLocation = { NSPoint(x: x, y: y) } }
+
+        // 起始态：自动开面板（点击语义）先关掉，从关闭态起跑
+        if popover.isShown { togglePanel() }
+        wait(0.3)
+        expectShown(false, "initial-close")
+
+        // 1. 图标驻留 0.2s 才打开；0.1s 不开
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.1)
+        guard !popover.isShown else { fail("dwell 0.1s must not open") }
+        wait(0.5)
+        expectShown(true, "dwell-opens")
+        guard panelPresentedByHover else { fail("hover-open must mark presentedByHover") }
+
+        // 2. 图标→面板跨桥区：先排 hide 后被面板 enter 取消，保持打开
+        pointAt(panelRect.midX, panelRect.midY)
+        hover.iconExited()
+        wait(0.05)
+        hover.panelEntered()
+        wait(0.6)
+        expectShown(true, "icon-to-panel-keeps-open")
+
+        // 3. 离开面板（远离）→ 0.3s 收起
+        pointAt(200, 300)
+        hover.panelExited()
+        wait(0.15)
+        guard popover.isShown else { fail("0.15s after leave must still be open") }
+        wait(0.45)
+        expectShown(false, "leave-closes")
+        guard !panelPresentedByHover else { fail("close must reset presentedByHover") }
+
+        // 4. 重新悬停打开 → 首次点击=pin（不关闭）；pin 后离开图标不收
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.6)
+        expectShown(true, "reopens-by-dwell")
+        togglePanel()
+        guard popover.isShown, !panelPresentedByHover else { fail("first click on hover-open panel must pin") }
+        print("GLM_HOVER_TEST click-pins: ok")
+        hover.iconExited()
+        wait(0.6)
+        expectShown(true, "pinned-survives-icon-exit")
+
+        // 5. pin 后再点 → 关闭
+        togglePanel()
+        expectShown(false, "second-click-closes")
+
+        // 6. 面板内点击=pin（local monitor 置位）→ 离开面板不收
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.6)
+        guard popover.isShown, panelPresentedByHover else { fail("reopens-by-dwell again") }
+        panelPresentedByHover = false   // 与 installClickMonitors 面板内点击处置一致
+        hover.panelExited()
+        wait(0.6)
+        expectShown(true, "panel-click-pinned-survives-exit")
+        togglePanel()
+        expectShown(false, "close-after-panel-pin")
+
+        // 7. `…` 菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）
+        let menu = makePanelSettingsMenu()
+        let hoverItem = menu.items.first { $0.title == "悬停显示状态面板" }
+        guard let hoverItem else { fail("settings menu missing hover item") }
+        let expectedState: NSControl.StateValue = panelHoverEnabled ? .on : .off
+        guard hoverItem.state == expectedState else { fail("menu item state mismatch") }
+        let wasEnabled = panelHoverController?.isEnabled == true
+        toggleHoverPanel()
+        guard panelHoverController?.isEnabled == !wasEnabled else { fail("toggle must flip runtime state") }
+        toggleHoverPanel()
+        guard panelHoverController?.isEnabled == wasEnabled else { fail("second toggle must restore") }
+        print("GLM_HOVER_TEST settings-toggle: ok")
+
+        // 8. 关闭开关时仍处 hover 呈现的面板应收起（toggleHoverPanel 委托的控制器行为）；
+        //    直接调控制器以隔离 preview 下「偏好值≠arg 启用态」的分叉
+        hover.iconEntered()
+        wait(0.6)
+        guard popover.isShown, panelPresentedByHover else { fail("reopen for disable test") }
+        hover.setEnabled(false)
+        wait(0.2)
+        expectShown(false, "disable-while-hover-open-closes")
+        hover.setEnabled(true)
+
+        print("GLM hover test: PASS")
+        exit(0)
+    }
+
     // Test-only AppKit event dispatch. The isolated preview never loads real credentials or history.
     private func testHistoryInteraction() {
         let resultFile = "/tmp/glm_quota_history_test_result.txt"
@@ -6666,6 +6864,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         cards.isEnabled = !showingCardSettings
         menu.addItem(cards)
 
+        let hover = NSMenuItem(title: "悬停显示状态面板", action: #selector(toggleHoverPanel), keyEquivalent: "")
+        hover.target = self
+        hover.state = panelHoverEnabled ? .on : .off
+        menu.addItem(hover)
+
         let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
         let backgroundMenu = NSMenu()
         backgroundMenu.autoenablesItems = false
@@ -6713,6 +6916,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         backgroundStyle = style
         if !preview { UserDefaults.standard.set(style.rawValue, forKey: GLMPanelBackgroundStyle.defaultsKey) }
         applyBackgroundStyle()
+    }
+    private var panelHoverEnabled: Bool { GLMPanelHoverPreference.load() }
+    @objc private func toggleHoverPanel() {
+        // 运行时状态以控制器为准翻转；生产同步落盘偏好，preview 不写生产 UserDefaults
+        let next = !(panelHoverController?.isEnabled ?? panelHoverEnabled)
+        if !preview { UserDefaults.standard.set(next, forKey: GLMPanelHoverPreference.defaultsKey) }
+        panelHoverController?.setEnabled(next)
     }
     private func makeUpdateConfirmation(tag: String, notes: String, width: CGFloat) -> NSView {
         let content = GLMPanelStack(); content.orientation = .vertical; content.alignment = .leading; content.spacing = 7
@@ -8148,6 +8358,25 @@ enum GLMOfflineRegression {
             try expect(CredStore.zcodeAccountEmail(record: zcodeRecord, secret: "wrong") == nil, "ZCode email accepted without correct key")
             try expect(CredStore.decrypt(fixtureV1, secret: fixtureSecret) == "fixture-token", "v1 fixture failed")
             try expect(CredStore.decrypt(fixtureV1, secret: "wrong") == nil, "wrong v1 key accepted")
+
+            // OAuth 历史身份证明决策矩阵（守卫镜像邮箱展示）：分区与 apiKey material 域隔离
+            let identityInfoJSON = #"{"id":" fixture-acct-1 ","username":"User","displayName":"User","rawProfile":{"email":"User@Example.com"}}"#
+            let identityInfoBox = try AES.GCM.seal(Data(identityInfoJSON.utf8), using: fixtureKey)
+            let identityInfo = "enc:v1:" + b64url(Data(identityInfoBox.nonce)) + "." + b64url(identityInfoBox.tag) + "." + b64url(identityInfoBox.ciphertext)
+            let identityRecord = ["oauth:bigmodel:access_token": fixtureV1, "oauth:bigmodel:user_info": identityInfo]
+            try expect(CredStore.oauthHistoryIdentity(record: identityRecord, secret: fixtureSecret) == "fixture-acct-1", "OAuth 身份取 user_info 顶层 id（含去空白）")
+            try expect(CredStore.oauthHistoryIdentity(record: ["oauth:bigmodel:user_info": identityInfo], secret: fixtureSecret) == nil, "无 access_token 时身份不可证")
+            try expect(CredStore.oauthHistoryIdentity(record: identityRecord, secret: "wrong") == nil, "解密失败身份不可证")
+            let noIdBox = try AES.GCM.seal(Data(#"{"username":"User"}"#.utf8), using: fixtureKey)
+            let noIdInfo = "enc:v1:" + b64url(Data(noIdBox.nonce)) + "." + b64url(noIdBox.tag) + "." + b64url(noIdBox.ciphertext)
+            try expect(CredStore.oauthHistoryIdentity(record: ["oauth:bigmodel:access_token": fixtureV1, "oauth:bigmodel:user_info": noIdInfo], secret: fixtureSecret) == nil, "user_info 无 id 时身份不可证")
+            let candidateRecord = identityRecord.merging(["bigmodel:api-key:coding-plan:x": fixtureV1]) { current, _ in current }
+            try expect(CredStore.oauthHistoryIdentity(record: candidateRecord, secret: fixtureSecret) == nil, "存在 api-key 候选时身份不可证")
+            let identityTyped = CredStore.resolvePlanCredentialTyped(record: identityRecord, secret: fixtureSecret)
+            try expect(identityTyped.mode == .oauth && identityTyped.oauthHistoryIdentity == "fixture-acct-1", "Typed credential 携带 OAuth 身份")
+            try expect(identityTyped.context?.partition == GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1").partition, "context 走 oauth 分区工厂")
+            try expect(GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1").partition != GLMQuotaHistoryContext.apiKey("fixture-acct-1").partition, "oauth 与 apiKey material 域隔离")
+            try expect(GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1") == GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1"), "同 id 分区稳定（token 轮换不碎裂）")
             var savedFixture = "old"
             var calls = 0
             let saveFixture: (String) -> Bool = { candidate in calls += 1; savedFixture = candidate; return true }
@@ -8409,7 +8638,56 @@ enum GLMOfflineRegression {
             try expect(GLMLaunchAgent.consumeResultLog(path: receiptForHelper.path)?
                 .contains("跳过接管动作") == true, "实例出现时的回执应为准确实例提示")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, panel snapshot equality/quantization/structural classification, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence, launch agent toggle decision matrix/helper script/receipt)")
+            // 悬停面板纯逻辑：几何判定（含边缘 inclusive 与桥区）、转换 token、点击决策、偏好默认值
+            let hoverIcon = NSRect(x: 100, y: 760, width: 40, height: 24)
+            let hoverPanel = NSRect(x: 100, y: 400, width: 320, height: 340)
+            let hoverGeo = PanelHoverGeometry(statusItemFrame: hoverIcon, panelFrames: [hoverPanel])
+            try expect(!hoverIcon.contains(NSPoint(x: hoverIcon.maxX, y: hoverIcon.maxY)),
+                       "对照：NSRect.contains 为半开（右/上边缘不在内）")
+            try expect(PanelHoverGeometry.containsInclusive(hoverIcon, NSPoint(x: hoverIcon.maxX, y: hoverIcon.maxY)),
+                       "inclusive 判定必须含右/上边缘像素（菜单栏图标常在边缘悬停/点击）")
+            try expect(hoverGeo.containsStatusItem(NSPoint(x: hoverIcon.minX, y: hoverIcon.minY)),
+                       "图标判定含左/下边缘")
+            try expect(!hoverGeo.containsStatusItem(NSPoint(x: hoverIcon.maxX + 1, y: hoverIcon.midY)),
+                       "图标判定不外扩")
+            try expect(hoverGeo.containsPanel(NSPoint(x: hoverPanel.maxX, y: hoverPanel.maxY)),
+                       "面板判定含右/上边缘")
+            try expect(hoverGeo.isWithinHoverArea(NSPoint(x: hoverIcon.midX, y: hoverPanel.maxY + 4)),
+                       "图标-面板桥区计入保持区")
+            try expect(!hoverGeo.isWithinHoverArea(NSPoint(x: hoverIcon.midX, y: hoverPanel.maxY + 10)),
+                       "桥区外不保持（面板桥 8pt 与图标桥 8pt 之间的死区）")
+            try expect(!hoverGeo.isWithinHoverArea(NSPoint(x: 0, y: 0)), "远离区域不保持")
+            let hoverGeoNoPanel = PanelHoverGeometry(statusItemFrame: hoverIcon, panelFrames: [])
+            try expect(hoverGeoNoPanel.isWithinHoverArea(NSPoint(x: hoverIcon.minX - 5, y: hoverIcon.midY)),
+                       "无面板时图标周围桥区仍保持")
+            try expect(!hoverGeoNoPanel.isWithinHoverArea(NSPoint(x: hoverIcon.minX - 20, y: hoverIcon.midY)),
+                       "无面板时远离图标不保持")
+            try expect(PanelHoverGeometry(statusItemFrame: nil, panelFrames: []).isWithinHoverArea(NSPoint(x: 0, y: 0)) == false,
+                       "无图标无面板时处处不保持")
+
+            var hoverIntent = PanelHoverIntent()
+            let hoverToken1 = hoverIntent.begin(.show)
+            try expect(hoverIntent.consume(hoverToken1), "首次触发应生效")
+            try expect(!hoverIntent.consume(hoverToken1), "同 token 二次触发须被丢弃")
+            let hoverToken2 = hoverIntent.begin(.hide)
+            hoverIntent.cancel()
+            try expect(!hoverIntent.consume(hoverToken2), "取消后的触发须被丢弃")
+            let hoverToken3 = hoverIntent.begin(.show)
+            _ = hoverIntent.begin(.hide)
+            try expect(!hoverIntent.consume(hoverToken3), "被新转换顶替的旧 token 须失效")
+
+            try expect(panelHoverClickOutcome(isShown: false, presentedByHover: false) == .present, "未打开点击=打开")
+            try expect(panelHoverClickOutcome(isShown: true, presentedByHover: false) == .close, "普通常开点击=关闭")
+            try expect(panelHoverClickOutcome(isShown: true, presentedByHover: true) == .pin, "hover 打开首次点击=固定常开")
+
+            let hoverSuite = "GLMHoverTest.\(UUID().uuidString)"
+            let hoverDefaults = UserDefaults(suiteName: hoverSuite)!
+            defer { hoverDefaults.removePersistentDomain(forName: hoverSuite) }
+            try expect(GLMPanelHoverPreference.load(from: hoverDefaults), "悬停偏好缺省必须为开")
+            hoverDefaults.set(false, forKey: GLMPanelHoverPreference.defaultsKey)
+            try expect(!GLMPanelHoverPreference.load(from: hoverDefaults), "悬停偏好写入后须如实读取")
+
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, panel snapshot equality/quantization/structural classification, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence, launch agent toggle decision matrix/helper script/receipt, panel hover geometry/intent/click-outcome/preference)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)

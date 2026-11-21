@@ -12,11 +12,11 @@
 
 同一窗口按原始额度更新；reset 两秒以内视为抖动，不单独触发写盘。任意幅度的余额回升均保留待确认信息，不因不足 1 个百分点而静默抹去；1pp 仅用于有窗口变化时的拆段候选判断。疑似新窗口先记录候选，10–180 秒内另一独立请求确认；窗口变化但原因不足时保持待确认。正常截止、无法归因的早期变化、观测缺口和额度规格变化分开标记；缺口不补造轮次。一次已绑定且确认成功的周卡操作，也要等消费后额度样本确认才拆分；5 小时卡不拆周。旧截止已到而接口仍返回旧窗口时继续等待。
 
-周卡依据沿用既有 `code == 0 && used == true` 结果，记录原操作时间、哈希和已知基线；unknown/失败不会生成轮次，历史逻辑不会发起用卡请求。仅当套餐监控使用与 ZCode 用卡相同的 OAuth token 且操作前后连接未切换，才可归因为主动用周卡；API Key 连接无法据邮箱或时间接近推断同账号。重启后的归属证明不恢复；旧 pending 没有基线时只留未归属操作。
+周卡依据沿用既有 `code == 0 && used == true` 结果，记录原操作时间、哈希和已知基线；unknown/失败不会生成轮次，历史逻辑不会发起用卡请求。仅当套餐监控使用与 ZCode 用卡相同的 OAuth token 且操作前后连接未切换，才可归因为主动用周卡；API Key 连接无法据邮箱或时间接近推断同账号。重启后的归属证明不恢复（由持久化编码层保证：归因证明不写入 JSON，从磁盘载入一律视为未归属，API Key 与 OAuth 分区同规则）；旧 pending 没有基线时只留未归属操作。
 
 ## 分区和持久化
 
-API Key 使用域隔离 SHA-256 的 64 位分区，路径为 `~/Library/Application Support/GlmUsage/quota-history/<partition>/history-v1.json`。更换 Key 不合并；OAuth 回退仅保留进程内历史。JSON 不包含 API Key、OAuth token、邮箱或原幂等 key；历史文件不写入 status.json。根目录及分区目录权限 0700，文件 0600；同目录独占临时文件写完后原子替换。已有损坏文件或未来 schema 保留并保护，不用新状态覆盖；普通写失败则继续使用内存并显示未保存，后续尝试可恢复。首次、数值和候选/操作变化立即保存，纯时间推进最多每五分钟一次心跳；心跳同时更新界面里的观测时刻（OAuth 临时模式也更新），不会因余额不变而永久显示首样本时间。
+API Key 使用域隔离 SHA-256 的 64 位分区，路径为 `~/Library/Application Support/GlmUsage/quota-history/<partition>/history-v1.json`。更换 Key 不合并。OAuth 回退仅在 user_info 与 access_token 同源可证（纯 OAuth 回退、无 api-key 候选、两者均解密成功）且 user_info 含非空服务端账号 id 时，按该 id 的域隔离 SHA-256 分区持久化；分区名与 JSON 均不含 id、邮箱或 token，token 轮换不改变分区，账号切换得到独立分区（与 API Key 同款隔离）；身份不可证时退回仅保留进程内历史。JSON 不包含 API Key、OAuth token、邮箱或原幂等 key；历史文件不写入 status.json。根目录及分区目录权限 0700，文件 0600；同目录独占临时文件写完后原子替换。已有损坏文件或未来 schema 保留并保护，不用新状态覆盖；普通写失败则继续使用内存并显示未保存，后续尝试可恢复。首次、数值和候选/操作变化立即保存，纯时间推进最多每五分钟一次心跳；心跳同时更新界面里的观测时刻（OAuth 临时模式也更新），不会因余额不变而永久显示首样本时间。
 
 源码入口：`Sources/GLMQuotaCycleHistory.swift`、`GLMQuotaCycleContext.swift`、`GLMQuotaCycleStore.swift`、`GLMQuotaCycleCoordinator.swift`、`GLMQuotaCycleHistoryView.swift`。额度适配与现有用卡协议接线位于 `GlmUsage.swift`。纯模型回归运行 `python3 -m unittest discover -s tests -p 'quota_cycle_history_test.py' -v`；GUI 假数据入口和完整回归命令见 `docs/DEVELOPMENT.md`。
 
