@@ -168,9 +168,12 @@ enum CredStore {
         let key: String?
         let error: String
         let mode: GLMQuotaHistoryContext.Mode?
+        // OAuth 回退模式下可证明的同源账号 id（user_info 顶层服务端 id）；nil = 退回会话历史
+        var oauthHistoryIdentity: String? = nil
         var context: GLMQuotaHistoryContext? {
             guard let key, let mode else { return nil }
-            return mode == .apiKey ? .apiKey(key) : .oauth
+            if mode == .apiKey { return .apiKey(key) }
+            return oauthHistoryIdentity.map { .oauth(userInfoId: $0) } ?? .oauth
         }
     }
     static func loadPlanCredential() -> (key: String?, error: String) {
@@ -192,7 +195,8 @@ enum CredStore {
         let result = resolvePlanCredential(envValue: envValue, record: record, secret: secret, systemKey: systemKey)
         guard result.key != nil else { return .init(key: nil, error: result.error, mode: nil) }
         let mode: GLMQuotaHistoryContext.Mode = (envValue?.trimmingCharacters(in: .whitespaces).isEmpty == false || preferredApiKey(record: record) != nil) ? .apiKey : .oauth
-        return .init(key: result.key, error: result.error, mode: mode)
+        let identity = mode == .oauth ? oauthHistoryIdentity(record: record, secret: secret, systemKey: systemKey) : nil
+        return .init(key: result.key, error: result.error, mode: mode, oauthHistoryIdentity: identity)
     }
 
     private static func credentialRecord() -> [String: String]? {
@@ -296,6 +300,23 @@ enum CredStore {
     static func loadZCodeAccountEmail() -> String? {
         guard let record = credentialRecord() else { return nil }
         return zcodeAccountEmail(record: record)
+    }
+
+    /// OAuth 回退历史的同源身份证明：与邮箱展示同一套守卫哲学——
+    /// 存在任何 api-key 候选（key 无法证明与 user_info 同账号）、token 缺失/解密失败、
+    /// 或 user_info 无非空顶层服务端 id 时一律 nil（历史退回会话模式，不落盘）。
+    /// 返回值仅用于分区哈希：不写 status.json、不打日志、不进 JSON 内容。
+    static func oauthHistoryIdentity(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> String? {
+        guard preferredApiKey(record: record) == nil else { return nil }
+        let oauthToken = decrypt(record["oauth:bigmodel:access_token"] ?? "", secret: secret, systemKey: systemKey)
+        guard let token = oauthToken?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return nil }
+        let rawUserInfo = record["oauth:bigmodel:user_info"] ?? ""
+        let userInfoJSON = rawUserInfo.isEmpty ? nil : (rawUserInfo.hasPrefix("enc:") ? decrypt(rawUserInfo, secret: secret, systemKey: systemKey) : rawUserInfo)
+        guard let jsonString = userInfoJSON, !jsonString.isEmpty,
+              let info = (try? JSONSerialization.jsonObject(with: Data(jsonString.utf8))) as? [String: Any],
+              let id = info["id"] as? String else { return nil }
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// 宽松但足够的邮箱格式校验（x@y.z，总长 ≤254），防止把昵称/用户 ID 当邮箱展示
@@ -8332,6 +8353,25 @@ enum GLMOfflineRegression {
             try expect(CredStore.zcodeAccountEmail(record: zcodeRecord, secret: "wrong") == nil, "ZCode email accepted without correct key")
             try expect(CredStore.decrypt(fixtureV1, secret: fixtureSecret) == "fixture-token", "v1 fixture failed")
             try expect(CredStore.decrypt(fixtureV1, secret: "wrong") == nil, "wrong v1 key accepted")
+
+            // OAuth 历史身份证明决策矩阵（守卫镜像邮箱展示）：分区与 apiKey material 域隔离
+            let identityInfoJSON = #"{"id":" fixture-acct-1 ","username":"User","displayName":"User","rawProfile":{"email":"User@Example.com"}}"#
+            let identityInfoBox = try AES.GCM.seal(Data(identityInfoJSON.utf8), using: fixtureKey)
+            let identityInfo = "enc:v1:" + b64url(Data(identityInfoBox.nonce)) + "." + b64url(identityInfoBox.tag) + "." + b64url(identityInfoBox.ciphertext)
+            let identityRecord = ["oauth:bigmodel:access_token": fixtureV1, "oauth:bigmodel:user_info": identityInfo]
+            try expect(CredStore.oauthHistoryIdentity(record: identityRecord, secret: fixtureSecret) == "fixture-acct-1", "OAuth 身份取 user_info 顶层 id（含去空白）")
+            try expect(CredStore.oauthHistoryIdentity(record: ["oauth:bigmodel:user_info": identityInfo], secret: fixtureSecret) == nil, "无 access_token 时身份不可证")
+            try expect(CredStore.oauthHistoryIdentity(record: identityRecord, secret: "wrong") == nil, "解密失败身份不可证")
+            let noIdBox = try AES.GCM.seal(Data(#"{"username":"User"}"#.utf8), using: fixtureKey)
+            let noIdInfo = "enc:v1:" + b64url(Data(noIdBox.nonce)) + "." + b64url(noIdBox.tag) + "." + b64url(noIdBox.ciphertext)
+            try expect(CredStore.oauthHistoryIdentity(record: ["oauth:bigmodel:access_token": fixtureV1, "oauth:bigmodel:user_info": noIdInfo], secret: fixtureSecret) == nil, "user_info 无 id 时身份不可证")
+            let candidateRecord = identityRecord.merging(["bigmodel:api-key:coding-plan:x": fixtureV1]) { current, _ in current }
+            try expect(CredStore.oauthHistoryIdentity(record: candidateRecord, secret: fixtureSecret) == nil, "存在 api-key 候选时身份不可证")
+            let identityTyped = CredStore.resolvePlanCredentialTyped(record: identityRecord, secret: fixtureSecret)
+            try expect(identityTyped.mode == .oauth && identityTyped.oauthHistoryIdentity == "fixture-acct-1", "Typed credential 携带 OAuth 身份")
+            try expect(identityTyped.context?.partition == GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1").partition, "context 走 oauth 分区工厂")
+            try expect(GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1").partition != GLMQuotaHistoryContext.apiKey("fixture-acct-1").partition, "oauth 与 apiKey material 域隔离")
+            try expect(GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1") == GLMQuotaHistoryContext.oauth(userInfoId: "fixture-acct-1"), "同 id 分区稳定（token 轮换不碎裂）")
             var savedFixture = "old"
             var calls = 0
             let saveFixture: (String) -> Bool = { candidate in calls += 1; savedFixture = candidate; return true }

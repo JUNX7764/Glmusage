@@ -47,6 +47,9 @@ class QuotaCycleHistoryTest(unittest.TestCase):
     def test_partition_and_attribution(self):
         self.case("partitionAndAttribution")
 
+    def test_oauth_partition_factory(self):
+        self.case("oauthPartitionFactory")
+
     def test_capture_gate(self):
         self.case("captureGate")
 
