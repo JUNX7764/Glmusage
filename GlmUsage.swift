@@ -2409,8 +2409,21 @@ final class GLMPanelAction: NSButton {
         guard let parent = superview else { return super.hitTest(point) }
         return bounds.contains(convert(point, from: parent)) ? self : nil
     }
-    override func updateTrackingAreas() { super.updateTrackingAreas(); for area in trackingAreas { removeTrackingArea(area) }; addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)) }
-    override func mouseEntered(with event: NSEvent) { hovered = true }
+    // 面板每 10s 重建、行随布局/滚动在光标下位移时，.inVisibleRect 的合成 enter 可能带过期
+    // 位置，area 在 updateTrackingAreas 被换新时配对的 exit 也可能被吞掉，高亮就残留在
+    // 鼠标并不在的行上。enter 用实时光标位置校验；area 换新时自查一次，补发丢失的 exit。
+    private var mouseIsInside: Bool {
+        guard let win = window else { return false }
+        let point = win.convertFromScreen(NSRect(origin: NSEvent.mouseLocation, size: .zero)).origin
+        return bounds.contains(convert(point, from: nil))
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+        if hovered && !mouseIsInside { hovered = false }
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = mouseIsInside }
     override func mouseExited(with event: NSEvent) { hovered = false }
 }
 
