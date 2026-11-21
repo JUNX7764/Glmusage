@@ -91,6 +91,10 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 # 焦点在被替换卡内恢复、结构变化立即重排（其他 GUI 测试错开 ≥5s）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-perf-test
 
+# 悬停显示状态面板：驻留打开/桥区保持/延迟收起/点击 pin/菜单开关时序回归。
+# 合成事件驱动（测试内断开真实 tracking，不受真实光标扰动）；与其他 GUI 测试错开 ≥5s
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-hover-test
+
 # 更新流程预览（进度行原位展示；不执行真实更新）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-updating
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-updating-install
