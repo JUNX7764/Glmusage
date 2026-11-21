@@ -1,7 +1,7 @@
 import AppKit
 
 // 悬停显示状态面板：几何/时序纯逻辑 + 控制器（机制参照 Status Trio issue #355）。
-// 图标与面板各挂 NSTrackingArea，边界进出驱动 0.35s 驻留开 / 0.30s 延迟收；
+// 图标与面板各挂 NSTrackingArea，边界进出驱动 0.2s 驻留开 / 0.30s 延迟收；
 // 图标-面板间 8pt 桥区计入保持区；hover 打开的面板首次点击转常开（pin）。
 // 纯逻辑与 AppKit 控制器分离，便于 --self-test 离线断言；控制器只依赖注入的
 // 状态读取与动作闭包，测试可整体替换（固定矩形/固定指针位置）做确定性时序验证。
@@ -142,7 +142,7 @@ final class PanelHoverTracking: NSResponder {
 /// 面板关闭后面板 tracking 保留在复用的内容视图上（无窗口时不触发）。
 /// 主线程专用（与全库惯例一致：AppKit 交互类不做显式 actor 标注）。
 final class PanelHoverController {
-    static let showDelay: TimeInterval = 0.35
+    static let showDelay: TimeInterval = 0.2
     static let hideDelay: TimeInterval = 0.30
 
     // 以下闭包由宿主注入；测试可整体替换为固定值

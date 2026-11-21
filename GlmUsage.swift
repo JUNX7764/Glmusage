@@ -3265,7 +3265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") || CommandLine.arguments.contains("--preview-hover-test") {
             popover.behavior = .applicationDefined
         }
-        // 悬停显示状态面板（Sources/PanelHover.swift）：驻留 0.35s 开、离组 0.30s 收、首次点击 pin。
+        // 悬停显示状态面板（Sources/PanelHover.swift）：驻留 0.2s 开、离组 0.30s 收、首次点击 pin。
         // preview 进程仅在 --preview-hover-test 启用，其余 GUI 回归不受真实鼠标驻留干扰
         panelHoverController = PanelHoverController(iconView: statusItem.button)
         if let hover = panelHoverController {
@@ -5613,11 +5613,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         wait(0.3)
         expectShown(false, "initial-close")
 
-        // 1. 图标驻留 0.35s 才打开；0.15s 不开
+        // 1. 图标驻留 0.2s 才打开；0.1s 不开
         pointAt(iconRect.midX, iconRect.midY)
         hover.iconEntered()
-        wait(0.15)
-        guard !popover.isShown else { fail("dwell 0.15s must not open") }
+        wait(0.1)
+        guard !popover.isShown else { fail("dwell 0.1s must not open") }
         wait(0.5)
         expectShown(true, "dwell-opens")
         guard panelPresentedByHover else { fail("hover-open must mark presentedByHover") }
