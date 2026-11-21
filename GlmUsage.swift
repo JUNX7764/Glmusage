@@ -3084,8 +3084,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var updateMessageDismissal: DispatchWorkItem?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
-    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-connection-test") || CommandLine.arguments.contains("--preview-appearance-test") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
-    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let preview = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-daily-unavailable") || CommandLine.arguments.contains("--preview-daily-basezero") || CommandLine.arguments.contains("--preview-daily-insufficient") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-connection-test") || CommandLine.arguments.contains("--preview-appearance-test") || CommandLine.arguments.contains("--preview-perf-test") || CommandLine.arguments.contains("--preview-updating") || CommandLine.arguments.contains("--preview-updating-install") || Bundle.main.bundleIdentifier == "com.local.glm-usage.preview" || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
+    private let previewPopover = CommandLine.arguments.contains("--preview-popover") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true)
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
@@ -3160,6 +3160,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var panelLayout = GLMPanelLayout.load()
     private var showingCardSettings = false
 
+    // —— 面板增量渲染（2026-11-21 性能加固）——
+    // lastPanelSnapshot：当前树内容的快照基准，buildPanel 结束时刷新；
+    // panelDirty：面板关闭期间检测到内容将变化（打开路径据此先重建再显示，保证打开即最新）。
+    // 计数器仅供离线 GUI 回归（--preview-perf-test）断言注入观察，不影响行为：
+    // panelRebuildCount = 整棵重建次数；panelCardRefreshCounts = 各卡内容(重)建次数。
+    private var lastPanelSnapshot: GLMPanelSnapshot?
+    private var panelDirty = false
+    private(set) var panelRebuildCount = 0
+    private var panelCardRefreshCounts: [GLMPanelCardID: Int] = [:]
+
     private func persistPanelLayout() {
         if !preview { panelLayout.save() }
     }
@@ -3205,17 +3215,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func onSpeedPeriod(_ sender: NSButton) {
         guard let period = GLMLocalModelStats.Period(rawValue: sender.tag), speedStatsPeriod != period else { return }
         speedStatsPeriod = period
-        rebuildPanel()
+        rebuildPanel(force: true)
     }
 
     @objc private func onCachePeriod(_ sender: NSButton) {
         guard let period = GLMLocalModelStats.Period(rawValue: sender.tag), cacheStatsPeriod != period else { return }
         cacheStatsPeriod = period
-        rebuildPanel()
+        rebuildPanel(force: true)
     }
 
-    @objc private func toggleSpeed() { speedExpanded.toggle(); rebuildPanel() }
-    @objc private func toggleCache() { cacheExpanded.toggle(); rebuildPanel() }
+    @objc private func toggleSpeed() { speedExpanded.toggle(); rebuildPanel(force: true) }
+    @objc private func toggleCache() { cacheExpanded.toggle(); rebuildPanel(force: true) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 恢复上次「结果未知」遗留的幂等 key：跨重启防重复扣卡
@@ -3244,7 +3254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.animates = false
         // 仅离线 GUI 回归进程：改用 applicationDefined，避免测试期间的真实鼠标点击
         // （用户正在用机）把 transient Popover 关掉造成几何断言误报；生产与普通预览不变
-        if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") {
+        if CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") {
             popover.behavior = .applicationDefined
         }
         if preview {
@@ -3280,7 +3290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 previewWindow?.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
             }
-            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
+            if CommandLine.arguments.contains("--preview-auto-open") || CommandLine.arguments.contains("--preview-popover-test") || CommandLine.arguments.contains("--preview-daily-test") || CommandLine.arguments.contains("--preview-quota-history-test") || CommandLine.arguments.contains("--preview-card-settings-test") || CommandLine.arguments.contains("--preview-perf-test") || (Bundle.main.object(forInfoDictionaryKey: "GLMPreviewPopover") as? Bool == true) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self = self else { return }
                     self.togglePanel()
@@ -3296,6 +3306,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                     if CommandLine.arguments.contains("--preview-card-settings-test") {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.testCardSettings() }
+                    }
+                    if CommandLine.arguments.contains("--preview-perf-test") {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.testPreviewPanelPerf() }
                     }
                 }
             }
@@ -3710,7 +3723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let active = UpdateProgressController.shared.isActive
         if active != updateProgressWasActive {
             updateProgressWasActive = active
-            rebuildPanel()
+            rebuildPanel(force: true)   // 按钮↔进度行是结构变化，不走快照短路
             if !active, UpdateProgressController.shared.phase == .failed {
                 setUpdateMessage("更新失败，详见弹窗提示", dismissAfter: 8)
             }
@@ -3820,22 +3833,250 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 下拉面板
     // 历史上此处还构造过一个 NSMenu（menu delegate 从未接线、从未展示，文案需人肉与面板同步）；
     // 2026-11-08 review 确认死代码后整段切除。面板打开时的刷新与更新检查在 togglePanel 内完成。
-    private func rebuildPanel() {
-        if updateConfirmation == nil || !panelConfigured { buildPanel() }
+
+    /// 面板显示状态的统一判定：Popover 弹出中，或 preview 预览窗口模式（无 Popover，常显）。
+    private var panelDisplayed: Bool { popover.isShown || (preview && !previewPopover) }
+
+    /// 面板树内容快照：收敛 buildPanel 实际读取的全部输入（字段口径见 GLMPanelSnapshot 头注）。
+    /// 只在主线程调用；原始 Date 一律转分钟粒度展示文案，连续比例量化，保证快照相等 ⇔ 渲染相等。
+    private func currentPanelSnapshot() -> GLMPanelSnapshot {
+        let now = Date()
+        let recovery = GLMConnectionRecovery.action(quotaError: usage.quotaError, resetError: usage.resetCardsError)
+        let needsPlanConnection = GLMConnectionRecovery.action(quotaError: usage.quotaError, resetError: nil) != .none
+        let resetLoginUnsupported = usage.resetCardsError == CredStore.newCredentialMessage
+        var s = GLMPanelSnapshot()
+        // 结构层
+        s.layout = panelLayout
+        s.showingCardSettings = showingCardSettings
+        s.updateProgressActive = UpdateProgressController.shared.isActive
+        s.updateConfirmation = updateConfirmation.map { .init(tag: $0.tag, notes: $0.notes) }
+        s.updateButtonVisible = (UpdateChecker.shared.available && !preview)
+            || (preview && CommandLine.arguments.contains("--preview-update-notes"))
+        s.recoveryAction = recovery
+        s.structure = .init(tokenExpanded: tokenExpanded, modelExpandedWindows: expandedModelWindows,
+                            mcpExpanded: mcpExpanded, dailyExpanded: dailyExpanded, historyExpanded: historyExpanded,
+                            speedExpanded: speedExpanded, cacheExpanded: cacheExpanded,
+                            speedPeriod: speedStatsPeriod, cachePeriod: cacheStatsPeriod)
+        // 头部 / 底部
+        s.planTier = GLMPlanTier.resolve(subscription: usage.subscription,
+            subscriptionFresh: !subscriptionStale && subscriptionLastOK != nil
+                && (usage.subscription?.expireDate.map { $0 > now } ?? true),
+            level: usage.level,
+            levelFresh: !isStale(planLevelLastOK, hasData: usage.level != nil, after: quotaStaleAfter) && planLevelLastOK != nil)
+        s.planPillTooltip = usage.subscription?.name ?? s.planTier.title
+        s.accountEmail = usage.accountEmail
+        s.lastAttemptText = Fmt.time(lastAttemptAt)
+        s.updateMessage = updateMessage
+        s.loginItemEnabled = !preview && isLoginItemEnabled()
+        // 额度卡
+        func quotaWindow(_ entry: LimitEntry?, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool) -> GLMPanelSnapshot.QuotaCard.Window {
+            let ratio = entry?.usedRemainingRatio
+            var window = GLMPanelSnapshot.QuotaCard.Window()
+            window.percentText = Fmt.pct(ratio)
+            window.bandPercent = ratio.map { GLMPanelSnapshot.quantizedRatio($0).band } ?? -1
+            window.barFill = ratio.map { GLMPanelSnapshot.quantizedRatio($0).fill }
+            window.resetText = entry?.reset.map { Fmt.weekDayTime($0) } ?? "时间未知"
+            if let e = entry { window.remainingLine = "剩余 \(Fmt.credits(e.remaining)) / \(Fmt.credits(e.limit)) credits" }
+            if needsPlanConnection && error == usage.quotaError {
+                if let last { window.lastOKLine = "上次更新 \(Fmt.lastOK(last))" }
+            } else if let e = error {
+                window.errorLine = "刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))"
+            }
+            window.warningLine = warning.map { "部分数据异常：\($0)" }
+            if error == nil && stale { window.staleLine = "数据已过期 · 最后成功 \(Fmt.lastOK(last))" }
+            return window
+        }
+        s.quota.fiveHour = quotaWindow(usage.fiveHour, usage.fiveHourError, usage.fiveHourWarning, fiveHourLastOK, fiveHourStale)
+        s.quota.week = quotaWindow(usage.week, usage.weekError, usage.weekWarning, weekLastOK, weekStale)
+        let subscriptionError = needsPlanConnection && usage.subscriptionError == usage.quotaError ? nil : usage.subscriptionError
+        if let sub = usage.subscription {
+            s.quota.subscriptionLine = "套餐到期：\(sub.expireDate.map { Fmt.fullTime.string(from: $0) } ?? "暂无数据")"
+        }
+        if let error = subscriptionError {
+            s.quota.subscriptionErrorLine = "套餐刷新失败：\(error) · 最后成功 \(Fmt.lastOK(subscriptionLastOK))"
+        } else if subscriptionStale {
+            s.quota.subscriptionStaleLine = "套餐数据已过期 · 最后成功 \(Fmt.lastOK(subscriptionLastOK))"
+        }
+        // 峰谷卡（--preview-peak 强制按下个高峰时刻渲染，与 buildPanel 同源）
+        let peakNow = CommandLine.arguments.contains("--preview-peak") ? Peak.nextPeakStart(now) : now
+        let peakInfo = Peak.display(at: peakNow)
+        s.peak = .init(isPeak: peakInfo.isPeak, badge: peakInfo.badge, discount: peakInfo.discount,
+                       nextLabel: peakInfo.nextLabel, nextTime: peakInfo.nextTime)
+        // 重置卡卡
+        s.resetCards.loginUnsupported = resetLoginUnsupported
+        s.resetCards.useButtonEnabled = !resetUseInFlight
+        if !resetLoginUnsupported {
+            if let count = usage.resetCards?.availableCount(now: now), count > 0 { s.resetCards.countText = "×\(count)" }
+            if let c = usage.resetCards {
+                for (name, dates) in [("5 小时卡", c.fiveHour), ("周卡", c.week)] {
+                    if let dates = dates {
+                        let available = GLMFreshness.availableCards(dates, now: now)
+                        if available.isEmpty { s.resetCards.rows.append(.init(name: name, detail: "暂无可用", warning: false)) }
+                        for d in available {
+                            s.resetCards.rows.append(.init(name: name, detail: "\(Fmt.expires(d)) 过期",
+                                                           warning: d.timeIntervalSinceNow <= 72 * 3600))
+                        }
+                    }
+                }
+            } else {
+                s.resetCards.emptyText = "暂无数据"
+            }
+            for (name, error, stale, last) in [("5 小时卡", usage.fiveHourCardsError, fiveHourCardsStale, fiveHourCardsLastOK),
+                                               ("周卡", usage.weekCardsError, weekCardsStale, weekCardsLastOK)] {
+                let message = error.map {
+                    "\(name)获取失败：\($0)（ZCode 登录态可能过期，打开 ZCode 后重试） · 最后成功 \(Fmt.lastOK(last))"
+                } ?? (stale ? "\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))" : nil)
+                if let message { s.resetCards.errorLines.append(message) }
+            }
+        } else {
+            s.resetCards.emptyText = "请在 ZCode 的「使用统计 → 编程套餐」查看和使用"
+        }
+        // 用量情况卡（三窗数值 + 明细 + 异常/过期行）
+        func usageWindow(_ name: String, _ stats: ModelUsage?, _ last: Date?, _ stale: Bool, _ error: String?) -> GLMPanelSnapshot.UsageCard.Window {
+            var window = GLMPanelSnapshot.UsageCard.Window()
+            window.totalTokensText = stats.map { Fmt.tokens($0.totalTokens) } ?? "--"
+            window.totalCallsText = stats.map { Fmt.count($0.totalCalls) } ?? "--"
+            window.models = (stats.map { TokenModelList.visible($0.byModel) } ?? [])
+                .map { .init(name: $0.name, tokensText: Fmt.tokens($0.tokens)) }
+            if needsPlanConnection && error == usage.quotaError {
+                if let last { window.lastOKLine = "\(name)上次更新 \(Fmt.lastOK(last))" }
+            } else if let e = error {
+                window.errorLine = "\(name)刷新失败：\(e) · 最后成功 \(Fmt.lastOK(last))"
+            } else if stale {
+                window.staleLine = "\(name)数据已过期 · 最后成功 \(Fmt.lastOK(last))"
+            }
+            return window
+        }
+        s.usage.today = usageWindow("今日", usage.tokensToday, tokensTodayLastOK, tokensTodayStale, usage.tokensTodayError)
+        s.usage.sevenDays = usageWindow("近 7 天", usage.tokens7d, tokens7dLastOK, tokens7dStale, usage.tokens7dError)
+        s.usage.thirtyDays = usageWindow("近 30 天", usage.tokens30d, tokens30dLastOK, tokens30dStale, usage.tokens30dError)
+        // 每日用量卡
+        s.daily.buckets = usage.dailyTokens
+        s.daily.selectedIndex = dailySelectedIndex
+        s.daily.pendingNote = usage.dailyTokens != nil && (usage.dailyTokensError != nil || dailyStale)
+        // 额度周期回顾卡（备注口径与 buildPanel 逐字一致）
+        let historyState = historySnapshot?.state ?? GLMQuotaCycleState()
+        s.history.records = historyState.closed + (historyState.current.map { [$0] } ?? [])
+        s.history.browser = historyBrowser
+        s.history.pending = historyState.pending != nil
+        var historyNotes: [String] = []
+        if historySnapshot?.isLoading == true { historyNotes.append("加载历史中") }
+        if historySnapshot?.isProtected == true { historyNotes.append("历史文件受保护") }
+        else if historySnapshot?.isUnsaved == true { historyNotes.append("历史未保存") }
+        if historySnapshot?.isVolatile == true { historyNotes.append("仅保留本次运行") }
+        if !preview && historyState.current != nil && weekStale { historyNotes.append("额度待更新，余额为最后观测") }
+        if historyState.operations.values.contains(where: { $0.isWeek && $0.result == .confirmedUsed && !$0.attributionProven }) {
+            historyNotes.append("本机用卡归属未确认")
+        }
+        if historyState.current.map({ $0.expectedResetAt < now && historyState.pending == nil }) == true {
+            historyNotes.append("等待窗口更新")
+        }
+        s.history.status = historyNotes.isEmpty ? nil : historyNotes.joined(separator: " · ")
+        // MCP 工具卡
+        if mcpExpanded {
+            s.mcp.contentLine = usage.tools30d.map {
+                "网络搜索 \(Fmt.count($0.networkSearch)) 次 · 网页读取 \(Fmt.count($0.webRead)) 次"
+            } ?? "暂无数据"
+        }
+        if needsPlanConnection && usage.toolsError == usage.quotaError {
+            if toolsLastOK != nil { s.mcp.lastOKLine = "上次更新 \(Fmt.lastOK(toolsLastOK))" }
+        } else if let e = usage.toolsError {
+            s.mcp.errorLine = "MCP 刷新失败：\(e) · 最后成功 \(Fmt.lastOK(toolsLastOK))"
+        } else if toolsStale {
+            s.mcp.staleLine = "MCP 数据已过期 · 最后成功 \(Fmt.lastOK(toolsLastOK))"
+        }
+        // 模型速度 / 缓存命中卡
+        func statsCard(_ expanded: Bool, _ period: GLMLocalModelStats.Period) -> GLMPanelSnapshot.StatsCard {
+            var card = GLMPanelSnapshot.StatsCard()
+            card.period = period
+            if let error = localModelStatsError {
+                card.errorLine = error
+                return card
+            }
+            guard expanded, let snapshot = localStats(for: period) else { return card }
+            let speedRows = snapshot.speedRows()
+            if speedRows.isEmpty {
+                card.contentLine = period.emptySpeedText
+                return card
+            }
+            card.rows = speedRows.map {
+                let stat = GLMLocalModelStats.speedStat($0)
+                return .init(name: $0.name, statA: stat.speed, statB: stat.ttft)
+            }
+            return card
+        }
+        func cacheCard(_ expanded: Bool, _ period: GLMLocalModelStats.Period) -> GLMPanelSnapshot.StatsCard {
+            var card = GLMPanelSnapshot.StatsCard()
+            card.period = period
+            if let error = localModelStatsError {
+                card.errorLine = error
+                return card
+            }
+            guard expanded, let snapshot = localStats(for: period) else { return card }
+            let cacheRows = snapshot.cacheRows()
+            if cacheRows.isEmpty {
+                card.contentLine = period.emptyCacheText
+                return card
+            }
+            if let overall = snapshot.overall {
+                let stat = GLMLocalModelStats.cacheStat(overall)
+                card.rows.append(.init(name: "整体", statA: stat.hit, statB: stat.input))
+            }
+            card.rows += cacheRows.map {
+                let stat = GLMLocalModelStats.cacheStat($0)
+                return .init(name: $0.name, statA: stat.hit, statB: stat.input)
+            }
+            return card
+        }
+        s.speed = statsCard(speedExpanded, speedStatsPeriod)
+        s.cache = cacheCard(cacheExpanded, cacheStatsPeriod)
+        return s
+    }
+
+    /// 数据合并后的统一重建入口。
+    /// force=true：结构性变化（显隐/排序/恢复默认/展开收起/设置页进出/确认横幅/进度行/用卡在途），
+    /// 无条件整棵重建，不走快照短路。
+    /// force=false（数据路径）：
+    /// - 面板未显示 → 只标脏，不拆建（打开路径 togglePanel 保证打开即最新）；
+    /// - 确认横幅展示中 → 保持视图稳定（现状语义：数据刷新不打断横幅阅读）；
+    /// - 面板显示中 → 快照与上次相同则跳过；不同则整棵重建（Stage 1 语义，Stage 2 改逐卡）。
+    private func rebuildPanel(force: Bool = false) {
+        if force { buildPanel(); return }
+        if panelConfigured, updateConfirmation != nil { return }
+        if !panelConfigured { buildPanel(); return }
+        guard panelDisplayed else {
+            panelDirty = currentPanelSnapshot() != lastPanelSnapshot
+            return
+        }
+        let snapshot = currentPanelSnapshot()
+        guard snapshot != lastPanelSnapshot else {
+            panelDirty = false
+            return
+        }
+        buildPanel()
     }
 
     @objc private func restoreDefaultPanelLayout() {
         panelLayout = .default
         persistPanelLayout()
         showingCardSettings = false
-        rebuildPanel()
+        rebuildPanel(force: true)
     }
 
     @objc private func togglePanel() {
         if popover.isShown { popover.performClose(nil); return }
         dailySelectedIndex = nil
         if !preview { refresh(tokens: false); checkForUpdate() }
-        rebuildPanel()
+        // 打开即最新：dailySelectedIndex 重置与关闭期间的数据变化都在此刻落树。
+        // 快照一致（含未选中日的干净状态）时沿用现树，秒开；脏（关闭期有变化）则先重建再显示。
+        // 横幅语义与首次配置仍走 rebuildPanel 的既有守卫。
+        if panelConfigured && updateConfirmation == nil {
+            let snapshot = currentPanelSnapshot()
+            if panelDirty || snapshot != lastPanelSnapshot { buildPanel() }
+            panelDirty = false
+        } else {
+            rebuildPanel()
+        }
         if let button = statusItem.button {
             applyBackgroundStyle()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -3884,7 +4125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    @objc private func toggleToken() { tokenExpanded.toggle(); rebuildPanel() }
+    @objc private func toggleToken() { tokenExpanded.toggle(); rebuildPanel(force: true) }
 
     // 面板标题行的小重置图标：一类卡可用直接确认；两类都有先选类型；无卡提示
     @objc private func onResetCardIcon(_ sender: NSButton) {
@@ -3973,7 +4214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 responseAt: nil, isWeek: type == .week, result: .requested,
                 baselineCycleID: attempt.baseline, attributionProven: attempt.attributable), token: attempt.token)
         }
-        rebuildPanel()
+        rebuildPanel(force: true)   // 用卡在途：按钮禁用态翻转，结构变化不走快照短路
         Fetcher.useResetCard(jwt: jwt, maas: maas, resetType: type, idempotencyKey: key) { [weak self] outcome in
             DispatchQueue.main.async {
                 guard let self = self else { return }
@@ -4017,11 +4258,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard (0..<3).contains(index) else { return }
         if expandedModelWindows.contains(index) { expandedModelWindows.remove(index) }
         else { expandedModelWindows.insert(index) }
-        rebuildPanel()
+        rebuildPanel(force: true)
     }
-    @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildPanel() }
-    @objc private func toggleDaily() { dailyExpanded.toggle(); rebuildPanel() }
-    @objc private func toggleHistory() { historyExpanded.toggle(); rebuildPanel() }
+    @objc private func toggleMCP() { mcpExpanded.toggle(); rebuildPanel(force: true) }
+    @objc private func toggleDaily() { dailyExpanded.toggle(); rebuildPanel(force: true) }
+    @objc private func toggleHistory() { historyExpanded.toggle(); rebuildPanel(force: true) }
     // 版本点击等临时状态行；dismissAfter 到点后自动清除（与 CodexUsage 一致）
     private func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
         updateMessageDismissal?.cancel()
@@ -4558,6 +4799,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                                         expanded: dailyExpanded, toggleTarget: self,
                                                         toggleAction: #selector(toggleDaily), pendingNote: dailyPending) { [weak self] index in
                 self?.dailySelectedIndex = index
+                // 选中变化由区块视图原位呈现、不重建：快照基准必须同步树内实际选中，
+                // 否则快照相等 ⇔ 渲染相等的前提被打破（重开面板时选中日重置会漏判为无变化）
+                self?.lastPanelSnapshot?.daily.selectedIndex = index
             }
             addContent(dailySection, to: dailyCard)
             register(dailyCard, as: .daily)
@@ -4585,6 +4829,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self.historyBrowser = browser
                     if needsRebuild {
                         self.rebuildPanel()
+                    } else {
+                        // 选中变化原位呈现、不重建：同步快照基准（树内已展示新选中）
+                        self.lastPanelSnapshot?.history.browser = browser
                     }
                 }
                 historyCanvas = historyView.canvas
@@ -4966,6 +5213,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if restoreHistoryFocus, let canvas = historyCanvasForFocus {
             canvas.window?.makeFirstResponder(canvas)
         }
+        // 快照基准与计数器：树与快照在此对齐（面板关闭期间的变化由 rebuildPanel/togglePanel 补建）
+        lastPanelSnapshot = currentPanelSnapshot()
+        panelDirty = false
+        panelRebuildCount += 1
+        for view in panelRoot.arrangedSubviews {
+            guard let raw = view.identifier?.rawValue, raw.hasPrefix("GLMPanelCard."),
+                  let id = GLMPanelCardID(rawValue: String(raw.dropFirst("GLMPanelCard.".count))) else { continue }
+            panelCardRefreshCounts[id, default: 0] += 1
+        }
         tracePopover("rebuild")
     }
 
@@ -5194,7 +5450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         key(124)
         guard historyBrowser.selectedCycleID == records[8].id else { fail("repeated keyboard focus") }
         let selectionBeforeRefresh = historyBrowser.selectedCycleID
-        rebuildPanel()
+        rebuildPanel(force: true)   // 焦点恢复断言依赖真实重建：无变化跳过会让该检查空转
         guard let refreshedCanvas = historyCanvasForFocus,
               window.firstResponder === refreshedCanvas,
               historyBrowser.selectedCycleID == selectionBeforeRefresh else { fail("refresh lost history keyboard focus or selection") }
@@ -5633,6 +5889,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
         guard UserDefaults.standard.data(forKey: GLMPanelLayout.defaultsKey) == productionLayoutData else { fail("preview wrote production layout defaults") }
         print("GLM card settings test: PASS (default layout, unified menu, settings editor, dynamic key chain, scroll clamping, drag data boundary)")
+        exit(0)
+    }
+
+    // 面板增量渲染回归（L1：无变化跳过 + 关闭期标脏；假数据 + 隔离预览，绝不读真实凭据）。
+    // 断言重建计数器：旧实现每轮 updateUI 无条件整棵拆建、面板关着也拆建，
+    // 以下「显示中无变化不重建」「关闭期变化不拆建只标脏」两条在旧实现下必然失败。
+    private func testPreviewPanelPerf() {
+        func fail(_ message: String) -> Never {
+            fputs("GLM panel perf test: FAIL \(message)\n", stderr)
+            exit(1)
+        }
+        func allViews(_ root: NSView) -> [NSView] { [root] + root.subviews.flatMap(allViews) }
+        func texts(_ root: NSView) -> [String] { allViews(root).compactMap { ($0 as? NSTextField)?.stringValue } }
+        func waitOpen() {
+            var waited = 0.0
+            while !popover.isShown && waited < 2.0 {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                waited += 0.1
+                if !popover.isShown { togglePanel() }
+            }
+            guard popover.isShown, panelController.view.window != nil else { fail("panel did not open") }
+        }
+        waitOpen()
+        // A. 显示中无变化刷新：不整棵重建（旧实现每轮 updateUI 都拆建 → 此处必红）
+        let baseline = panelRebuildCount
+        for _ in 0..<3 { updateUI() }
+        guard panelRebuildCount == baseline else { fail("unchanged refresh rebuilt panel \(panelRebuildCount - baseline) times") }
+        guard statusItem.button?.image != nil else { fail("menubar image missing after panel skip") }
+        // B. 显示中数值变化：重建一次且新值入树（Stage 1 保持全量重建语义）
+        var entry = usage.fiveHour ?? LimitEntry(label: "5 小时窗口", isFiveHour: true, limit: 2000, used: 0, remaining: 2000, usedRatio: 0, reset: nil)
+        entry.used = 1100; entry.remaining = 900; entry.usedRatio = 0.55
+        usage.fiveHour = entry
+        updateUI()
+        guard panelRebuildCount == baseline + 1 else { fail("value change did not rebuild exactly once") }
+        guard texts(panelController.view).contains(where: { $0 == "45%" }) else { fail("fresh percent missing after rebuild") }
+        let afterValueChange = panelRebuildCount
+        // C. 关闭期变化：不拆建、只标脏；打开即最新
+        popover.performClose(nil)
+        var closedWait = 0.0
+        while popover.isShown && closedWait < 2.0 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            closedWait += 0.1
+        }
+        guard !popover.isShown else { fail("panel did not close") }
+        var week = usage.week ?? LimitEntry(label: "7 天额度", isFiveHour: false, limit: 10000, used: 0, remaining: 10000, usedRatio: 0, reset: nil)
+        week.used = 0; week.remaining = 10000; week.usedRatio = 0
+        usage.week = week
+        updateUI()
+        guard panelRebuildCount == afterValueChange else { fail("closed-period change rebuilt panel") }
+        guard panelDirty else { fail("closed-period change not marked dirty") }
+        togglePanel()
+        waitOpen()
+        guard panelRebuildCount == afterValueChange + 1 else { fail("dirty open did not rebuild") }
+        guard texts(panelController.view).contains(where: { $0 == "100%" }) else { fail("dirty open did not show fresh value") }
+        guard !panelDirty else { fail("dirty flag not cleared after rebuild") }
+        // D. 展开/收起：结构性变化必须立即重排（force 路径，不走快照短路）
+        let beforeToggle = panelRebuildCount
+        toggleMCP()
+        guard panelRebuildCount == beforeToggle + 1 else { fail("expand did not rebuild immediately") }
+        toggleMCP()
+        guard panelRebuildCount == beforeToggle + 2 else { fail("collapse did not rebuild immediately") }
+        print("GLM panel perf test: PASS (unchanged-skip, closed-period dirty + open-fresh, structural immediate rebuild)")
         exit(0)
     }
 
@@ -6130,7 +6448,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func showCardSettings() {
         showingCardSettings = true
-        rebuildPanel()
+        rebuildPanel(force: true)
         // 打开设置页时接管焦点：否则焦点残留在「···」按钮上，Space 会再次弹出菜单，
         // 菜单跟踪期间 transient Popover 失去 key 被关闭（Cua 真实按键验收发现的缺陷）。
         func scan(_ view: NSView) -> GLMCardSettingsView? {
@@ -6147,7 +6465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func finishCardSettings() {
         showingCardSettings = false
-        rebuildPanel()
+        rebuildPanel(force: true)
     }
     @objc private func selectBackgroundStyle(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let style = GLMPanelBackgroundStyle(rawValue: raw), style != .liquidGlass || Self.supportsLiquidGlass else { return }
@@ -7285,6 +7603,84 @@ enum GLMOfflineRegression {
             customLayout.save(to: defaults)
             try expect(GLMPanelLayout.load(from: defaults) == customLayout, "UserDefaults layout round trip")
 
+            // 面板内容快照（L1 无变化跳过重建的正确性前提）：显式字段相等性、量化稳定性
+            // 与结构变化分类。快照相等 ⇔ 渲染内容相等；禁止 String(reflecting:) 深比较。
+            let baseSnapshot = GLMPanelSnapshot()
+            try expect(baseSnapshot == GLMPanelSnapshot(), "snapshot baseline equality")
+            try expect(!baseSnapshot.containsStructuralChange(to: GLMPanelSnapshot()), "identical snapshot is not structural")
+            for id in GLMPanelCardID.allCases {
+                try expect(!baseSnapshot.cardDiffers(from: GLMPanelSnapshot(), id: id), "identical snapshot per-card diff \(id)")
+            }
+            // 每张卡与头/底字段的变化都必须被快照捕获（抽查代表字段）
+            var dataSnapshot = baseSnapshot
+            dataSnapshot.quota.fiveHour.percentText = "42%"
+            try expect(baseSnapshot != dataSnapshot && baseSnapshot.cardDiffers(from: dataSnapshot, id: .quota), "quota percent change captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.peak.isPeak = true
+            try expect(baseSnapshot.cardDiffers(from: dataSnapshot, id: .peak), "peak flip captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.resetCards.rows = [.init(name: "5 小时卡", detail: "明天 08:00 过期", warning: false)]
+            try expect(baseSnapshot.cardDiffers(from: dataSnapshot, id: .resetCards), "reset card rows captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.usage.today.models = [.init(name: "glm-4.7", tokensText: "1.20M")]
+            try expect(baseSnapshot.cardDiffers(from: dataSnapshot, id: .usage), "usage model detail captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.daily.buckets = [GLMDayBucket(day: Date(timeIntervalSince1970: 1_800_000_000), tokens: 1)]
+            try expect(baseSnapshot.cardDiffers(from: dataSnapshot, id: .daily), "daily buckets captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.history.browser.selectedCycleID = UUID()
+            try expect(baseSnapshot.cardDiffers(from: dataSnapshot, id: .history), "history browser captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.mcp.contentLine = "网络搜索 1 次 · 网页读取 1 次"
+            try expect(baseSnapshot.cardDiffers(from: dataSnapshot, id: .mcp), "mcp content captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.speed.rows = [.init(name: "glm-5.3-flashx", statA: "153 tok/s", statB: "首字2.3s")]
+            try expect(baseSnapshot.cardDiffers(from: dataSnapshot, id: .speed), "speed rows captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.cache.contentLine = "今日暂无数据"
+            try expect(baseSnapshot.cardDiffers(from: dataSnapshot, id: .cache), "cache content captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.accountEmail = "user@example.com"
+            try expect(baseSnapshot != dataSnapshot, "header email captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.updateMessage = "预览：当前已是最新版本"
+            try expect(baseSnapshot != dataSnapshot, "footer message captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.lastAttemptText = "14:32"
+            try expect(baseSnapshot != dataSnapshot, "footer last-attempt captured")
+            // 量化稳定性：亚 0.5% 漂移不产生快照差异（否则 10s 刷新会每轮打脏快照）；
+            // 真实跨档位变化仍然被捕
+            let smallDrift = GLMPanelSnapshot.quantizedRatio(0.32)
+            let sameBucket = GLMPanelSnapshot.quantizedRatio(0.322)
+            let nextBucket = GLMPanelSnapshot.quantizedRatio(0.36)
+            try expect(smallDrift.band == sameBucket.band && smallDrift.fill == sameBucket.fill, "sub-0.5% drift quantized away")
+            try expect(smallDrift.fill != nextBucket.fill && smallDrift.band != GLMPanelSnapshot.quantizedRatio(0.795).band,
+                       "real ratio change survives quantization")
+            var browserA = GLMQuotaHistoryBrowser()
+            var browserB = browserA
+            try expect(browserA == browserB, "browser equatable synthesized")
+            browserB.loadedLimit += 12
+            try expect(browserA != browserB, "browser loadedLimit change captured")
+            // 结构变化分类：布局/展开收起/横幅/进度行 → 整棵重建；卡内数值变化 → 逐卡
+            dataSnapshot = baseSnapshot
+            dataSnapshot.layout.setVisible(false, for: .mcp)
+            try expect(baseSnapshot.containsStructuralChange(to: dataSnapshot), "layout change is structural")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.structure.mcpExpanded = false
+            try expect(baseSnapshot.containsStructuralChange(to: dataSnapshot), "expansion change is structural")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.updateConfirmation = .init(tag: "v1", notes: "n")
+            try expect(baseSnapshot.containsStructuralChange(to: dataSnapshot), "confirmation banner is structural")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.updateProgressActive = true
+            try expect(baseSnapshot.containsStructuralChange(to: dataSnapshot), "progress row is structural")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.showingCardSettings = true
+            try expect(baseSnapshot.containsStructuralChange(to: dataSnapshot), "settings page is structural")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.quota.fiveHour.percentText = "42%"
+            try expect(!baseSnapshot.containsStructuralChange(to: dataSnapshot), "card data change is not structural")
+
             let surfaceCard = GLMPanelCard()
             var previousFill: CGColor?
             for name in [NSAppearance.Name.aqua, .darkAqua] {
@@ -7611,7 +8007,7 @@ enum GLMOfflineRegression {
             try expect(!CredStore.isValidEmail(String(repeating: "a", count: 250) + "@example.com"),
                        "over-length email accepted")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence)")
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, panel snapshot equality/quantization/structural classification, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)

@@ -217,7 +217,9 @@ struct GLMQuotaCycleReducer {
     }
 }
 
-struct GLMQuotaHistoryBrowser {
+/// 周期回顾浏览状态（分页锚点/选中周期/加载上限）；Equatable 供面板内容快照比较
+/// （2026-11-21 面板增量渲染：浏览状态变化才重建历史卡）。
+struct GLMQuotaHistoryBrowser: Equatable {
     var loadedLimit = 12
     var selectedCycleID: UUID?
     var pageAnchorID: UUID? // nil means follow the latest page

@@ -76,13 +76,17 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-popover --preview-quota-history --preview-quota-history-test
 
 # 可附加 --preview-dark / --preview-narrow；状态用 --preview-quota-history-state=empty|short|long|unsaved|volatile|protected
-# 每日图空态/缺口/基期0/数据不足变体（与 --preview-daily-test 错开 ≥5s 逐个跑）
-./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-unavailable
-./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-basezero
-./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-insufficient
+# 每日图空态/缺口/基期0/数据不足变体（与 --preview-daily-test 错开 ≥5s 逐个跑；
+# 假数据离线预览，可加 --preview-screenshot <path> 渲染后自动退出）
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-unavailable --preview-screenshot /tmp/glm_daily_unavailable.png
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-basezero --preview-screenshot /tmp/glm_daily_basezero.png
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-daily-insufficient --preview-screenshot /tmp/glm_daily_insufficient.png
 
 # 卡片显隐/排序/统一菜单/空态/滚动与动态键盘链（其他 GUI 测试错开 ≥5s）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-card-settings-test
+
+# 面板增量渲染回归：无变化刷新不重建、关闭期标脏打开即最新、结构变化立即重排（其他 GUI 测试错开 ≥5s）
+./GlmUsage.app/Contents/MacOS/GlmUsage --preview-perf-test
 
 # 更新流程预览（进度行原位展示；不执行真实更新）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-updating
