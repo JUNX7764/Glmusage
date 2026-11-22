@@ -2340,6 +2340,22 @@ final class UpdateChecker {
 
 final class GLMPanelStack: NSStackView { override var isFlipped: Bool { true } }
 
+// 面板根容器：底栏退出按钮移除后 ⌘Q 失去常驻 responder（NSMenuItem keyEquivalent 仅在
+// 菜单跟踪期间有效），在此兜底拦截面板窗口内的 ⌘Q 转交 onQuit；其余按键原样交还
+// super（子视图遍历继续，刷新按钮的 ⌘R 不受影响）。
+final class GLMPanelRootView: NSView {
+    var quitHandler: (() -> Void)?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // 修饰键精确匹配 ⌘Q（不含 ⇧/⌥/⌃）：⌘⇧Q 是系统注销快捷键，宽匹配会抢走它
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting(.capsLock)
+        if mods == .command, event.charactersIgnoringModifiers?.lowercased() == "q" {
+            quitHandler?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 enum GLMPanelBackgroundStyle: String, CaseIterable {
     case solid, liquidGlass, classicMaterial
     static let defaultsKey = "panelBackgroundStyle"
@@ -2443,6 +2459,9 @@ final class GLMPanelCard: NSView {
 final class GLMPanelAction: NSButton {
     var prominent = false { didSet { needsDisplay = true } }
     var subtleBackground = false { didSet { needsDisplay = true } }
+    // pillNeutral：版本胶囊专用新视觉态（常驻 6% / hover 12%），只影响该按钮，
+    // 不改动其他按钮的普通 hover 分支（0/8%）
+    var pillNeutral = false { didSet { needsDisplay = true } }
     private var hovered = false { didSet { needsDisplay = true } }
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
@@ -2452,6 +2471,8 @@ final class GLMPanelAction: NSButton {
                 color = GLMPeakTint.prominentFill.withAlphaComponent(hovered ? 0.8 : 1)
             } else if subtleBackground {
                 color = GLMPeakTint.accent.withAlphaComponent(hovered ? 0.28 : 0.18)
+            } else if pillNeutral {
+                color = NSColor.labelColor.withAlphaComponent(hovered ? 0.12 : 0.06)
             } else {
                 color = NSColor.labelColor.withAlphaComponent(hovered ? 0.08 : 0)
             }
@@ -2482,6 +2503,19 @@ final class GLMPanelAction: NSButton {
     override func mouseExited(with event: NSEvent) { hovered = false }
     // 离线回归只读钩子：断言「悬停高亮 ⇔ 真实光标在视图内」（逐卡替换后无 hover 残留）
     var isHoveredForTesting: Bool { hovered }
+}
+
+// 6px 更新提示圆点（版本胶囊右上角钉挂，可越出按钮边界 2pt）：accent 主题色随明暗外观
+// 即时刷新；纯展示不参与命中——GLMPanelAction.hitTest 对 bounds 内点一律返回按钮自身，
+// 圆点不会截获点击（点击区域保持整个胶囊）。
+final class GLMAccentDotView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = GLMPeakTint.accent.cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
 }
 
 // 峰谷卡状态胶囊：非高峰绿 / 高峰低饱和暖色，浅底深字（色值与 GLMRemainingColor 同源，共用其动态色解码）
@@ -3127,6 +3161,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var cycle = 0
     private let refreshGate = RefreshGate()
     private let quotaGate = RefreshGate()
+    // 手动额度刷新在飞位（底栏「刷新中…」状态源）：手动触发可能先排队等待在飞自动轮询
+    // 完成（RefreshGate.queuedManual），在飞窗口跨多个闸门周期，无法从闸门 busy 位直接
+    // 派生（自动轮询同样持有闸门，会误伤「自动不置位」约束），故显式跟踪；
+    // manualRefreshReset 为 20s 兜底，网络悬挂时强制清位，按钮不永久卡死。
+    private var manualRefreshInFlight = false
+    private var manualRefreshReset: DispatchWorkItem?
     // token 统计每 N 个刷新周期拉一次（主循环 10s × 30 = 5 分钟；额度窗口每轮都刷）
     private let tokenEveryCycles = 30
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
@@ -3410,6 +3450,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let helperMessage = GLMLaunchAgent.consumeResultLog() {
             setUpdateMessage(helperMessage, dismissAfter: 10)
         }
+        // 开机自启默认开启（用户决策 2026-11-22）：仅当用户从未显式选择且无 plist 时
+        // 静默写入偏好，不 bootstrap——当前实例已在运行，bootstrap 会拉起第二实例造成
+        // 菜单栏图标叠位；下次登录由 launchd 接管，更新时 update.sh 按偏好 bootstrap。
+        // 显式关闭过的用户（存在选择标记）永不被静默重新开启。
+        if GLMLaunchAgent.shouldAutoEnableOnLaunch(
+            preview: preview,
+            explicitChoiceRecorded: UserDefaults.standard.object(forKey: GLMLaunchAgent.explicitChoiceDefaultsKey) != nil,
+            plistExists: isLoginItemEnabled()) {
+            writeLaunchAgentPlist(executablePath: Bundle.main.executablePath ?? "")
+        }
         rebuildPanel()
         renderBar()
         // 面板内更新进度：状态翻转时重建面板（按钮↔进度行），进度百分比由进度行自刷；
@@ -3458,8 +3508,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func refreshQuota(manual: Bool) {
-        guard quotaGate.begin(manual: manual) else { return }
+        guard quotaGate.begin(manual: manual) else {
+            // 闸门被占（在飞的可能只是自动轮询）：手动请求进入排队，在飞位即刻生效反馈「刷新中…」
+            if manual { setManualRefreshInFlight(true) }
+            return
+        }
+        if manual { setManualRefreshInFlight(true) }
         performQuotaRefresh()
+    }
+
+    /// 手动刷新在飞位翻转：置位即重建面板呈现「刷新中…」，重入时先 cancel 旧兜底再重新武装
+    private func setManualRefreshInFlight(_ active: Bool) {
+        manualRefreshReset?.cancel()
+        manualRefreshReset = nil
+        let changed = manualRefreshInFlight != active
+        manualRefreshInFlight = active
+        if active {
+            let reset = DispatchWorkItem { [weak self] in
+                guard let self, self.manualRefreshInFlight else { return }
+                self.manualRefreshInFlight = false
+                self.updateUI()
+            }
+            manualRefreshReset = reset
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: reset)
+        }
+        if changed { updateUI() }
     }
 
     private func performQuotaRefresh() {
@@ -3501,6 +3574,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func finishQuota(_ fresh: UsageData) {
         applyQuota(fresh)
         if quotaGate.finish() { performQuotaRefresh() }
+        else { setManualRefreshInFlight(false) }   // 闸门真正释放才清位；排队的手动刷新接手后仍在飞
     }
 
     private func applyQuota(_ fresh: UsageData) {
@@ -3932,7 +4006,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.accountEmail = usage.accountEmail
         s.lastAttemptText = Fmt.time(lastAttemptAt)
         s.updateMessage = updateMessage
-        s.loginItemEnabled = !preview && isLoginItemEnabled()
+        // 主额度（7 天窗口）成功时间：GLMFreshness 失败时保留旧值，绝不把时间跳到失败时刻；
+        // 失败信号（含「最后成功」原文 tooltip）复用 quota.week.errorLine
+        s.quotaLastOKText = Fmt.time(weekLastOK)
+        s.refreshInFlight = manualRefreshInFlight
         // 额度卡
         func quotaWindow(_ entry: LimitEntry?, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool) -> GLMPanelSnapshot.QuotaCard.Window {
             let ratio = entry?.usedRemainingRatio
@@ -4618,7 +4695,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let emptyCard = GLMPanelCard()
                 emptyCard.identifier = NSUserInterfaceItemIdentifier("GLMPanelEmptyState")
                 addToRoot(emptyCard, in: root)
-                addCardContent(panelLabel("卡片已全部隐藏，可通过右上角「···」恢复。", color: .secondaryLabelColor), to: emptyCard)
+                addCardContent(panelLabel("卡片已全部隐藏，可通过右上角 ⚙ 设置菜单恢复。", color: .secondaryLabelColor), to: emptyCard)
                 addCardContent(panelButton("恢复默认卡片布局", #selector(restoreDefaultPanelLayout)), to: emptyCard)
             } else {
                 for card in builtCards { addToRoot(card, in: root) }
@@ -4629,7 +4706,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         activeScroll = scroll
         let footer = makePanelFooter(s)
         if !panelConfigured {
-            let container = NSView(); container.translatesAutoresizingMaskIntoConstraints = false
+            let container = GLMPanelRootView(); container.translatesAutoresizingMaskIntoConstraints = false
+            // ⌘Q 兜底接线（底栏退出按钮已移除）：preview/自检共用该容器，行为一致
+            container.quitHandler = { [weak self] in self?.onQuit() }
             container.wantsLayer = true
             container.layer?.cornerRadius = 16
             container.layer?.masksToBounds = true
@@ -4700,7 +4779,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             panelInstall(makePanelHeader(new), in: panelHeaderSlot)
             changed = true
         }
-        if old.lastAttemptText != new.lastAttemptText || old.updateMessage != new.updateMessage || old.loginItemEnabled != new.loginItemEnabled {
+        // 底栏：消息行/更新时间/在飞位/主额度失败行任一变化即原位重建。
+        // lastAttemptText 已无视觉载体（时间口径改成功时间），移出条件避免每分钟
+        // 一次无视觉重建在分钟边界冲掉按钮悬停高亮；字段保留供诊断/status.json。
+        if old.updateMessage != new.updateMessage
+            || old.quotaLastOKText != new.quotaLastOKText || old.refreshInFlight != new.refreshInFlight
+            || old.quota.week.errorLine != new.quota.week.errorLine {
             panelInstall(makePanelFooter(new), in: panelFooterSlot)
             changed = true
         }
@@ -5423,8 +5507,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         header.addArrangedSubview(headerText); headerText.translatesAutoresizingMaskIntoConstraints = false
         headerText.widthAnchor.constraint(equalToConstant: inner - 76).isActive = true
         header.addArrangedSubview(panelSpacer())
-        let settingsButton = NSButton(image: NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "面板设置") ?? NSImage(), target: self, action: #selector(showPanelSettingsMenu(_:)))
-        settingsButton.isBordered = false; settingsButton.contentTintColor = .secondaryLabelColor
+        // 右上角 ⚙ 设置入口（GLMPanelAction 自带 hover 灰底）：image-only、无 subtle/prominent
+        // 走普通 hover 分支（labelColor 8%）；24×24 + cornerRadius 12 = 圆形 hover 底
+        let settingsButton = GLMPanelAction(title: "", target: self, action: #selector(showPanelSettingsMenu(_:)))
+        settingsButton.isBordered = false; settingsButton.focusRingType = .default
+        settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "面板设置")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+        settingsButton.imagePosition = .imageOnly
+        settingsButton.contentTintColor = .secondaryLabelColor
+        settingsButton.wantsLayer = true; settingsButton.layer?.cornerRadius = 12
         settingsButton.toolTip = "面板设置"; settingsButton.setAccessibilityLabel("面板设置")
         settingsButton.identifier = NSUserInterfaceItemIdentifier("GLMRole.header.settings")   // 稳定身份：header 原位重建后焦点可恢复
         settingsButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
@@ -5433,20 +5524,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return header
     }
 
+    // 底栏单行（2026-11-22）：版本胶囊 … spacer … 更新时间 + 刷新按钮；updateMessage 出现时
+    // footer 自然增高（不做 hard 高度约束，面板高度按 fittingSize 计算）。退出仅存 ⚙ 菜单，
+    // ⌘Q 由 GLMPanelRootView 兜底。
     private func makePanelFooter(_ s: GLMPanelSnapshot) -> NSView {
-        let inner = panelContentWidth - 32
         let footer = GLMPanelStack(); footer.orientation = .vertical; footer.alignment = .leading; footer.spacing = 8
-        let meta = panelRow(); meta.spacing = 8
-        meta.addArrangedSubview(panelLabel("最近尝试刷新 \(s.lastAttemptText)", size: 11, color: .secondaryLabelColor)); meta.addArrangedSubview(panelSpacer())
+        footer.edgeInsets = NSEdgeInsets()   // NSStackView 默认 6pt insets 会让单行不贴 slot 边缘
+        // 单行不用 NSStackView：gravityAreas 在固定行宽 + 弹性 spacer 下行尾不保证贴右
+        // （实测按钮右缘距 slot 右缘 ~13pt，左右边缘间距不对称），改为普通视图手排约束
+        let meta = NSView(); meta.translatesAutoresizingMaskIntoConstraints = false
+        // 版本胶囊（左，pillNeutral 新视觉态：常驻 6% / hover 12%，不影响其他按钮的 0/8%），
+        // 右上角 6px 更新圆点钉挂（越出边界 2pt；hitTest 由胶囊整体承接）
         let shortVersion = BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version
-        let version = panelButton("版本 \(shortVersion)", #selector(manualUpdate)); version.toolTip = "\(BuildInfo.version) · 点击检查更新"; version.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular); version.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.version"); meta.addArrangedSubview(version); footer.addArrangedSubview(meta)
-        meta.widthAnchor.constraint(equalToConstant: inner).isActive = true
+        let version = GLMPanelAction(title: shortVersion, target: self, action: #selector(manualUpdate))
+        version.isBordered = false; version.focusRingType = .default; version.wantsLayer = true
+        version.layer?.cornerRadius = 12; version.pillNeutral = true
+        version.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        version.attributedTitle = NSAttributedString(string: shortVersion, attributes: [
+            .foregroundColor: NSColor.labelColor,
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)])
+        version.toolTip = "\(BuildInfo.version) · 点击检查更新"
+        version.alignment = .center
+        version.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.version")
+        version.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        version.widthAnchor.constraint(greaterThanOrEqualToConstant: ceil(version.attributedTitle.size().width) + 20).isActive = true
+        let dot = GLMAccentDotView(); dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.wantsLayer = true; dot.layer?.cornerRadius = 3; dot.layer?.masksToBounds = true
+        dot.isHidden = !s.updateButtonVisible
+        version.addSubview(dot)
+        NSLayoutConstraint.activate([
+            dot.widthAnchor.constraint(equalToConstant: 6), dot.heightAnchor.constraint(equalToConstant: 6),
+            dot.topAnchor.constraint(equalTo: version.topAnchor, constant: -2),
+            dot.trailingAnchor.constraint(equalTo: version.trailingAnchor, constant: -2)])
+        meta.addSubview(version)
+        // 更新时间（右一）：成功 → 「HH:mm 更新」；主额度失败 → 红字「刷新失败」，tooltip 保留
+        // 完整 errorLine（含「最后成功 …」原成功时间，时间口径绝不跳到失败时刻）；无数据 → 「—」
+        let updatedAt: NSTextField
+        if let errorLine = s.quota.week.errorLine {
+            updatedAt = panelLabel("刷新失败", size: 11, color: .systemRed)
+            updatedAt.toolTip = errorLine
+        } else if !s.quotaLastOKText.isEmpty {
+            updatedAt = panelLabel("\(s.quotaLastOKText) 更新", size: 11, color: .secondaryLabelColor)
+        } else {
+            updatedAt = panelLabel("—", size: 11, color: .secondaryLabelColor)
+        }
+        updatedAt.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.updatedAt")
+        meta.addSubview(updatedAt)
+        // 刷新按钮（右二，subtle accent 18% pill）：仅手动刷新在飞时「刷新中…」并禁点，
+        // 自动 10s 轮询不置位；失败信号由更新时间红字承担，按钮文案不变
+        let refresh = GLMPanelAction(title: "数据刷新", target: self, action: #selector(onRefresh))
+        refresh.isBordered = false; refresh.focusRingType = .default; refresh.wantsLayer = true
+        refresh.layer?.cornerRadius = 6; refresh.subtleBackground = true
+        refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "数据刷新")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+        refresh.imagePosition = .imageLeft
+        // isBordered=false 的 NSButton 内容默认左对齐：显式居中 + icon 紧贴 title，
+        // 否则内容偏左、icon 与文字之间留出系统默认大间距
+        refresh.alignment = .center
+        refresh.imageHugsTitle = true
+        refresh.contentTintColor = GLMPeakTint.accent
+        refresh.attributedTitle = NSAttributedString(string: s.refreshInFlight ? "刷新中…" : "数据刷新", attributes: [
+            .foregroundColor: GLMPeakTint.accent,
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium)])
+        refresh.isEnabled = !s.refreshInFlight
+        refresh.keyEquivalent = "r"; refresh.keyEquivalentModifierMask = .command
+        refresh.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.refresh")
+        refresh.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        refresh.widthAnchor.constraint(greaterThanOrEqualToConstant: ceil(refresh.attributedTitle.size().width) + 11 + 4 + 20).isActive = true
+        meta.addSubview(refresh)
+        for v in [version, updatedAt, refresh] { v.translatesAutoresizingMaskIntoConstraints = false }
+        footer.addArrangedSubview(meta)
+        NSLayoutConstraint.activate([
+            // 左：胶囊贴左缘；右：按钮贴右缘；更新时间贴按钮左侧 —— 与 slot 左右内缩对称
+            version.leadingAnchor.constraint(equalTo: meta.leadingAnchor),
+            version.centerYAnchor.constraint(equalTo: meta.centerYAnchor),
+            refresh.trailingAnchor.constraint(equalTo: meta.trailingAnchor),
+            refresh.centerYAnchor.constraint(equalTo: meta.centerYAnchor),
+            updatedAt.trailingAnchor.constraint(equalTo: refresh.leadingAnchor, constant: -8),
+            updatedAt.centerYAnchor.constraint(equalTo: meta.centerYAnchor),
+            updatedAt.leadingAnchor.constraint(greaterThanOrEqualTo: version.trailingAnchor, constant: 8),
+            meta.heightAnchor.constraint(equalToConstant: 28)])
+        meta.widthAnchor.constraint(equalTo: footer.widthAnchor).isActive = true
         if let msg = s.updateMessage { footer.addArrangedSubview(panelLabel(msg, color: .secondaryLabelColor)) }
-        let actions = panelRow(); actions.spacing = 6
-        let refresh = panelButton("立即刷新", #selector(onRefresh), prominent: true); refresh.keyEquivalent = "r"; refresh.keyEquivalentModifierMask = .command; refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true; refresh.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.refresh"); actions.addArrangedSubview(refresh)
-        let login = NSButton(checkboxWithTitle: "开机自启", target: self, action: #selector(onToggleLogin(_:))); login.font = .systemFont(ofSize: 12); login.state = s.loginItemEnabled ? .on : .off; login.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.login"); actions.addArrangedSubview(login); actions.addArrangedSubview(panelSpacer())
-        let quit = panelButton("退出", #selector(onQuit)); quit.keyEquivalent = "q"; quit.keyEquivalentModifierMask = .command; quit.widthAnchor.constraint(equalToConstant: 40).isActive = true; quit.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.quit"); actions.addArrangedSubview(quit)
-        footer.addArrangedSubview(actions); actions.widthAnchor.constraint(equalToConstant: inner).isActive = true
         return footer
     }
 
@@ -5693,10 +5852,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         togglePanel()
         expectShown(false, "close-after-panel-pin")
 
-        // 7. `…` 菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）
+        // 7. ⚙ 设置菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）
         let menu = makePanelSettingsMenu()
-        let hoverItem = menu.items.first { $0.title == "悬停显示状态面板" }
+        let hoverItem = menu.items.first { $0.title == "悬停自动展开" }
         guard let hoverItem else { fail("settings menu missing hover item") }
+        guard menu.items.contains(where: { $0.title == "开机自启" }) else { fail("settings menu missing login item") }
+        guard menu.items.contains(where: { $0.title == "退出 GlmUsage" }) else { fail("settings menu missing quit item") }
+        guard menu.items.contains(where: { $0.title.hasPrefix("背景样式（") }) else { fail("settings menu missing background item") }
+        guard menu.items.contains(where: { $0.title == "卡片显示与排序…" }) else { fail("settings menu missing card settings item") }
+        let loginItem = menu.items.first { $0.title == "开机自启" }!
+        guard loginItem.state == (isLoginItemEnabled() ? .on : .off) else { fail("login item state must reflect plist") }
         let expectedState: NSControl.StateValue = panelHoverEnabled ? .on : .off
         guard hoverItem.state == expectedState else { fail("menu item state mismatch") }
         let wasEnabled = panelHoverController?.isEnabled == true
@@ -6042,6 +6207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         rebuildPanel()
         guard cardOrder().isEmpty else { fail("all-hidden left cards \(cardOrder())") }
         guard allViews(panelController.view).contains(where: { $0.identifier?.rawValue == "GLMPanelEmptyState" }) else { fail("all-hidden empty state") }
+        guard allTexts(panelController.view).contains("卡片已全部隐藏，可通过右上角 ⚙ 设置菜单恢复。") else { fail("empty state copy") }
         restoreDefaultPanelLayout()
         guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
         // ===== 动态 key view 链：重排后按可见顺序连接，而非旧固定 usage → chart → mcp =====
@@ -6131,17 +6297,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         expandedModelWindows = []
         restoreDefaultPanelLayout()
         guard cardOrder() == expectedDefault else { fail("restore default \(cardOrder())") }
-        // 统一「···」菜单：卡片设置入口 + 背景样式子菜单，背景选择仍即时生效
+        // 统一 ⚙ 菜单：分组标题 + 卡片设置 + 背景样式子菜单 + 通用开关 + 退出，背景选择仍即时生效
         let panelMenu = makePanelSettingsMenu()
-        guard panelMenu.items.map(\.title) == ["卡片显示与排序…", "背景样式"] else { fail("panel menu structure") }
-        guard let backgroundMenu = panelMenu.items[1].submenu else { fail("background submenu") }
+        let menuTitles = panelMenu.items.map(\.title)
+        guard menuTitles == ["外观与布局", "卡片显示与排序…", "背景样式（\(backgroundStyle.title)）", "", "通用设置", "悬停自动展开", "开机自启", "", "退出 GlmUsage"] else { fail("panel menu structure \(menuTitles)") }
+        guard let backgroundMenu = panelMenu.items[2].submenu else { fail("background submenu") }
         guard backgroundMenu.items.map(\.title).contains("纯色") else { fail("solid background missing") }
         for style in GLMPanelBackgroundStyle.allCases where style != .liquidGlass || Self.supportsLiquidGlass {
             guard let item = backgroundMenu.items.first(where: { $0.representedObject as? String == style.rawValue }) else { fail("background item \(style.rawValue)") }
             selectBackgroundStyle(item)
             guard backgroundStyle == style else { fail("background selection \(style.rawValue)") }
         }
-        guard panelMenu.items[0].isEnabled else { fail("settings entry disabled outside settings") }
+        guard panelMenu.items[1].isEnabled else { fail("settings entry disabled outside settings") }
+        guard !panelMenu.items[0].isEnabled, !panelMenu.items[4].isEnabled else { fail("group headers must be disabled") }
+        guard panelMenu.items[8].action == #selector(onQuit), panelMenu.items[8].keyEquivalent == "q" else { fail("menu quit wiring") }
+        // 底栏单行化：版本胶囊 / 更新时间 / 刷新按钮标识齐备，退出按钮移除（退出仅存 ⚙ 菜单）
+        func allFooterButtons() -> [NSButton] { allViews(panelFooterSlot).compactMap { $0 as? NSButton } }
+        guard let versionPill = allFooterButtons().first(where: { $0.identifier?.rawValue == "GLMRole.footer.version" }),
+              versionPill.action == #selector(manualUpdate),
+              versionPill.toolTip?.contains("点击检查更新") == true else { fail("footer version pill missing") }
+        guard allViews(panelFooterSlot).contains(where: { $0.identifier?.rawValue == "GLMRole.footer.updatedAt" }) else { fail("footer updatedAt missing") }
+        guard let refreshButton = allFooterButtons().first(where: { $0.identifier?.rawValue == "GLMRole.footer.refresh" }),
+              refreshButton.action == #selector(onRefresh), refreshButton.isEnabled,
+              refreshButton.keyEquivalent == "r", refreshButton.keyEquivalentModifierMask == .command,
+              refreshButton.attributedTitle.string == "数据刷新" else { fail("footer refresh missing") }
+        guard !allFooterButtons().contains(where: { $0.identifier?.rawValue == "GLMRole.footer.quit" }) else { fail("footer quit must be removed") }
 
         // ===== 原位设置页：显隐开关 + 上/下排序按钮 + 完成（全部走真实按钮事件） =====
         showCardSettings()
@@ -6153,7 +6333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             allViews(panelController.view).first(where: { $0.identifier?.rawValue == identifier }) as? NSButton
         }
         guard let editor = editorView() else { fail("settings view missing") }
-        // 键盘可达性回归：打开设置页后焦点必须落在设置视图上，Space 等按键不会落到残留的「···」按钮
+        // 键盘可达性回归：打开设置页后焦点必须落在设置视图上，Space 等按键不会落到残留的 ⚙ 设置按钮
         // 再把菜单弹出来关掉 transient Popover（Cua 真实按键验收发现的缺陷）。
         if let responder = panelController.view.window?.firstResponder {
             guard responder === editor.table else { fail("settings editor not initial first responder: \(responder)") }
@@ -6621,29 +6801,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    @objc private func onToggleLogin(_ sender: NSButton) {
+    /// ⚙ 设置菜单入口：item 的 state 表示当前生效状态，点击即翻转
+    @objc private func onToggleLoginFromMenu(_ sender: NSMenuItem) {
+        toggleLogin(wantEnabled: sender.state != .on)
+    }
+
+    /// 开机自启开关主体（唯一入口在 ⚙ 设置菜单）。所有落盘分支都会记录「用户已
+    /// 显式选择」，此后启动不再套用默认开启。
+    private func toggleLogin(wantEnabled: Bool) {
         if preview { setUpdateMessage("预览模式不会修改开机自启"); return }
         let action = GLMLaunchAgent.decide(
-            wantEnabled: sender.state == .on,
+            wantEnabled: wantEnabled,
             state: GLMLaunchAgent.probe(binaryPath: Bundle.main.executablePath ?? ""))
         switch action {
         case .writeAndBootstrap, .removeAndRelaunch:
-            presentLoginRestartConfirmation(action, checkbox: sender)
+            presentLoginRestartConfirmation(action)
         case .writeSynced:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: true)
             setUpdateMessage("已开启开机自启（当前实例已由 launchd 接管，立即生效）", dismissAfter: 4)
         case .removeOnly:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: false)
             setUpdateMessage("已关闭开机自启（当前无受管任务，无需重启）", dismissAfter: 4)
         case .writeForeignConflict, .removeForeignConflict:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: action == .writeForeignConflict)
             setUpdateMessage("系统已加载的同名任务指向其他副本，本会话不改动 launchd 状态；偏好已保存",
                              dismissAfter: 8)
         }
     }
 
+    /// 显式选择标记：plist 不存在无法区分「从未开启」与「显式关闭」，
+    /// 存在此标记后启动默认开启逻辑永不触发。
+    private func recordExplicitLoginChoice() {
+        UserDefaults.standard.set(true, forKey: GLMLaunchAgent.explicitChoiceDefaultsKey)
+    }
+
     /// 受控重启方向的三键确认：主键立即重启并生效，副键仅保存偏好（旧行为），ESC 取消不动
-    private func presentLoginRestartConfirmation(_ action: GLMLaunchAgent.Action, checkbox: NSButton) {
+    private func presentLoginRestartConfirmation(_ action: GLMLaunchAgent.Action) {
         let turningOn = action == .writeAndBootstrap
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -6657,6 +6853,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         alert.addButton(withTitle: "取消")
         switch alert.runModal() {
         case .alertFirstButtonReturn:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: turningOn)
             let spawned = GLMLaunchAgent.spawnExitHelper(
                 direction: turningOn ? .bootstrap : .bootoutThenOpen,
@@ -6669,12 +6866,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // helper 会轮询等待本进程消失；让弹窗闭合与状态写盘收尾完成后再正常退出
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { NSApp.terminate(nil) }
         case .alertSecondButtonReturn:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: turningOn)
             setUpdateMessage(turningOn ? "已开启开机自启（下次登录生效）" : "已关闭开机自启（下次登录生效）",
                              dismissAfter: 4)
         default:
-            // 取消不动：恢复复选框与偏好一致（此处未写/删 plist，状态未变）
-            checkbox.state = isLoginItemEnabled() ? .on : .off
+            // 取消不动：未写/删 plist，状态未变；菜单 item 状态在下次弹出时重建
+            break
         }
     }
 
@@ -6789,9 +6987,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func onRefresh() {
         if preview {
             if previewPopover {
+                // 离线预览「刷新中…」按钮态：仅内存置位 0.3s（不触网、不写生产 UserDefaults）
+                setManualRefreshInFlight(true)
                 setUpdateMessage("正在刷新预览…")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self = self else { return }
+                    self.setManualRefreshInFlight(false)
                     self.setUpdateMessage("预览数据已刷新")
                 }
             } else { setUpdateMessage("预览数据已刷新") }
@@ -6859,17 +7060,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
+        // 禁用分组标题：小字次级色、无 action、不可点无高亮
+        func groupHeader(_ title: String) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            item.attributedTitle = NSAttributedString(string: title, attributes: [
+                .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+            return item
+        }
+
+        menu.addItem(groupHeader("外观与布局"))
+
         let cards = NSMenuItem(title: "卡片显示与排序…", action: #selector(showCardSettings), keyEquivalent: "")
         cards.target = self
         cards.isEnabled = !showingCardSettings
         menu.addItem(cards)
 
-        let hover = NSMenuItem(title: "悬停显示状态面板", action: #selector(toggleHoverPanel), keyEquivalent: "")
-        hover.target = self
-        hover.state = panelHoverEnabled ? .on : .off
-        menu.addItem(hover)
-
-        let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
+        let background = NSMenuItem(title: "背景样式（\(backgroundStyle.title)）", action: nil, keyEquivalent: "")
         let backgroundMenu = NSMenu()
         backgroundMenu.autoenablesItems = false
         for style in GLMPanelBackgroundStyle.allCases {
@@ -6880,6 +7087,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         background.submenu = backgroundMenu
         menu.addItem(background)
+
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(groupHeader("通用设置"))
+
+        let hover = NSMenuItem(title: "悬停自动展开", action: #selector(toggleHoverPanel), keyEquivalent: "")
+        hover.target = self
+        hover.state = panelHoverEnabled ? .on : .off
+        menu.addItem(hover)
+
+        let loginItem = NSMenuItem(title: "开机自启", action: #selector(onToggleLoginFromMenu(_:)), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = isLoginItemEnabled() ? .on : .off
+        menu.addItem(loginItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let quit = NSMenuItem(title: "退出 GlmUsage", action: #selector(onQuit), keyEquivalent: "q")
+        quit.target = self
+        quit.keyEquivalentModifierMask = .command
+        menu.addItem(quit)
         return menu
     }
 
@@ -6893,7 +7121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func showCardSettings() {
         showingCardSettings = true
         rebuildPanel(force: true)
-        // 打开设置页时接管焦点：否则焦点残留在「···」按钮上，Space 会再次弹出菜单，
+        // 打开设置页时接管焦点：否则焦点残留在 ⚙ 设置按钮上，Space 会再次弹出菜单，
         // 菜单跟踪期间 transient Popover 失去 key 被关闭（Cua 真实按键验收发现的缺陷）。
         func scan(_ view: NSView) -> GLMCardSettingsView? {
             if let editor = view as? GLMCardSettingsView { return editor }
@@ -6947,7 +7175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let actions = NSStackView(); actions.orientation = .horizontal; actions.alignment = .centerY; actions.spacing = 5
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal); actions.addArrangedSubview(spacer)
         actions.addArrangedSubview(NSButton(title: "取消", target: self, action: #selector(cancelUpdateConfirmation)))
-        // 主操作按钮用产品绿 prominent 样式（与页脚「立即刷新」同源），在确认页里清晰可辨
+        // 主操作按钮用产品绿 prominent 样式（与页脚「数据刷新」同源），在确认页里清晰可辨
         let install = GLMPanelAction(title: "下载并安装", target: self, action: #selector(confirmUpdate))
         install.isBordered = false; install.focusRingType = .default; install.wantsLayer = true
         install.layer?.cornerRadius = 6; install.prominent = true
@@ -8099,6 +8327,13 @@ enum GLMOfflineRegression {
             dataSnapshot = baseSnapshot
             dataSnapshot.lastAttemptText = "14:32"
             try expect(baseSnapshot != dataSnapshot, "footer last-attempt captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.quotaLastOKText = "14:32"
+            try expect(baseSnapshot != dataSnapshot, "footer quota last-OK captured")
+            dataSnapshot = baseSnapshot
+            dataSnapshot.refreshInFlight = true
+            try expect(baseSnapshot != dataSnapshot, "footer refresh-in-flight captured")
+            try expect(!baseSnapshot.containsStructuralChange(to: dataSnapshot), "refresh-in-flight is footer-local, not structural")
             // 量化稳定性：亚 0.5% 漂移不产生快照差异（否则 10s 刷新会每轮打脏快照）；
             // 真实跨档位变化仍然被捕
             let smallDrift = GLMPanelSnapshot.quantizedRatio(0.32)
@@ -8502,6 +8737,15 @@ enum GLMOfflineRegression {
                        && GLMLaunchAgent.Action.removeForeignConflict.conflictsForeignJob
                        && !GLMLaunchAgent.Action.writeSynced.conflictsForeignJob,
                        "身份不匹配分支绝不碰 launchd")
+            // 启动默认开启判定（2026-11-22）：显式关闭过的用户永不被静默重新开启
+            try expect(GLMLaunchAgent.shouldAutoEnableOnLaunch(preview: false, explicitChoiceRecorded: false, plistExists: false),
+                       "全新安装默认开启开机自启")
+            try expect(!GLMLaunchAgent.shouldAutoEnableOnLaunch(preview: false, explicitChoiceRecorded: true, plistExists: false),
+                       "显式关闭过不再自动开启")
+            try expect(!GLMLaunchAgent.shouldAutoEnableOnLaunch(preview: false, explicitChoiceRecorded: false, plistExists: true),
+                       "已有 plist 不重复写")
+            try expect(!GLMLaunchAgent.shouldAutoEnableOnLaunch(preview: true, explicitChoiceRecorded: false, plistExists: false),
+                       "preview 永不写生产偏好")
             // launchctl print 的 program 解析与身份比对判据（与 scripts/update.sh 同口径）
             let printedFixture = """
             com.local.glm-usage = {

@@ -49,7 +49,11 @@ struct GLMPanelSnapshot: Equatable {
     var accountEmail: String?
     var lastAttemptText = ""
     var updateMessage: String?
-    var loginItemEnabled = false
+    // 底栏单行化（2026-11-22）：quotaLastOKText = 主额度（7 天窗口）成功时间展示文案，
+    // 空串 = 无数据（底栏显示「—」）；refreshInFlight 仅手动刷新在飞为 true，
+    // 自动 10s 轮询不置位。失败信号复用 quota.week.errorLine（含「最后成功」原文）。
+    var quotaLastOKText = ""
+    var refreshInFlight = false
 
     // MARK: 额度卡（用量进度）
 

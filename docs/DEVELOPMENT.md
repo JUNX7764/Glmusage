@@ -37,7 +37,7 @@
 - **订阅**：通过 `/api/biz/subscription/list` 获取有效套餐与到期时间；明确无有效订阅时清除旧套餐数据，普通失败保留旧值并提示。
 - **重置卡**：通过 ZCode `/api/v1/coding-plan/reset/status` 查询 5 小时卡和周卡。手动使用走 `/reset/use`，必须由用户点击并二次确认；结果未知时按卡类型复用原幂等 key，禁止生成新请求盲目重试。
 - **Peak**：按 Asia/Shanghai 计算工作日高峰、周末和活动时段。活动日期修改后必须运行 `--peak-test`。
-- **开机自启**：偏好记录 = `~/Library/LaunchAgents/com.local.glm-usage.plist` 的存在与否。切换时 App 只读探测（`launchctl print` + plist 存在性，决策矩阵见 `Sources/GLMLaunchAgent.swift`）；需要立即生效的两种结果弹三键确认（立即重启并生效 / 仅保存偏好 / ESC 取消），受控重启固定为「写/删 plist → 派生 detach helper → App 正常 exit(0) → helper 等进程消失后 bootstrap（ON）或 bootout+`open -n`（OFF）」，App 内绝不直接 bootstrap/bootout 自己；helper 失败写固定回执文件，下次启动提示一次后清除。已加载任务指向其他副本（身份不匹配）时只落盘偏好并报错，绝不碰别人的 job。
+- **开机自启**：偏好记录 = `~/Library/LaunchAgents/com.local.glm-usage.plist` 的存在与否，入口为面板页头 ⚙ 设置菜单（item 状态反映 plist 实况，点击即翻转）。**默认开启**（2026-11-22）：仅当用户从未显式选择（UserDefaults `login.explicitChoiceRecorded` 缺失）且无 plist 时，启动静默写入偏好——不 bootstrap（当前实例已在运行，bootstrap 会拉起第二实例叠位），下次登录由 launchd 接管、更新时由 update.sh 接管；任何显式 toggle 落盘都会记录选择标记，此后启动不再自动写，显式关闭过的用户永不被静默重新开启。切换时 App 只读探测（`launchctl print` + plist 存在性，决策矩阵见 `Sources/GLMLaunchAgent.swift`）；需要立即生效的两种结果弹三键确认（立即重启并生效 / 仅保存偏好 / ESC 取消），受控重启固定为「写/删 plist → 派生 detach helper → App 正常 exit(0) → helper 等进程消失后 bootstrap（ON）或 bootout+`open -n`（OFF）」，App 内绝不直接 bootstrap/bootout 自己；helper 失败写固定回执文件，下次启动提示一次后清除。已加载任务指向其他副本（身份不匹配）时只落盘偏好并报错，绝不碰别人的 job。
 - **更新脚本接管规则**：`scripts/update.sh` 的 bootout 判定保持「已加载且身份匹配」；替换后的启动判定为 plist 偏好存在或原 job 已加载 → bootstrap（回滚同规则），两者皆无 → `open -n`。曾加载但偏好缺失的遗留状态按 App 同款定义恢复 plist 保守保留托管语义；plist 指向其他副本一律中止。
 - **刷新**：额度每 10 秒，慢项每 5 分钟；失败保留旧值与原成功时间，并显示错误或过期状态。
 
@@ -150,6 +150,6 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 - macOS 13 部署目标不等同于已在 macOS 13、14、15 或干净用户环境完成实机验收。
 - 真实更新验收必须记录旧版版本、目标版本、安装路径、是否从面板点击，以及重启和回滚结果。
 
-面板背景从页头「··· → 背景样式」进入，默认纯色；液态玻璃需 macOS 26+，旧系统回退经典毛玻璃，系统开启降低透明度时显示纯色。七张内容卡（含额度周期回顾）的独立显隐与顺序从「··· → 卡片显示与排序…」进入，布局保存在本机，可恢复默认。`--preview --preview-background=solid|classicMaterial|liquidGlass` 可使用假数据预览；`--preview --preview-update-notes` 预览更新确认，不执行真实更新。版本说明来自所选可安装 Release，确认前不下载。
+面板背景从页头「⚙ → 背景样式」进入，默认纯色；液态玻璃需 macOS 26+，旧系统回退经典毛玻璃，系统开启降低透明度时显示纯色。七张内容卡（含额度周期回顾）的独立显隐与顺序从「⚙ → 卡片显示与排序…」进入，布局保存在本机，可恢复默认。`--preview --preview-background=solid|classicMaterial|liquidGlass` 可使用假数据预览；`--preview --preview-update-notes` 预览更新确认，不执行真实更新。版本说明来自所选可安装 Release，确认前不下载。
 
 手动套餐连接时，如 ZCode 登录资料可在后台读取且含有效邮箱，标题直接显示该邮箱；此邮箱不证明与套餐 API Key 属于同一账号。读取失败时隐藏，不保留该来源的旧邮箱；不新增网络请求。
