@@ -5528,9 +5528,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // footer 自然增高（不做 hard 高度约束，面板高度按 fittingSize 计算）。退出仅存 ⚙ 菜单，
     // ⌘Q 由 GLMPanelRootView 兜底。
     private func makePanelFooter(_ s: GLMPanelSnapshot) -> NSView {
-        let inner = panelContentWidth - 32
         let footer = GLMPanelStack(); footer.orientation = .vertical; footer.alignment = .leading; footer.spacing = 8
-        let meta = panelRow(); meta.spacing = 8
+        footer.edgeInsets = NSEdgeInsets()   // NSStackView 默认 6pt insets 会让单行不贴 slot 边缘
+        // 单行不用 NSStackView：gravityAreas 在固定行宽 + 弹性 spacer 下行尾不保证贴右
+        // （实测按钮右缘距 slot 右缘 ~13pt，左右边缘间距不对称），改为普通视图手排约束
+        let meta = NSView(); meta.translatesAutoresizingMaskIntoConstraints = false
         // 版本胶囊（左，pillNeutral 新视觉态：常驻 6% / hover 12%，不影响其他按钮的 0/8%），
         // 右上角 6px 更新圆点钉挂（越出边界 2pt；hitTest 由胶囊整体承接）
         let shortVersion = BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version
@@ -5554,8 +5556,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             dot.widthAnchor.constraint(equalToConstant: 6), dot.heightAnchor.constraint(equalToConstant: 6),
             dot.topAnchor.constraint(equalTo: version.topAnchor, constant: -2),
             dot.trailingAnchor.constraint(equalTo: version.trailingAnchor, constant: -2)])
-        meta.addArrangedSubview(version)
-        meta.addArrangedSubview(panelSpacer())
+        meta.addSubview(version)
         // 更新时间（右一）：成功 → 「HH:mm 更新」；主额度失败 → 红字「刷新失败」，tooltip 保留
         // 完整 errorLine（含「最后成功 …」原成功时间，时间口径绝不跳到失败时刻）；无数据 → 「—」
         let updatedAt: NSTextField
@@ -5568,7 +5569,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             updatedAt = panelLabel("—", size: 11, color: .secondaryLabelColor)
         }
         updatedAt.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.updatedAt")
-        meta.addArrangedSubview(updatedAt)
+        meta.addSubview(updatedAt)
         // 刷新按钮（右二，subtle accent 18% pill）：仅手动刷新在飞时「刷新中…」并禁点，
         // 自动 10s 轮询不置位；失败信号由更新时间红字承担，按钮文案不变
         let refresh = GLMPanelAction(title: "数据刷新", target: self, action: #selector(onRefresh))
@@ -5590,9 +5591,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         refresh.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.refresh")
         refresh.heightAnchor.constraint(equalToConstant: 28).isActive = true
         refresh.widthAnchor.constraint(greaterThanOrEqualToConstant: ceil(refresh.attributedTitle.size().width) + 11 + 4 + 20).isActive = true
-        meta.addArrangedSubview(refresh)
+        meta.addSubview(refresh)
+        for v in [version, updatedAt, refresh] { v.translatesAutoresizingMaskIntoConstraints = false }
         footer.addArrangedSubview(meta)
-        meta.widthAnchor.constraint(equalToConstant: inner).isActive = true
+        NSLayoutConstraint.activate([
+            // 左：胶囊贴左缘；右：按钮贴右缘；更新时间贴按钮左侧 —— 与 slot 左右内缩对称
+            version.leadingAnchor.constraint(equalTo: meta.leadingAnchor),
+            version.centerYAnchor.constraint(equalTo: meta.centerYAnchor),
+            refresh.trailingAnchor.constraint(equalTo: meta.trailingAnchor),
+            refresh.centerYAnchor.constraint(equalTo: meta.centerYAnchor),
+            updatedAt.trailingAnchor.constraint(equalTo: refresh.leadingAnchor, constant: -8),
+            updatedAt.centerYAnchor.constraint(equalTo: meta.centerYAnchor),
+            updatedAt.leadingAnchor.constraint(greaterThanOrEqualTo: version.trailingAnchor, constant: 8),
+            meta.heightAnchor.constraint(equalToConstant: 28)])
+        meta.widthAnchor.constraint(equalTo: footer.widthAnchor).isActive = true
         if let msg = s.updateMessage { footer.addArrangedSubview(panelLabel(msg, color: .secondaryLabelColor)) }
         return footer
     }
