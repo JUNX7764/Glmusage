@@ -2346,7 +2346,9 @@ final class GLMPanelStack: NSStackView { override var isFlipped: Bool { true } }
 final class GLMPanelRootView: NSView {
     var quitHandler: (() -> Void)?
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "q" {
+        // 修饰键精确匹配 ⌘Q（不含 ⇧/⌥/⌃）：⌘⇧Q 是系统注销快捷键，宽匹配会抢走它
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting(.capsLock)
+        if mods == .command, event.charactersIgnoringModifiers?.lowercased() == "q" {
             quitHandler?()
             return true
         }
@@ -4777,8 +4779,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             panelInstall(makePanelHeader(new), in: panelHeaderSlot)
             changed = true
         }
-        // 底栏：尝试时间/消息行/更新时间/在飞位/主额度失败行任一变化即原位重建
-        if old.lastAttemptText != new.lastAttemptText || old.updateMessage != new.updateMessage
+        // 底栏：消息行/更新时间/在飞位/主额度失败行任一变化即原位重建。
+        // lastAttemptText 已无视觉载体（时间口径改成功时间），移出条件避免每分钟
+        // 一次无视觉重建在分钟边界冲掉按钮悬停高亮；字段保留供诊断/status.json。
+        if old.updateMessage != new.updateMessage
             || old.quotaLastOKText != new.quotaLastOKText || old.refreshInFlight != new.refreshInFlight
             || old.quota.week.errorLine != new.quota.week.errorLine {
             panelInstall(makePanelFooter(new), in: panelFooterSlot)
