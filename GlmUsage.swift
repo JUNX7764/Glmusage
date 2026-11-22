@@ -3410,6 +3410,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let helperMessage = GLMLaunchAgent.consumeResultLog() {
             setUpdateMessage(helperMessage, dismissAfter: 10)
         }
+        // 开机自启默认开启（用户决策 2026-11-22）：仅当用户从未显式选择且无 plist 时
+        // 静默写入偏好，不 bootstrap——当前实例已在运行，bootstrap 会拉起第二实例造成
+        // 菜单栏图标叠位；下次登录由 launchd 接管，更新时 update.sh 按偏好 bootstrap。
+        // 显式关闭过的用户（存在选择标记）永不被静默重新开启。
+        if GLMLaunchAgent.shouldAutoEnableOnLaunch(
+            preview: preview,
+            explicitChoiceRecorded: UserDefaults.standard.object(forKey: GLMLaunchAgent.explicitChoiceDefaultsKey) != nil,
+            plistExists: isLoginItemEnabled()) {
+            writeLaunchAgentPlist(executablePath: Bundle.main.executablePath ?? "")
+        }
         rebuildPanel()
         renderBar()
         // 面板内更新进度：状态翻转时重建面板（按钮↔进度行），进度百分比由进度行自刷；
@@ -5697,6 +5707,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let menu = makePanelSettingsMenu()
         let hoverItem = menu.items.first { $0.title == "悬停显示状态面板" }
         guard let hoverItem else { fail("settings menu missing hover item") }
+        guard menu.items.contains(where: { $0.title == "开机自启" }) else { fail("settings menu missing login item") }
+        let loginItem = menu.items.first { $0.title == "开机自启" }!
+        guard loginItem.state == (isLoginItemEnabled() ? .on : .off) else { fail("login item state must reflect plist") }
         let expectedState: NSControl.StateValue = panelHoverEnabled ? .on : .off
         guard hoverItem.state == expectedState else { fail("menu item state mismatch") }
         let wasEnabled = panelHoverController?.isEnabled == true
@@ -6622,28 +6635,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func onToggleLogin(_ sender: NSButton) {
+        toggleLogin(wantEnabled: sender.state == .on) { [weak self] in
+            sender.state = self?.isLoginItemEnabled() == true ? .on : .off
+        }
+    }
+
+    /// 「···」菜单入口：item 的 state 表示当前生效状态，点击即翻转
+    @objc private func onToggleLoginFromMenu(_ sender: NSMenuItem) {
+        toggleLogin(wantEnabled: sender.state != .on, revert: nil)
+    }
+
+    /// 页脚复选框与「···」菜单共用的开关主体。所有落盘分支都会记录「用户已显式
+    /// 选择」，此后启动不再套用默认开启；取消分支调用 revert 恢复控件显示。
+    private func toggleLogin(wantEnabled: Bool, revert: (() -> Void)?) {
         if preview { setUpdateMessage("预览模式不会修改开机自启"); return }
         let action = GLMLaunchAgent.decide(
-            wantEnabled: sender.state == .on,
+            wantEnabled: wantEnabled,
             state: GLMLaunchAgent.probe(binaryPath: Bundle.main.executablePath ?? ""))
         switch action {
         case .writeAndBootstrap, .removeAndRelaunch:
-            presentLoginRestartConfirmation(action, checkbox: sender)
+            presentLoginRestartConfirmation(action, revert: revert)
         case .writeSynced:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: true)
             setUpdateMessage("已开启开机自启（当前实例已由 launchd 接管，立即生效）", dismissAfter: 4)
         case .removeOnly:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: false)
             setUpdateMessage("已关闭开机自启（当前无受管任务，无需重启）", dismissAfter: 4)
         case .writeForeignConflict, .removeForeignConflict:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: action == .writeForeignConflict)
             setUpdateMessage("系统已加载的同名任务指向其他副本，本会话不改动 launchd 状态；偏好已保存",
                              dismissAfter: 8)
         }
     }
 
+    /// 显式选择标记：plist 不存在无法区分「从未开启」与「显式关闭」，
+    /// 存在此标记后启动默认开启逻辑永不触发。
+    private func recordExplicitLoginChoice() {
+        UserDefaults.standard.set(true, forKey: GLMLaunchAgent.explicitChoiceDefaultsKey)
+    }
+
     /// 受控重启方向的三键确认：主键立即重启并生效，副键仅保存偏好（旧行为），ESC 取消不动
-    private func presentLoginRestartConfirmation(_ action: GLMLaunchAgent.Action, checkbox: NSButton) {
+    private func presentLoginRestartConfirmation(_ action: GLMLaunchAgent.Action, revert: (() -> Void)?) {
         let turningOn = action == .writeAndBootstrap
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -6657,6 +6692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         alert.addButton(withTitle: "取消")
         switch alert.runModal() {
         case .alertFirstButtonReturn:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: turningOn)
             let spawned = GLMLaunchAgent.spawnExitHelper(
                 direction: turningOn ? .bootstrap : .bootoutThenOpen,
@@ -6669,12 +6705,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // helper 会轮询等待本进程消失；让弹窗闭合与状态写盘收尾完成后再正常退出
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { NSApp.terminate(nil) }
         case .alertSecondButtonReturn:
+            recordExplicitLoginChoice()
             applyLoginPreference(turningOn: turningOn)
             setUpdateMessage(turningOn ? "已开启开机自启（下次登录生效）" : "已关闭开机自启（下次登录生效）",
                              dismissAfter: 4)
         default:
-            // 取消不动：恢复复选框与偏好一致（此处未写/删 plist，状态未变）
-            checkbox.state = isLoginItemEnabled() ? .on : .off
+            // 取消不动：恢复控件与偏好一致（此处未写/删 plist，状态未变）
+            revert?()
         }
     }
 
@@ -6868,6 +6905,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         hover.target = self
         hover.state = panelHoverEnabled ? .on : .off
         menu.addItem(hover)
+
+        let loginItem = NSMenuItem(title: "开机自启", action: #selector(onToggleLoginFromMenu(_:)), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = isLoginItemEnabled() ? .on : .off
+        menu.addItem(loginItem)
 
         let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
         let backgroundMenu = NSMenu()
@@ -8502,6 +8544,15 @@ enum GLMOfflineRegression {
                        && GLMLaunchAgent.Action.removeForeignConflict.conflictsForeignJob
                        && !GLMLaunchAgent.Action.writeSynced.conflictsForeignJob,
                        "身份不匹配分支绝不碰 launchd")
+            // 启动默认开启判定（2026-11-22）：显式关闭过的用户永不被静默重新开启
+            try expect(GLMLaunchAgent.shouldAutoEnableOnLaunch(preview: false, explicitChoiceRecorded: false, plistExists: false),
+                       "全新安装默认开启开机自启")
+            try expect(!GLMLaunchAgent.shouldAutoEnableOnLaunch(preview: false, explicitChoiceRecorded: true, plistExists: false),
+                       "显式关闭过不再自动开启")
+            try expect(!GLMLaunchAgent.shouldAutoEnableOnLaunch(preview: false, explicitChoiceRecorded: false, plistExists: true),
+                       "已有 plist 不重复写")
+            try expect(!GLMLaunchAgent.shouldAutoEnableOnLaunch(preview: true, explicitChoiceRecorded: false, plistExists: false),
+                       "preview 永不写生产偏好")
             // launchctl print 的 program 解析与身份比对判据（与 scripts/update.sh 同口径）
             let printedFixture = """
             com.local.glm-usage = {

@@ -25,6 +25,16 @@ enum GLMLaunchAgent {
     /// 偏好记录路径（生产 LaunchAgent plist；本模块自身绝不写它，写入由 App 开关路径执行）
     static var plistPath: String { NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist" }
 
+    /// 「用户做过显式选择」标记（UserDefaults，Bool=true）。plist 不存在有歧义
+    /// （从未开启 vs 显式关闭），默认开启逻辑必须靠它区分：存在标记后启动不再自动写。
+    static let explicitChoiceDefaultsKey = "login.explicitChoiceRecorded"
+
+    /// 启动默认开启判定（纯函数，--self-test 覆盖）：仅当非 preview、用户从未显式
+    /// 选择且当前无 plist 时自动写入偏好。显式关闭过的用户永远不被静默重新开启。
+    static func shouldAutoEnableOnLaunch(preview: Bool, explicitChoiceRecorded: Bool, plistExists: Bool) -> Bool {
+        !preview && !explicitChoiceRecorded && !plistExists
+    }
+
     // MARK: 决策矩阵
 
     enum Action: Equatable {
