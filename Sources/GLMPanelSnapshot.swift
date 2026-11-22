@@ -49,7 +49,6 @@ struct GLMPanelSnapshot: Equatable {
     var accountEmail: String?
     var lastAttemptText = ""
     var updateMessage: String?
-    var loginItemEnabled = false
 
     // MARK: 额度卡（用量进度）
 

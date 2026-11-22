@@ -3942,7 +3942,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.accountEmail = usage.accountEmail
         s.lastAttemptText = Fmt.time(lastAttemptAt)
         s.updateMessage = updateMessage
-        s.loginItemEnabled = !preview && isLoginItemEnabled()
         // 额度卡
         func quotaWindow(_ entry: LimitEntry?, _ error: String?, _ warning: String?, _ last: Date?, _ stale: Bool) -> GLMPanelSnapshot.QuotaCard.Window {
             let ratio = entry?.usedRemainingRatio
@@ -4710,7 +4709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             panelInstall(makePanelHeader(new), in: panelHeaderSlot)
             changed = true
         }
-        if old.lastAttemptText != new.lastAttemptText || old.updateMessage != new.updateMessage || old.loginItemEnabled != new.loginItemEnabled {
+        if old.lastAttemptText != new.lastAttemptText || old.updateMessage != new.updateMessage {
             panelInstall(makePanelFooter(new), in: panelFooterSlot)
             changed = true
         }
@@ -5454,7 +5453,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let msg = s.updateMessage { footer.addArrangedSubview(panelLabel(msg, color: .secondaryLabelColor)) }
         let actions = panelRow(); actions.spacing = 6
         let refresh = panelButton("立即刷新", #selector(onRefresh), prominent: true); refresh.keyEquivalent = "r"; refresh.keyEquivalentModifierMask = .command; refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true; refresh.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.refresh"); actions.addArrangedSubview(refresh)
-        let login = NSButton(checkboxWithTitle: "开机自启", target: self, action: #selector(onToggleLogin(_:))); login.font = .systemFont(ofSize: 12); login.state = s.loginItemEnabled ? .on : .off; login.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.login"); actions.addArrangedSubview(login); actions.addArrangedSubview(panelSpacer())
+        actions.addArrangedSubview(panelSpacer())
         let quit = panelButton("退出", #selector(onQuit)); quit.keyEquivalent = "q"; quit.keyEquivalentModifierMask = .command; quit.widthAnchor.constraint(equalToConstant: 40).isActive = true; quit.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.quit"); actions.addArrangedSubview(quit)
         footer.addArrangedSubview(actions); actions.widthAnchor.constraint(equalToConstant: inner).isActive = true
         return footer
@@ -6634,27 +6633,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    @objc private func onToggleLogin(_ sender: NSButton) {
-        toggleLogin(wantEnabled: sender.state == .on) { [weak self] in
-            sender.state = self?.isLoginItemEnabled() == true ? .on : .off
-        }
-    }
-
     /// 「···」菜单入口：item 的 state 表示当前生效状态，点击即翻转
     @objc private func onToggleLoginFromMenu(_ sender: NSMenuItem) {
-        toggleLogin(wantEnabled: sender.state != .on, revert: nil)
+        toggleLogin(wantEnabled: sender.state != .on)
     }
 
-    /// 页脚复选框与「···」菜单共用的开关主体。所有落盘分支都会记录「用户已显式
-    /// 选择」，此后启动不再套用默认开启；取消分支调用 revert 恢复控件显示。
-    private func toggleLogin(wantEnabled: Bool, revert: (() -> Void)?) {
+    /// 开机自启开关主体（唯一入口在「···」菜单）。所有落盘分支都会记录「用户已
+    /// 显式选择」，此后启动不再套用默认开启。
+    private func toggleLogin(wantEnabled: Bool) {
         if preview { setUpdateMessage("预览模式不会修改开机自启"); return }
         let action = GLMLaunchAgent.decide(
             wantEnabled: wantEnabled,
             state: GLMLaunchAgent.probe(binaryPath: Bundle.main.executablePath ?? ""))
         switch action {
         case .writeAndBootstrap, .removeAndRelaunch:
-            presentLoginRestartConfirmation(action, revert: revert)
+            presentLoginRestartConfirmation(action)
         case .writeSynced:
             recordExplicitLoginChoice()
             applyLoginPreference(turningOn: true)
@@ -6678,7 +6671,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// 受控重启方向的三键确认：主键立即重启并生效，副键仅保存偏好（旧行为），ESC 取消不动
-    private func presentLoginRestartConfirmation(_ action: GLMLaunchAgent.Action, revert: (() -> Void)?) {
+    private func presentLoginRestartConfirmation(_ action: GLMLaunchAgent.Action) {
         let turningOn = action == .writeAndBootstrap
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -6710,8 +6703,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             setUpdateMessage(turningOn ? "已开启开机自启（下次登录生效）" : "已关闭开机自启（下次登录生效）",
                              dismissAfter: 4)
         default:
-            // 取消不动：恢复控件与偏好一致（此处未写/删 plist，状态未变）
-            revert?()
+            // 取消不动：未写/删 plist，状态未变；菜单 item 状态在下次弹出时重建
+            break
         }
     }
 
