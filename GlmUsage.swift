@@ -5542,6 +5542,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .foregroundColor: NSColor.labelColor,
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)])
         version.toolTip = "\(BuildInfo.version) · 点击检查更新"
+        version.alignment = .center
         version.identifier = NSUserInterfaceItemIdentifier("GLMRole.footer.version")
         version.heightAnchor.constraint(equalToConstant: 24).isActive = true
         version.widthAnchor.constraint(greaterThanOrEqualToConstant: ceil(version.attributedTitle.size().width) + 20).isActive = true
@@ -5576,6 +5577,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "数据刷新")?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
         refresh.imagePosition = .imageLeft
+        // isBordered=false 的 NSButton 内容默认左对齐：显式居中 + icon 紧贴 title，
+        // 否则内容偏左、icon 与文字之间留出系统默认大间距
+        refresh.alignment = .center
+        refresh.imageHugsTitle = true
         refresh.contentTintColor = GLMPeakTint.accent
         refresh.attributedTitle = NSAttributedString(string: s.refreshInFlight ? "刷新中…" : "数据刷新", attributes: [
             .foregroundColor: GLMPeakTint.accent,
