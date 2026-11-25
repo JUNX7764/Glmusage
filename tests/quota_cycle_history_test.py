@@ -11,7 +11,8 @@ class QuotaCycleHistoryTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
         cls.binary = Path(cls.tmp.name) / "quota-history-tests"
-        subprocess.run(["swiftc", str(ROOT / "Sources/GLMQuotaCycleHistory.swift"),
+        subprocess.run(["swiftc", "-target", "arm64-apple-macos13.0",
+                        str(ROOT / "Sources/GLMQuotaCycleHistory.swift"),
                         str(ROOT / "Sources/GLMQuotaCycleContext.swift"),
                         str(ROOT / "Sources/GLMQuotaCycleStore.swift"),
                         str(ROOT / "Sources/GLMQuotaCycleCoordinator.swift"),

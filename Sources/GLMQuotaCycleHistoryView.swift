@@ -51,9 +51,20 @@ final class GLMQuotaHistoryCanvas: NSView {
         let frames = GLMQuotaHistoryGeometry.columns(width: bounds.width, height: bounds.height, count: records.count)
         return frames.firstIndex(where: { $0.contains(p) }).map { records[$0].id }
     }
-    override func mouseMoved(with event: NSEvent) { let id = record(at: event.locationInWindow); hover = id; needsDisplay = true; onHover?(id) }
+    override func mouseMoved(with event: NSEvent) {
+        let id = record(at: event.locationInWindow)
+        guard id != hover else { return }
+        hover = id
+        needsDisplay = true
+        onHover?(id)
+    }
     override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
-    override func mouseExited(with event: NSEvent) { hover = nil; needsDisplay = true; onHover?(nil) }
+    override func mouseExited(with event: NSEvent) {
+        guard hover != nil else { return }
+        hover = nil
+        needsDisplay = true
+        onHover?(nil)
+    }
     override func mouseDown(with event: NSEvent) {
         guard let id = record(at: event.locationInWindow) else { return }
         window?.makeFirstResponder(self); selected = id; needsDisplay = true; onClick?(id)

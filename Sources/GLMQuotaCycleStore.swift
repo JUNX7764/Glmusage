@@ -5,9 +5,30 @@ enum GLMQuotaCycleStoreError: Error { case invalidPartition, unsafePath, invalid
 
 final class GLMQuotaCycleStore {
     typealias Writer = (Data, URL) throws -> Void
+    private struct FileSignature: Equatable {
+        let dev: dev_t
+        let ino: ino_t
+        let mtimeSec: Int
+        let mtimeNsec: Int
+        let size: off_t
+    }
+
     private let root: URL
     private let writer: Writer
     private var protectedPartitions: Set<String> = []
+    private var verifiedSignatures: [String: FileSignature] = [:]
+
+    private static func fileSignature(atPath path: String) -> FileSignature? {
+        var info = stat()
+        guard lstat(path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
+        return FileSignature(
+            dev: info.st_dev,
+            ino: info.st_ino,
+            mtimeSec: info.st_mtimespec.tv_sec,
+            mtimeNsec: info.st_mtimespec.tv_nsec,
+            size: info.st_size
+        )
+    }
 
     init(root: URL, writer: @escaping Writer = GLMQuotaCycleStore.writePrivateJSON) {
         self.root = root; self.writer = writer
@@ -29,13 +50,24 @@ final class GLMQuotaCycleStore {
     func isProtected(partition: String) -> Bool { protectedPartitions.contains(partition) }
     func load(partition: String) throws -> GLMQuotaCycleState {
         let file = try location(partition)
-        guard FileManager.default.fileExists(atPath: file.path) else { return GLMQuotaCycleState() }
+        guard FileManager.default.fileExists(atPath: file.path) else {
+            verifiedSignatures.removeValue(forKey: partition)
+            return GLMQuotaCycleState()
+        }
         do {
+            let sigBefore = Self.fileSignature(atPath: file.path)
             let data = try Data(contentsOf: file)
             let state = try JSONDecoder().decode(GLMQuotaCycleState.self, from: data)
             guard Self.validate(state) else { throw GLMQuotaCycleStoreError.invalidData }
+            let sigAfter = Self.fileSignature(atPath: file.path)
+            if let sig = sigBefore, sig == sigAfter {
+                verifiedSignatures[partition] = sig
+            } else {
+                verifiedSignatures.removeValue(forKey: partition)
+            }
             return state
         } catch {
+            verifiedSignatures.removeValue(forKey: partition)
             protectedPartitions.insert(partition)
             throw error
         }
@@ -44,8 +76,25 @@ final class GLMQuotaCycleStore {
         let file = try location(partition)
         guard !protectedPartitions.contains(partition) else { throw GLMQuotaCycleStoreError.protectedFile }
         guard Self.validate(state) else { throw GLMQuotaCycleStoreError.invalidData }
-        if FileManager.default.fileExists(atPath: file.path) { _ = try load(partition: partition) }
-        try writer(JSONEncoder().encode(state), file)
+        if FileManager.default.fileExists(atPath: file.path) {
+            let currentSig = Self.fileSignature(atPath: file.path)
+            if currentSig == nil || verifiedSignatures[partition] != currentSig {
+                _ = try load(partition: partition)
+            }
+        } else {
+            verifiedSignatures.removeValue(forKey: partition)
+        }
+        do {
+            try writer(JSONEncoder().encode(state), file)
+        } catch {
+            verifiedSignatures.removeValue(forKey: partition)
+            throw error
+        }
+        if let newSig = Self.fileSignature(atPath: file.path) {
+            verifiedSignatures[partition] = newSig
+        } else {
+            verifiedSignatures.removeValue(forKey: partition)
+        }
     }
     static func validate(_ state: GLMQuotaCycleState) -> Bool {
         guard state.schemaVersion == 1 else { return false }

@@ -389,6 +389,59 @@ exit 0
             for other in OTHER_LABELS:
                 self.assertNotIn(other, line)
 
+    def test_loaded_job_without_preference_escapes_special_xml_chars_in_plist(self):
+        # 路径含 XML 特殊字符（& < > '）时恢复的 plist 必须经过转义并可通过 plistlib / plutil 校验
+        special_dir = self.base / "Apps & <Test> 'Quote'"
+        installed = self.make_app(special_dir, "v1.0.0", "old")
+        payload = self.make_app(self.base / "payload-special", "v2.0.0", "new")
+        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        self.state.write_text("old process")
+        result = self.run_update(
+            installed=installed,
+            MOCK_AGENT_ACTIVE="1",
+            MOCK_PAYLOAD=str(payload),
+            MOCK_TARGET=str(installed),
+            MOCK_EXECUTABLE=EXECUTABLE,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        self.assertTrue(plist.exists())
+        lint = subprocess.run(["/usr/bin/plutil", "-lint", str(plist)], capture_output=True, text=True, check=False)
+        self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
+        with plist.open("rb") as handle:
+            info = plistlib.load(handle)
+        self.assertEqual(info["ProgramArguments"], [str(installed / "Contents" / "MacOS" / EXECUTABLE)])
+
+    def test_update_polls_until_delayed_old_process_exits(self):
+        # 模拟旧进程退场耗时（applicationWillTerminate 写盘排空等）：收到 kill 后前 3 次 ps 仍在，
+        # 第 4 次才退场；轮询等待必须成功换包而不被单次检查误杀
+        installed = self.prepare_update()
+        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        plist.unlink()
+        countdown = self.base / "exit.countdown"
+        killshim = self.base / "kill-delayed-env.sh"
+        killshim.write_text(f'kill() {{ echo "kill $*" >> "{self.log}"; echo 3 > "{countdown}"; return 0; }}\n')
+        self._mock("ps", f'''
+if [ -e "{countdown}" ]; then
+    n="$(cat "{countdown}")"
+    if [ "$n" -gt 0 ]; then
+        echo $((n - 1)) > "{countdown}"
+        echo "99999 $MOCK_TARGET/Contents/MacOS/$MOCK_EXECUTABLE"
+    else
+        rm -f "{countdown}" "$MOCK_STATE"
+    fi
+elif [ -e "$MOCK_STATE" ]; then
+    echo "99999 $MOCK_TARGET/Contents/MacOS/$MOCK_EXECUTABLE"
+fi
+if [ "${{MOCK_OTHER_COPY:-0}}" = 1 ]; then echo "99998 /other/${{MOCK_APP_NAME}}/Contents/MacOS/$MOCK_EXECUTABLE"; fi
+''')
+        self._mock("sleep", 'echo "sleep $*" >> "$MOCK_LOG"\nexit 0\n')
+        result = self.run_update(MOCK_AGENT_ACTIVE="0", BASH_ENV=str(killshim))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        poll_sleeps = [line for line in self.log_lines() if line == "sleep 0.2"]
+        self.assertGreaterEqual(len(poll_sleeps), 3, self.log_lines())
+
     def test_release_api_failure_preserves_old_app_and_service(self):
         installed = self.prepare_update()
         result = self.run_update(MOCK_CURL_RELEASE_FAIL="1")
