@@ -113,17 +113,38 @@ enum GLMLaunchAgent {
 
     // MARK: plist 定义与 helper 脚本
 
+    private static func xmlEscape(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+    }
+
     /// 与历史版本及 scripts/update.sh 恢复分支同款定义：
     /// RunAtLoad 登录/加载即拉起；KeepAlive 仅非正常退出复活（菜单「退出」exit 0 不再被拉回）。
+    /// 使用 PropertyListSerialization 生成规范 XML，避免路径含 XML 特殊字符破坏 plist 结构。
     static func plistContent(executablePath: String) -> String {
-        """
+        let plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [executablePath],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+        ]
+        if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0),
+           let xml = String(data: data, encoding: .utf8) {
+            return xml
+        }
+        let escapedPath = xmlEscape(executablePath)
+        return """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0">
         <dict>
             <key>Label</key><string>\(label)</string>
             <key>ProgramArguments</key>
-            <array><string>\(executablePath)</string></array>
+            <array><string>\(escapedPath)</string></array>
             <key>RunAtLoad</key><true/>
             <key>KeepAlive</key>
             <dict><key>SuccessfulExit</key><false/></dict>
@@ -239,15 +260,48 @@ enum GLMLaunchAgent {
 
     // MARK: 派生 helper
 
+    /// 从 App 路径或可执行路径解析 pgrep -x 使用的真实进程名（若末段为 .app 则去除后缀）。
+    static func processName(forAppPath appPath: String) -> String {
+        let last = (appPath as NSString).lastPathComponent
+        return last.hasSuffix(".app") ? (last as NSString).deletingPathExtension : last
+    }
+
+    /// 构造 /bin/sh 所需的 helper 完整参数列表（纯函数，--self-test 直接覆盖 $1..$7 绑定）。
+    static func helperArguments(
+        direction: Direction,
+        waitingPID: Int32,
+        appPath: String,
+        processName: String? = nil,
+        plistPath: String = plistPath,
+        resultLogPath: String = resultLogPath,
+        maxPolls: Int = 50
+    ) -> [String] {
+        let resolvedProcessName: String
+        if let processName, !processName.isEmpty {
+            resolvedProcessName = processName
+        } else {
+            resolvedProcessName = Self.processName(forAppPath: appPath)
+        }
+        return [
+            "-c", helperScript(direction), "glm-launchctl-helper",
+            "\(waitingPID)", plistPath, appPath, resultLogPath, label,
+            resolvedProcessName, "\(maxPolls)"
+        ]
+    }
+
     /// 派生 detach helper（/bin/sh -c，独立于本进程存活）。调用方随后自行正常退出；
     /// 返回 false 表示派生失败，调用方不得退出，改走「仅保存偏好」并提示。
-    /// 进程名取 App 路径末段（pgrep -x 精确守卫），轮询上限 50×0.2s≈10s。
-    static func spawnExitHelper(direction: Direction, waitingPID: Int32, appPath: String) -> Bool {
+    /// 进程名优先取调用方传入的可执行文件名（缺失时自动去除 .app 后缀），轮询上限 50×0.2s≈10s。
+    static func spawnExitHelper(direction: Direction, waitingPID: Int32, appPath: String,
+                                processName: String? = nil) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", helperScript(direction), "glm-launchctl-helper",
-                             "\(waitingPID)", plistPath, appPath, resultLogPath, label,
-                             (appPath as NSString).lastPathComponent, "50"]
+        process.arguments = helperArguments(
+            direction: direction,
+            waitingPID: waitingPID,
+            appPath: appPath,
+            processName: processName
+        )
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return false }

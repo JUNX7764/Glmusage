@@ -56,6 +56,18 @@ stop_target() {
     local pid
     while read -r pid; do [ -z "$pid" ] || kill "$pid" 2>/dev/null || true; done < <(target_pids)
 }
+wait_target_exit() {
+    local i=0
+    while [ "$i" -lt 25 ]; do
+        [ -z "$(target_pids)" ] && return 0
+        sleep 0.2
+        i=$((i + 1))
+    done
+    [ -z "$(target_pids)" ]
+}
+xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+}
 version_newer() {
     /usr/bin/osascript -l JavaScript - "$1" "$2" <<'JXA'
 function run(a) {
@@ -261,6 +273,7 @@ elif [ "$JOB_LOADED" = 1 ]; then
     # 语义，按 App 同款定义恢复 plist，保证 bootout 后 bootstrap 能把应用接管拉回；
     # 回滚路径的 bootstrap 同样依赖该文件。
     mkdir -p "$(dirname "$AGENT_PLIST")" || { echo "!! 无法创建 LaunchAgents 目录，已中止"; exit 1; }
+    ESCAPED_BINARY="$(xml_escape "$BINARY")"
     cat > "$AGENT_PLIST" <<PLIST || { echo "!! 无法恢复 LaunchAgent 配置，已中止"; exit 1; }
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -268,7 +281,7 @@ elif [ "$JOB_LOADED" = 1 ]; then
 <dict>
     <key>Label</key><string>${LABEL}</string>
     <key>ProgramArguments</key>
-    <array><string>${BINARY}</string></array>
+    <array><string>${ESCAPED_BINARY}</string></array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key>
     <dict><key>SuccessfulExit</key><false/></dict>
@@ -296,8 +309,7 @@ if [ "$AGENT" = 1 ]; then
 fi
 STOPPED=1
 stop_target
-sleep 1
-if [ -n "$(target_pids)" ]; then
+if ! wait_target_exit; then
     echo "!! 旧进程仍未退出，取消换包"
     exit 1
 fi

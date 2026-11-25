@@ -172,6 +172,41 @@ case "storeSafety":
     do { _ = try store.load(partition: partition); check(false, "future version must fail") } catch { }
     do { try store.save(state, partition: partition); check(false, "protected file must not be overwritten") } catch { }
     check(try! Data(contentsOf: url) == Data("{\"schemaVersion\":999}".utf8), "future preserved")
+    // stat 签名缓存不得削弱外部篡改保护：save 命中缓存后若磁盘文件被外部改坏，下一次 save 无需先调 load 也必须发现并拒绝覆盖
+    let p2 = String(repeating: "b", count: 64)
+    try! store.save(state, partition: p2)
+    try! store.save(state, partition: p2)
+    let url2 = root.appendingPathComponent(p2).appendingPathComponent("history-v1.json")
+    try! Data("{\"schemaVersion\":999}".utf8).write(to: url2)
+    do { try store.save(state, partition: p2); check(false, "external tampering after cached save must be rejected") } catch { }
+    check(store.isProtected(partition: p2), "external tampering must mark partition protected")
+    check(try! Data(contentsOf: url2) == Data("{\"schemaVersion\":999}".utf8), "externally modified file preserved")
+    // writer 抛错后必须失效签名缓存：即使磁盘保留相同 inode/size/mtime 的损坏内容，下一次 save 也必须重走 load 校验
+    let p3 = String(repeating: "c", count: 64)
+    var failNextWrite = false
+    let flakyStore = GLMQuotaCycleStore(root: root, writer: { data, destination in
+        if failNextWrite { throw NSError(domain: "fixture", code: 2) }
+        try GLMQuotaCycleStore.writePrivateJSON(data, to: destination)
+    })
+    try! flakyStore.save(state, partition: p3)
+    let url3 = root.appendingPathComponent(p3).appendingPathComponent("history-v1.json")
+    var origStat = stat()
+    check(lstat(url3.path, &origStat) == 0, "stat written history")
+    failNextWrite = true
+    do { try flakyStore.save(state, partition: p3); check(false, "flaky writer must fail") } catch { }
+    // 原位覆写等长非法 JSON 并还原原 mtime/atime，使 dev/ino/mtime/size 与旧缓存完全一致
+    let badSameLen = Data(repeating: UInt8(ascii: "X"), count: Int(origStat.st_size))
+    let fd3 = Darwin.open(url3.path, O_WRONLY)
+    check(fd3 >= 0, "open for in-place corrupt")
+    let written = badSameLen.withUnsafeBytes { ptr in Darwin.write(fd3, ptr.baseAddress, ptr.count) }
+    Darwin.close(fd3)
+    check(written == badSameLen.count, "in-place corrupt size")
+    var origTimes = [origStat.st_atimespec, origStat.st_mtimespec]
+    check(utimensat(AT_FDCWD, url3.path, &origTimes, 0) == 0, "restore mtime")
+    failNextWrite = false
+    do { try flakyStore.save(state, partition: p3); check(false, "save after failed write must re-verify file") } catch { }
+    check(flakyStore.isProtected(partition: p3), "re-verified corrupt file must mark partition protected")
+    check(try! Data(contentsOf: url3) == badSameLen, "corrupt file preserved after failed-write invalidation")
     print("PASS: storeSafety")
 case "storeNestedAndSymlink":
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

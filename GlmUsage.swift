@@ -19,6 +19,21 @@ import LocalAuthentication
 //   "enc:v2:env:" 走 ZCode 进程环境派生密钥，本应用无法获取，保持不支持。
 // 本应用只读取、绝不写入该文件；key 仅存在于内存，不写日志或诊断状态。
 
+// 进程级钥匙串交互开关锁：SecKeychainGetUserInteractionAllowed / SecKeychainSetUserInteractionAllowed
+// 属于进程全局状态，后台 non-interactive 轮询与主线程交互式解锁并发时必须串行保护临界区。
+enum GLMKeychainLock {
+    private static let lock = NSLock()
+    static func withUserInteractionAllowed<T>(interactive: Bool, _ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        var wasAllowed: DarwinBoolean = true
+        let restoreInteraction = !interactive && SecKeychainGetUserInteractionAllowed(&wasAllowed) == errSecSuccess
+        if restoreInteraction { SecKeychainSetUserInteractionAllowed(false) }
+        defer { if restoreInteraction { SecKeychainSetUserInteractionAllowed(wasAllowed.boolValue) } }
+        return body()
+    }
+}
+
 // Only this app's dedicated item is accessed; background reads must never prompt.
 enum GLMPlanKeychain {
     static let service = "com.local.glm-usage.coding-plan"
@@ -36,33 +51,35 @@ enum GLMPlanKeychain {
             let context = LAContext(); context.interactionNotAllowed = true
             q[kSecUseAuthenticationContext as String] = context
         }
-        var wasAllowed: DarwinBoolean = true
-        let restoreInteraction = !interactive && SecKeychainGetUserInteractionAllowed(&wasAllowed) == errSecSuccess
-        if restoreInteraction { SecKeychainSetUserInteractionAllowed(false) }
-        defer { if restoreInteraction { SecKeychainSetUserInteractionAllowed(wasAllowed.boolValue) } }
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(q as CFDictionary, &result)
-        if status == errSecItemNotFound { return .missing }
-        guard status == errSecSuccess, let data = result as? Data,
-              let value = String(data: data, encoding: .utf8), !value.isEmpty else { return .unavailable }
-        return .key(value)
+        return GLMKeychainLock.withUserInteractionAllowed(interactive: interactive) {
+            var result: CFTypeRef?
+            let status = SecItemCopyMatching(q as CFDictionary, &result)
+            if status == errSecItemNotFound { return .missing }
+            guard status == errSecSuccess, let data = result as? Data,
+                  let value = String(data: data, encoding: .utf8), !value.isEmpty else { return .unavailable }
+            return .key(value)
+        }
     }
     // Called only after the user submits a verified key. Existing items are updated in place;
     // an access denial never deletes the old item.
     static func save(_ key: String) -> Bool {
-        let q = query()
-        let data = Data(key.utf8)
-        let status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecSuccess { return true }
-        guard status == errSecItemNotFound else { return false }
-        var item = q
-        item[kSecValueData as String] = data
-        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+        GLMKeychainLock.withUserInteractionAllowed(interactive: true) {
+            let q = query()
+            let data = Data(key.utf8)
+            let status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+            if status == errSecSuccess { return true }
+            guard status == errSecItemNotFound else { return false }
+            var item = q
+            item[kSecValueData as String] = data
+            return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+        }
     }
 
     // 仅「断开连接」入口调用：用户显式放弃已保存的连接，回退凭据库自动读取。
     static func delete() {
-        SecItemDelete(query() as CFDictionary)
+        GLMKeychainLock.withUserInteractionAllowed(interactive: true) {
+            _ = SecItemDelete(query() as CFDictionary)
+        }
     }
 }
 
@@ -98,15 +115,13 @@ enum ZCodeSystemKey {
             let context = LAContext(); context.interactionNotAllowed = true
             q[kSecUseAuthenticationContext as String] = context
         }
-        var wasAllowed: DarwinBoolean = true
-        let restoreInteraction = !interactive && SecKeychainGetUserInteractionAllowed(&wasAllowed) == errSecSuccess
-        if restoreInteraction { SecKeychainSetUserInteractionAllowed(false) }
-        defer { if restoreInteraction { SecKeychainSetUserInteractionAllowed(wasAllowed.boolValue) } }
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
-              let raw = result as? Data,
-              let text = String(data: raw, encoding: .utf8), !text.isEmpty else { return nil }
-        return CredStore.base64urlDecode(text)
+        return GLMKeychainLock.withUserInteractionAllowed(interactive: interactive) {
+            var result: CFTypeRef?
+            guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
+                  let raw = result as? Data,
+                  let text = String(data: raw, encoding: .utf8), !text.isEmpty else { return nil }
+            return CredStore.base64urlDecode(text)
+        }
     }
 
     /// 后台读取：优先进程内缓存，miss 时 non-interactive 查询（成功才缓存；失败不缓存，
@@ -137,27 +152,65 @@ enum CredStore {
 
     static let keychainUnavailableMessage = "已保存的套餐连接暂不可用，请重新连接"
     // A single non-interactive lookup per process avoids repeated Keychain prompts/work.
-    private static var savedKey: GLMPlanKeychain.ReadResult = GLMPlanKeychain.read()
-    static func useSavedKey(_ key: String) { savedKey = .key(key) }
+    // 独立锁保护进程内缓存读写，持锁期间绝不执行 Keychain 交互或删除调用。
+    private static let savedKeyLock = NSLock()
+    private static var _savedKey: GLMPlanKeychain.ReadResult?
+
+    private static func readSavedKey() -> GLMPlanKeychain.ReadResult {
+        savedKeyLock.lock()
+        if let cached = _savedKey {
+            savedKeyLock.unlock()
+            return cached
+        }
+        savedKeyLock.unlock()
+        let fresh = GLMPlanKeychain.read(interactive: false)
+        savedKeyLock.lock()
+        if let existing = _savedKey {
+            savedKeyLock.unlock()
+            return existing
+        }
+        _savedKey = fresh
+        savedKeyLock.unlock()
+        return fresh
+    }
+
+    static func useSavedKey(_ key: String) {
+        savedKeyLock.lock()
+        _savedKey = .key(key)
+        savedKeyLock.unlock()
+    }
+    // 仅离线自测清理进程内缓存（绝不触发 Keychain 删除）
+    static func resetSavedKeyCacheForTesting() {
+        savedKeyLock.lock()
+        _savedKey = nil
+        savedKeyLock.unlock()
+    }
     // 断开已保存连接：删除钥匙串条目并回到凭据库自动读取路径（用户显式操作）。
     static func forgetSavedKey() {
         GLMPlanKeychain.delete()
-        savedKey = .missing
+        savedKeyLock.lock()
+        _savedKey = .missing
+        savedKeyLock.unlock()
     }
     static func unlockSavedKey() -> Bool {
         let result = GLMPlanKeychain.read(interactive: true)
-        if case .key = result { savedKey = result; return true }
+        if case .key = result {
+            savedKeyLock.lock()
+            _savedKey = result
+            savedKeyLock.unlock()
+            return true
+        }
         return false
     }
     static var isSavedKeyActive: Bool {
         let env = ProcessInfo.processInfo.environment[envKey]?.trimmingCharacters(in: .whitespacesAndNewlines)
         if env?.isEmpty == false { return false }
-        if case .key = savedKey { return true }
+        if case .key = readSavedKey() { return true }
         return false
     }
     // 条目存在但当前二进制不在 ACL（更新后签名指纹变化）→ 交互式解锁可恢复
     static var savedKeyNeedsUnlock: Bool {
-        if case .unavailable = savedKey { return true }
+        if case .unavailable = readSavedKey() { return true }
         return false
     }
     static func loadApiKey() -> String? {
@@ -185,7 +238,7 @@ enum CredStore {
         if let value = envValue, !value.trimmingCharacters(in: .whitespaces).isEmpty {
             return .init(key: value, error: "", mode: .apiKey)
         }
-        switch savedKey {
+        switch readSavedKey() {
         case .key(let key): return .init(key: key, error: "", mode: .apiKey)
         case .unavailable: return .init(key: nil, error: keychainUnavailableMessage, mode: nil)
         case .missing: return resolvePlanCredentialTyped(record: credentialRecord() ?? [:])
@@ -648,13 +701,14 @@ enum GLMLocalModelStats {
         defer { sqlite3_close(database) }
         guard opened == SQLITE_OK else { throw ReadFailure() }
         sqlite3_busy_timeout(database, 1_000)
-        return try queryWindow(from: from, to: to, calendar: calendar, database: database)
+        let startMs = calendar.startOfDay(for: from).timeIntervalSince1970 * 1_000
+        return try queryWindows(windows: [(0, startMs)], to: to, database: database)[0]
+            ?? Snapshot(rows: [], overall: nil)
     }
 
-    /// 一次刷新的三个周期共用一个只读连接（2026-11-21 性能：原实现逐周期独立 sqlite3_open_v2/close）。
-    /// 每个周期仍执行与 load 逐字节相同的查询、过滤与累计（顺序同 Period.allCases），聚合口径、
-    /// 行过滤、排序语义不变——这是第 8/9 张卡的数据源，口径红线。任一周期抛错即整体失败，
-    /// 上层保留旧快照并置异常态（与原循环 break 语义一致）。
+    /// 一次刷新的三个周期共用一个只读连接与单次 SQLite 查询（按近 30 天最大窗口扫描一次，
+    /// 游标单次遍历按 started_at 同时累计到三个独立累加器）。每个周期各自维护独立的 order 与
+    /// displayName，确保与逐周期独立 load 逐字节等价。
     static func loadAll(now: Date,
                         databasePath: String = NSHomeDirectory() + "/.zcode/cli/db/db.sqlite",
                         calendar: Calendar = .current) throws -> [Period: Snapshot] {
@@ -666,17 +720,95 @@ enum GLMLocalModelStats {
         defer { sqlite3_close(database) }
         guard opened == SQLITE_OK else { throw ReadFailure() }
         sqlite3_busy_timeout(database, 1_000)
-        var results: [Period: Snapshot] = [:]
-        for period in Period.allCases {
-            results[period] = try queryWindow(from: period.windowStart(now: now, calendar: calendar),
-                                              to: now, calendar: calendar, database: database)
+        let windows = Period.allCases.map { period -> (Period, Double) in
+            let from = period.windowStart(now: now, calendar: calendar)
+            return (period, calendar.startOfDay(for: from).timeIntervalSince1970 * 1_000)
         }
-        return results
+        return try queryWindows(windows: windows, to: now, database: database)
     }
 
-    /// 单个时间窗的查询与累计（原 load 主体逐字节保留，仅改为接收已打开的连接）。
-    private static func queryWindow(from: Date, to: Date, calendar: Calendar,
-                                    database: OpaquePointer?) throws -> Snapshot {
+    private struct Accum {
+        var displayName: String
+        var requests = 0
+        var samples = 0
+        var outputTokens: Double = 0
+        var sampleOutput: Double = 0
+        var sampleDurationMs: Double = 0
+        var ttftSum: Double = 0
+        var ttftCount = 0
+        var inputTokens: Double = 0
+        var cacheReadTokens: Double = 0
+        var hasCacheActivity = false
+    }
+
+    private struct WindowAccumulator {
+        let startMs: Double
+        var order: [String] = []
+        var accums: [String: Accum] = [:]
+
+        mutating func add(key: String, model: String, output: Double,
+                          firstToken: Double?, completed: Double?, ttft: Double?,
+                          input: Double, cacheRead: Double, cacheCreation: Double) {
+            if accums[key] == nil { order.append(key); accums[key] = Accum(displayName: model) }
+            var accum = accums[key]!
+            accum.requests += 1
+            accum.outputTokens += output
+            // 有效速度样本：first_token_at 非空且 completed_at > first_token_at 且 output_tokens > 0
+            if let firstToken, let completed, completed > firstToken, output > 0 {
+                accum.samples += 1
+                accum.sampleOutput += output
+                accum.sampleDurationMs += completed - firstToken
+            }
+            // TTFT 仅统计 > 0 的行
+            if let ttft, ttft > 0 { accum.ttftSum += ttft; accum.ttftCount += 1 }
+            // 缓存活动 = 任一纳入行 cache_read>0 或 cache_creation>0（与 input 行数无关，计划口径字面）
+            if cacheRead > 0 || cacheCreation > 0 { accum.hasCacheActivity = true }
+            // input_tokens ≤ 0 的行不进任何分母/分子（除零守卫）
+            if input > 0 {
+                accum.inputTokens += input
+                accum.cacheReadTokens += cacheRead
+            }
+            accums[key] = accum
+        }
+
+        func buildSnapshot() -> Snapshot {
+            let rows = order.map { key -> ModelRow in
+                let a = accums[key]!
+                return ModelRow(name: a.displayName,
+                                requests: a.requests,
+                                decodeSamples: a.samples,
+                                decodeTps: a.samples > 0 ? 1_000 * a.sampleOutput / a.sampleDurationMs : nil,
+                                avgTtftMs: a.ttftCount > 0 ? a.ttftSum / Double(a.ttftCount) : nil,
+                                outputTokens: a.outputTokens,
+                                inputTokens: a.inputTokens,
+                                cacheReadTokens: a.cacheReadTokens,
+                                cacheHitRate: a.hasCacheActivity && a.inputTokens > 0
+                                    ? a.cacheReadTokens / a.inputTokens : nil)
+            }
+            if rows.isEmpty { return Snapshot(rows: [], overall: nil) }
+            let totalInput = rows.reduce(0.0) { $0 + $1.inputTokens }
+            let totalCacheRead = rows.reduce(0.0) { $0 + $1.cacheReadTokens }
+            let anyActivity = order.contains { accums[$0]!.hasCacheActivity }
+            let overall = ModelRow(name: "整体",
+                                   requests: rows.reduce(0) { $0 + $1.requests },
+                                   decodeSamples: rows.reduce(0) { $0 + $1.decodeSamples },
+                                   decodeTps: nil, avgTtftMs: nil,
+                                   outputTokens: rows.reduce(0.0) { $0 + $1.outputTokens },
+                                   inputTokens: totalInput,
+                                   cacheReadTokens: totalCacheRead,
+                                   cacheHitRate: anyActivity && totalInput > 0 ? totalCacheRead / totalInput : nil)
+            return Snapshot(rows: rows, overall: overall)
+        }
+    }
+
+    /// 单次 SQL 扫描驱动单个或多个时间窗的聚合（按 started_at ASC 升序读取，
+    /// 每个窗口各自维护独立的 order 与 displayName，保证首现大小写口径与独立查询一致）。
+    private static func queryWindows<Key: Hashable>(
+        windows: [(Key, Double)],
+        to: Date,
+        database: OpaquePointer?
+    ) throws -> [Key: Snapshot] {
+        guard let minStartMs = windows.map(\.1).min() else { return [:] }
         // 通用剔除（计划口径）：cancelled_by_user=1 与 status='running' 的行不进任何统计；
         // 按时间升序读取，保证模型显示名保留首次（最早）出现的大小写。
         let query = """
@@ -694,28 +826,14 @@ enum GLMLocalModelStats {
         guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK else {
             // 尚无逐次请求表的旧版 ZCode → 空态；表结构不识别（缺列）→ 明确失败，不静默造 0
             if String(cString: sqlite3_errmsg(database)) == "no such table: model_usage" {
-                return Snapshot(rows: [], overall: nil)
+                return Dictionary(uniqueKeysWithValues: windows.map { ($0.0, Snapshot(rows: [], overall: nil)) })
             }
             throw ReadFailure()
         }
         // 日界对齐 Start Plan 读取器：窗口首日按本地自然日 0 点准入
-        sqlite3_bind_double(statement, 1, calendar.startOfDay(for: from).timeIntervalSince1970 * 1_000)
+        sqlite3_bind_double(statement, 1, minStartMs)
         sqlite3_bind_double(statement, 2, to.timeIntervalSince1970 * 1_000)
-        struct Accum {
-            var displayName: String
-            var requests = 0
-            var samples = 0
-            var outputTokens: Double = 0
-            var sampleOutput: Double = 0
-            var sampleDurationMs: Double = 0
-            var ttftSum: Double = 0
-            var ttftCount = 0
-            var inputTokens: Double = 0
-            var cacheReadTokens: Double = 0
-            var hasCacheActivity = false
-        }
-        var order: [String] = []
-        var accums: [String: Accum] = [:]
+        var buckets = windows.map { WindowAccumulator(startMs: $0.1) }
         func cell(_ index: Int32) throws -> Double? {
             switch sqlite3_column_type(statement, index) {
             case SQLITE_INTEGER, SQLITE_FLOAT: return sqlite3_column_double(statement, index)
@@ -727,6 +845,7 @@ enum GLMLocalModelStats {
         while step == SQLITE_ROW {
             guard sqlite3_column_type(statement, 0) == SQLITE_INTEGER,
                   let rawModel = sqlite3_column_text(statement, 1) else { throw ReadFailure() }
+            let startedAtMs = sqlite3_column_double(statement, 0)
             let model = String(cString: rawModel).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !model.isEmpty else { throw ReadFailure() }
             let output = try cell(4) ?? 0
@@ -737,55 +856,19 @@ enum GLMLocalModelStats {
             let cacheRead = try cell(9) ?? 0
             let cacheCreation = try cell(10) ?? 0
             let key = model.lowercased()
-            if accums[key] == nil { order.append(key); accums[key] = Accum(displayName: model) }
-            var accum = accums[key]!
-            accum.requests += 1
-            accum.outputTokens += output
-            // 有效速度样本：first_token_at 非空且 completed_at > first_token_at 且 output_tokens > 0
-            if firstToken != nil, completed != nil, completed! > firstToken!, output > 0 {
-                accum.samples += 1
-                accum.sampleOutput += output
-                accum.sampleDurationMs += completed! - firstToken!
+            for i in buckets.indices where startedAtMs >= buckets[i].startMs {
+                buckets[i].add(key: key, model: model, output: output,
+                               firstToken: firstToken, completed: completed, ttft: ttft,
+                               input: input, cacheRead: cacheRead, cacheCreation: cacheCreation)
             }
-            // TTFT 仅统计 > 0 的行
-            if let ttft, ttft > 0 { accum.ttftSum += ttft; accum.ttftCount += 1 }
-            // 缓存活动 = 任一纳入行 cache_read>0 或 cache_creation>0（与 input 行数无关，计划口径字面）
-            if cacheRead > 0 || cacheCreation > 0 { accum.hasCacheActivity = true }
-            // input_tokens ≤ 0 的行不进任何分母/分子（除零守卫）
-            if input > 0 {
-                accum.inputTokens += input
-                accum.cacheReadTokens += cacheRead
-            }
-            accums[key] = accum
             step = sqlite3_step(statement)
         }
         guard step == SQLITE_DONE else { throw ReadFailure() }
-        let rows = order.map { key -> ModelRow in
-            let a = accums[key]!
-            return ModelRow(name: a.displayName,
-                            requests: a.requests,
-                            decodeSamples: a.samples,
-                            decodeTps: a.samples > 0 ? 1_000 * a.sampleOutput / a.sampleDurationMs : nil,
-                            avgTtftMs: a.ttftCount > 0 ? a.ttftSum / Double(a.ttftCount) : nil,
-                            outputTokens: a.outputTokens,
-                            inputTokens: a.inputTokens,
-                            cacheReadTokens: a.cacheReadTokens,
-                            cacheHitRate: a.hasCacheActivity && a.inputTokens > 0
-                                ? a.cacheReadTokens / a.inputTokens : nil)
+        var results: [Key: Snapshot] = [:]
+        for (i, window) in windows.enumerated() {
+            results[window.0] = buckets[i].buildSnapshot()
         }
-        if rows.isEmpty { return Snapshot(rows: [], overall: nil) }
-        let totalInput = rows.reduce(0.0) { $0 + $1.inputTokens }
-        let totalCacheRead = rows.reduce(0.0) { $0 + $1.cacheReadTokens }
-        let anyActivity = order.contains { accums[$0]!.hasCacheActivity }
-        let overall = ModelRow(name: "整体",
-                               requests: rows.reduce(0) { $0 + $1.requests },
-                               decodeSamples: rows.reduce(0) { $0 + $1.decodeSamples },
-                               decodeTps: nil, avgTtftMs: nil,
-                               outputTokens: rows.reduce(0.0) { $0 + $1.outputTokens },
-                               inputTokens: totalInput,
-                               cacheReadTokens: totalCacheRead,
-                               cacheHitRate: anyActivity && totalInput > 0 ? totalCacheRead / totalInput : nil)
-        return Snapshot(rows: rows, overall: overall)
+        return results
     }
 }
 
@@ -1275,13 +1358,28 @@ enum GLMPlanConnection {
 enum Fetcher {
     static let base = "https://open.bigmodel.cn"
 
-    static func authRequest(_ urlStr: String, apiKey: String, rawKey: Bool = false) -> URLRequest? {
-        guard let url = URL(string: urlStr) else { return nil }
+    // 专用 ephemeral 会话：不写磁盘缓存/Cookie，并统一请求与资源超时。
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 25
+        return URLSession(configuration: config)
+    }()
+
+    private static let validDateRegex = try? NSRegularExpression(pattern: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#)
+
+    static func authRequest(_ url: URL, apiKey: String, rawKey: Bool = false) -> URLRequest {
         var req = URLRequest(url: url, timeoutInterval: 15)
         req.setValue(rawKey ? apiKey : "Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.setValue("GlmUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return req
+    }
+
+    static func authRequest(_ urlStr: String, apiKey: String, rawKey: Bool = false) -> URLRequest? {
+        guard let url = URL(string: urlStr) else { return nil }
+        return authRequest(url, apiKey: apiKey, rawKey: rawKey)
     }
 
     private static func winParams(from: Date, to: Date) -> [URLQueryItem] {
@@ -1297,12 +1395,12 @@ enum Fetcher {
         if let from = from, let to = to {
             var comp = URLComponents(string: base + path)
             comp?.queryItems = winParams(from: from, to: to)
-            req = comp?.url.map { authRequest($0.absoluteString, apiKey: apiKey, rawKey: rawKey)! }
+            req = comp?.url.map { authRequest($0, apiKey: apiKey, rawKey: rawKey) }
         } else {
             req = authRequest(base + path, apiKey: apiKey, rawKey: rawKey)
         }
         guard let req = req else { completion(nil, "bad url"); return }
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        session.dataTask(with: req) { data, resp, err in
             // 先看 HTTP 状态：非 200 且 body 非 JSON 时也能报出真实状态码，而不是笼统的 bad response
             if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
                 completion(nil, "HTTP \(http.statusCode)"); return
@@ -1441,6 +1539,8 @@ enum Fetcher {
     /// model-usage：一个时间窗的 token/调用统计；第二/三参数为每日桶与其解析失败标记
     /// （复用同一响应，不新增请求；Gate 已于 2026-11-06 真实验收确认，解析失败仍整体拒绝）
     static func fetchModelUsage(apiKey: String, from: Date, to: Date, includeLocal: Bool = true, rawKey: Bool = false,
+                                parseDaily: Bool = true,
+                                preloadedLocal: (() -> GLMStartPlanUsage.Snapshot?)? = nil,
                                 completion: @escaping (ModelUsage?, [GLMDayBucket]?, Bool, String?) -> Void) {
         // 环境变量可指向其他账号，其用量不能与当前 ZCode 的本机记录直接合并。
         let externalKey = ProcessInfo.processInfo.environment[CredStore.envKey]?
@@ -1450,20 +1550,28 @@ enum Fetcher {
             guard let usage = parseModelUsage(data) else {
                 completion(nil, nil, false, "missing or invalid model usage fields"); return
             }
-            let daily = Self.dailyBuckets(from: data, windowStart: from, now: Date())
+            let daily: (buckets: [GLMDayBucket]?, parseFailed: Bool) = parseDaily
+                ? Self.dailyBuckets(from: data, windowStart: from, now: Date())
+                : (nil, false)
             guard includeLocal && externalKey?.isEmpty != false else {
                 completion(usage, daily.buckets, daily.parseFailed, nil)
                 return
             }
-            do {
-                let startPlan = try GLMStartPlanUsage.load(from: from, to: to)
-                completion(startPlan.merging(usage, from: from, to: to),
-                           daily.buckets.map { startPlan.merging($0) }, daily.parseFailed, nil)
-            } catch {
+            let startPlan: GLMStartPlanUsage.Snapshot?
+            if let preloadedLocal {
+                startPlan = preloadedLocal()
+            } else {
+                startPlan = try? GLMStartPlanUsage.load(from: from, to: to)
+            }
+            guard let startPlan else {
                 // 本地赠送用量库读失败（如 ZCode 正活跃写入、busy 超时）：服务端统计本身有效，
                 // 降级为未合并的服务端数据继续展示，不再整体丢弃本次成功响应回退旧值。
                 completion(usage, daily.buckets, daily.parseFailed, nil)
+                return
             }
+            completion(startPlan.merging(usage, from: from, to: to),
+                       parseDaily ? daily.buckets.map { startPlan.merging($0) } : nil,
+                       daily.parseFailed, nil)
         }
     }
 
@@ -1547,7 +1655,7 @@ enum Fetcher {
         guard let req = resetRequest("/api/v1/coding-plan/reset/status", jwt: jwt, maas: maas) else {
             completion(ResetCardsResult(fiveHourError: "bad url", weekError: "bad url")); return
         }
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        session.dataTask(with: req) { data, resp, err in
             guard err == nil, let data = data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 let error = err?.localizedDescription ?? "bad response"
@@ -1602,7 +1710,7 @@ enum Fetcher {
                                             "reset_type": resetType.rawValue]) else {
             completion(ResetUseOutcome(used: false, error: "bad request", retryable: false)); return
         }
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        session.dataTask(with: req) { data, resp, err in
             if let err = err {
                 completion(ResetUseOutcome(used: false, error: err.localizedDescription, retryable: true)); return
             }
@@ -1637,6 +1745,7 @@ enum Fetcher {
     }
 
     /// 套餐订阅：取 status=="VALID" 的第一条；到期时间解析失败时仅降级显示名称
+    /// 注：现行沿用默认 Bearer 认证头（未透传 rawKey），待实网确认后再决定是否透传。
     static func fetchSubscription(apiKey: String,
                                   completion: @escaping (SubscriptionInfo?, String?) -> Void) {
         fetchRaw(apiKey: apiKey, path: "/api/biz/subscription/list") { data, err in
@@ -1699,7 +1808,7 @@ enum Fetcher {
     }
 
     private static func parseValidDates(_ valid: String) -> [Date] {
-        guard let re = try? NSRegularExpression(pattern: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#) else {
+        guard let re = validDateRegex else {
             return []
         }
         let ns = valid as NSString
@@ -1715,7 +1824,7 @@ enum Fetcher {
 // MARK: - 菜单栏堆叠两行文字渲染
 
 enum StackImage {
-    struct Line {
+    struct Line: Equatable {
         let badge: String
         let label: String
         let value: String
@@ -2024,6 +2133,8 @@ final class UpdateProgressController: NSObject {
         phase == .installing ? "应用将自动退出并重启，无需手动操作" : nil
     }
 
+    private static let progressPercentRegex = try? NSRegularExpression(pattern: #"([0-9]+(?:\.[0-9]+)?)%"#)
+
     private var timer: Timer?
     private var directory: URL?
 
@@ -2042,7 +2153,7 @@ final class UpdateProgressController: NSObject {
             export UPDATE_PROGRESS_FILE="$1/progress"
             /bin/bash "$1/update.sh" "$2" "$3" > "$1/log" 2>&1
             result=$?
-            printf '%s' "$result" > "$1/result"
+            printf '%s' "$result" > "$1/result.tmp" && /bin/mv "$1/result.tmp" "$1/result"
             if [ "$result" -ne 0 ] && /usr/bin/grep -q '4/5' "$1/log"; then
                 detail=$(/usr/bin/grep '!!' "$1/log" | /usr/bin/tail -1)
                 /usr/bin/osascript - "${detail:-更新未完成，请查看日志。}" "$1/log" <<'APPLESCRIPT' >/dev/null 2>&1
@@ -2082,21 +2193,31 @@ final class UpdateProgressController: NSObject {
         if changed { notify() }
     }
 
+    /// 从 update.sh 日志解析当前更新阶段（纯函数，--self-test 覆盖无 v 前缀 tag 与全阶段识别）。
+    static func phase(fromLog log: String) -> Phase? {
+        if log.contains("4/5") || log.contains("5/5") { return .installing }
+        if log.contains("3/5") { return .staging }
+        if log.contains("2/5") { return .verifying }
+        if log.contains("==> 下载 ") { return .downloading }
+        return nil
+    }
+
     private func refresh() {
         guard let dir = directory else { return }
         let log = (try? String(contentsOf: dir.appendingPathComponent("log"), encoding: .utf8)) ?? ""
-        if log.contains("4/5") || log.contains("5/5") { setPhase(.installing) }
-        else if log.contains("3/5") { setPhase(.staging) }
-        else if log.contains("2/5") { setPhase(.verifying) }
-        else if log.contains("下载 v") {
-            var value: Double?
-            if let text = try? String(contentsOf: dir.appendingPathComponent("progress"), encoding: .utf8),
-               let regex = try? NSRegularExpression(pattern: #"([0-9]+(?:\.[0-9]+)?)%"#),
-               let match = regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).last,
-               let range = Range(match.range(at: 1), in: text) {
-                value = Double(text[range])
+        if let detected = Self.phase(fromLog: log) {
+            if detected == .downloading {
+                var value: Double?
+                if let text = try? String(contentsOf: dir.appendingPathComponent("progress"), encoding: .utf8),
+                   let regex = Self.progressPercentRegex,
+                   let match = regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).last,
+                   let range = Range(match.range(at: 1), in: text) {
+                    value = Double(text[range])
+                }
+                setPhase(.downloading, fraction: value)   // 百分比尚未写出时保留旧值
+            } else {
+                setPhase(detected)
             }
-            setPhase(.downloading, fraction: value)   // 百分比尚未写出时保留旧值
         }
         if let result = try? String(contentsOf: dir.appendingPathComponent("result"), encoding: .utf8) {
             if result != "0" {
@@ -2279,6 +2400,13 @@ enum UpdateCheck {
 /// 状态只在主线程读写（回调统一 dispatch 回主线程），无需加锁。
 final class UpdateChecker {
     static let shared = UpdateChecker()
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 25
+        return URLSession(configuration: config)
+    }()
     private(set) var available = false
     private(set) var targetTag: String?
     private(set) var releaseNotes = ""
@@ -2304,7 +2432,7 @@ final class UpdateChecker {
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("GlmUsage/1.0 (menubar; update check)", forHTTPHeaderField: "User-Agent")
         if let etag = etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+        Self.session.dataTask(with: req) { [weak self] data, resp, err in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.inFlight = false
@@ -3104,11 +3232,21 @@ private final class GLMStubDraggingInfo: NSObject, NSDraggingInfo {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    private struct BarRenderKey: Equatable {
+        let line1: StackImage.Line
+        let line2: StackImage.Line
+        let dark: Bool
+        let toolTip: String
+    }
+
     private var statusItem: NSStatusItem!
     // 状态栏底色随全屏进出/深浅模式翻转时，KVO 触发按新外观重画（否则浅色栏上残留白色余量文字）；
     // setImage 也会再次触发 KVO 通知，用明暗主题快照去重防止 renderBar↔KVO 反馈循环
     private var statusItemAppearanceObs: NSKeyValueObservation?
     private var barThemeDark: Bool?
+    private var lastBarRenderKey: BarRenderKey?
+    private var wakeObserver: NSObjectProtocol?
+    private var wakeRefreshWorkItem: DispatchWorkItem?
     // 菜单栏可因深色壁纸、双屏或全屏而与 App 外观合法地不同，不能用 App 外观覆盖菜单栏。
     // 2026-11-21 起 App 级 effectiveAppearance KVO 取代 5s 轮询 timer：系统深浅色两个方向
     // 切换都会触发同一套对账路径 reconcileBarAppearance，不一致时仅重建不缓存的动态颜色图片，
@@ -3484,6 +3622,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // 显式容差让系统合并定时器唤醒（Apple 节能指南建议 ≥间隔 10%；10s → 3s）
         timer?.tolerance = 3
+        // 休眠唤醒补偿刷新：取消未触发的旧任务，延迟 2.5s 等网络恢复后触发全量刷新
+        // （走既有 RefreshGate 去重，不强置 manualRefreshInFlight）
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.scheduleWakeRefresh()
+        }
         // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 30 分钟；
         // 打开菜单也会触发一次（同一 interval 节流，不增加请求频率）
         updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateCheck.interval, repeats: true) { [weak self] _ in
@@ -3493,9 +3638,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.checkForUpdate() }
     }
 
-    // 退出前等 status.json 待写快照排空：同步写盘时代「最后一次状态落盘」的行为保持不变
-    // （有界等待，写盘卡住最多 2s，不拖死退出）
+    private func scheduleWakeRefresh() {
+        wakeRefreshWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.wakeRefreshWorkItem = nil
+            self.refresh(tokens: true)
+        }
+        wakeRefreshWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
+    }
+
+    // 退出前清理定时器、观察者与唤醒延迟任务，并等 status.json 待写快照排空：
+    // 同步写盘时代「最后一次状态落盘」的行为保持不变（有界等待，写盘卡住最多 2s，不拖死退出）
     func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate(); timer = nil
+        updateTimer?.invalidate(); updateTimer = nil
+        statusItemAppearanceObs = nil
+        appAppearanceObs = nil
+        wakeRefreshWorkItem?.cancel()
+        wakeRefreshWorkItem = nil
+        if let observer = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            wakeObserver = nil
+        }
+        if let observer = backgroundObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            backgroundObserver = nil
+        }
+        if let observer = updateProgressObserver {
+            NotificationCenter.default.removeObserver(observer)
+            updateProgressObserver = nil
+        }
         _ = statusWriter.waitForIdle(timeout: 2)
     }
 
@@ -3634,10 +3808,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 (1, now.addingTimeInterval(-7 * 86400), now),
                 (2, now.addingTimeInterval(-30 * 86400), now)
             ]
+            // Start Plan 本机赠送用量：单次读取 30 天窗口快照，三个周期网络回调复用合并，
+            // 避免每轮慢刷新重复扫 3 次 SQLite；读失败时传 nil 降级为服务端统计。
+            let externalKey = ProcessInfo.processInfo.environment[CredStore.envKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let shouldIncludeLocal = !savedConnection && externalKey?.isEmpty != false
+            let localLoadGroup = DispatchGroup()
+            var preloadedStartPlan: GLMStartPlanUsage.Snapshot?
+            if shouldIncludeLocal {
+                let thirtyStart = windows[2].from
+                localLoadGroup.enter()
+                DispatchQueue.global().async {
+                    preloadedStartPlan = try? GLMStartPlanUsage.load(from: thirtyStart, to: now)
+                    localLoadGroup.leave()
+                }
+            }
+            let localProvider: (() -> GLMStartPlanUsage.Snapshot?)? = shouldIncludeLocal ? {
+                localLoadGroup.wait()
+                return preloadedStartPlan
+            } : nil
             let wg = DispatchGroup()
             for w in windows {
                 wg.enter()
-                Fetcher.fetchModelUsage(apiKey: key, from: w.from, to: w.to, includeLocal: !savedConnection, rawKey: savedConnection) { r, daily, dailyFailed, err in
+                Fetcher.fetchModelUsage(apiKey: key, from: w.from, to: w.to, includeLocal: !savedConnection,
+                                        rawKey: savedConnection, parseDaily: w.label == 2,
+                                        preloadedLocal: localProvider) { r, daily, dailyFailed, err in
                     accumulator.update { current in
                         switch w.label {
                         case 0:
@@ -3840,7 +4035,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let appDark = isDark(NSApp.effectiveAppearance)
         let buttonDark = isDark(button.effectiveAppearance)
         if buttonDark != appDark {
-            renderBar()
+            renderBar(force: true)
         } else {
             renderBarIfThemeChanged()
         }
@@ -3870,7 +4065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         renderBar()
     }
 
-    private func renderBar() {
+    private func renderBar(force: Bool = false) {
         let peak = Peak.evaluate()
         let fiveRemaining = usage.fiveHour?.usedRemainingRatio
         let weekRemaining = usage.week?.usedRemainingRatio
@@ -3881,19 +4076,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let line2 = StackImage.Line(badge: marks2.joined(), label: "7D",
                                     value: Fmt.pct(weekRemaining), remaining: weekRemaining)
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
-        barThemeDark = isDark(appearance)
-        statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
-        statusItem.button?.title = ""
+        let dark = isDark(appearance)
+        barThemeDark = dark
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
-        statusItem.button?.toolTip = "GLM 余额 · 5H最后成功 \(Fmt.lastOK(fiveHourLastOK))"
+        var toolTip = "GLM 余额 · 5H最后成功 \(Fmt.lastOK(fiveHourLastOK))"
             + " · 7D最后成功 \(Fmt.lastOK(weekLastOK))"
             + " · 今日Token最后成功 \(Fmt.lastOK(tokensTodayLastOK))"
             + " · 7天Token最后成功 \(Fmt.lastOK(tokens7dLastOK))"
             + " · 30天Token最后成功 \(Fmt.lastOK(tokens30dLastOK))"
             + " · MCP最后成功 \(Fmt.lastOK(toolsLastOK))"
         if UpdateProgressController.shared.isActive {
-            statusItem.button?.toolTip = (statusItem.button?.toolTip ?? "")
-                + " · \(UpdateProgressController.shared.statusLine)"
+            toolTip += " · \(UpdateProgressController.shared.statusLine)"
+        }
+        let renderKey = BarRenderKey(line1: line1, line2: line2, dark: dark, toolTip: toolTip)
+        if force || statusItem.button?.image == nil || renderKey != lastBarRenderKey {
+            statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
+            statusItem.button?.title = ""
+            statusItem.button?.toolTip = toolTip
+            lastBarRenderKey = renderKey
         }
         writeStatus(line1: (marks1.isEmpty ? "" : marks1.joined() + " ") + "\(line1.label) \(line1.value)",
                     line2: (marks2.isEmpty ? "" : marks2.joined() + " ") + "\(line2.label) \(line2.value)",
@@ -4195,7 +4395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if panelConfigured, updateConfirmation != nil { return }
         if !panelConfigured { buildPanel(); return }
         guard panelDisplayed else {
-            panelDirty = currentPanelSnapshot() != lastPanelSnapshot
+            panelDirty = true
             return
         }
         let snapshot = currentPanelSnapshot()
@@ -4238,7 +4438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 横幅语义与首次配置仍走 rebuildPanel 的既有守卫。
         if panelConfigured && updateConfirmation == nil {
             let snapshot = currentPanelSnapshot()
-            if panelDirty || snapshot != lastPanelSnapshot { buildPanel() }
+            if snapshot != lastPanelSnapshot { buildPanel(with: snapshot) }
             panelDirty = false
         } else {
             rebuildPanel()
@@ -6855,10 +7055,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .alertFirstButtonReturn:
             recordExplicitLoginChoice()
             applyLoginPreference(turningOn: turningOn)
+            let execName = ((Bundle.main.executablePath ?? "") as NSString).lastPathComponent
+            let procName = execName.isEmpty
+                ? GLMLaunchAgent.processName(forAppPath: Bundle.main.bundlePath)
+                : execName
             let spawned = GLMLaunchAgent.spawnExitHelper(
                 direction: turningOn ? .bootstrap : .bootoutThenOpen,
                 waitingPID: ProcessInfo.processInfo.processIdentifier,
-                appPath: Bundle.main.bundlePath)
+                appPath: Bundle.main.bundlePath,
+                processName: procName)
             guard spawned else {
                 setUpdateMessage("无法安排受控重启，已仅保存偏好（下次登录生效）", dismissAfter: 6)
                 return
@@ -7246,7 +7451,8 @@ func onceMode() {
     for (label, from) in [("today", dayStart), ("7d", now.addingTimeInterval(-7 * 86400)),
                           ("30d", now.addingTimeInterval(-30 * 86400))] {
         group.enter()
-        Fetcher.fetchModelUsage(apiKey: key, from: from, to: now, includeLocal: !CredStore.isSavedKeyActive, rawKey: CredStore.isSavedKeyActive) { r, _, _, err in
+        Fetcher.fetchModelUsage(apiKey: key, from: from, to: now, includeLocal: !CredStore.isSavedKeyActive,
+                                rawKey: CredStore.isSavedKeyActive, parseDaily: false) { r, _, _, err in
             if let r = r {
                 acc.update { current in
                     switch label {
@@ -7733,7 +7939,7 @@ enum GLMOfflineRegression {
             try expect(boundarySeven?.requests == 2 && boundarySeven?.decodeSamples == 2
                        && boundarySeven?.decodeTps == 20 && boundarySeven?.avgTtftMs == 150,
                        "rolling 7-day window lost the previous day's tail")
-            // 11. 一次连接批量读三周期（生产 refreshLocalModelStats 路径）：与逐周期独立 load
+            // 11. 单次 SQL 扫描批量读三周期（生产 refreshLocalModelStats 路径）：与逐周期独立 load
             //     逐字节一致（同库同查询同累计，口径红线）
             let batchedStats = try GLMLocalModelStats.loadAll(now: now, databasePath: statsPath, calendar: calendar)
             let thirtyStats = try GLMLocalModelStats.load(from: now.addingTimeInterval(-30 * 86_400), to: now,
@@ -7741,6 +7947,52 @@ enum GLMOfflineRegression {
             try expect(batchedStats.count == 3 && batchedStats[.today] == todayStats
                        && batchedStats[.sevenDays] == sevenStats && batchedStats[.thirtyDays] == thirtyStats,
                        "single-connection batched stats must match per-period loads byte for byte")
+            // 11b. 跨周期大小写首现不同 + 边界时间戳精确匹配（独立 fixture，证明三累加器互不污染 order/displayName）
+            let multiPeriodPath = root.appendingPathComponent("local-stats-multi-period.sqlite").path
+            var multiPeriodDB: OpaquePointer?
+            try expect(sqlite3_open(multiPeriodPath, &multiPeriodDB) == SQLITE_OK, "cannot create multi-period stats fixture")
+            defer { sqlite3_close(multiPeriodDB) }
+            try expect(sqlite3_exec(multiPeriodDB, """
+                CREATE TABLE model_usage (id INTEGER PRIMARY KEY, started_at INTEGER, model_id TEXT, status TEXT,
+                    cancelled_by_user INTEGER, output_tokens INTEGER, first_token_at INTEGER, completed_at INTEGER,
+                    time_to_first_token_ms INTEGER, input_tokens INTEGER,
+                    cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER);
+                """, nil, nil, nil) == SQLITE_OK, "cannot create multi-period stats table")
+            func insertMulti(_ id: Int, _ startedAt: Date, _ model: String, _ output: Int, _ input: Int) throws {
+                let ts = Int64(startedAt.timeIntervalSince1970 * 1000)
+                let sql = """
+                    INSERT INTO model_usage VALUES (\(id), \(ts), '\(model)', 'completed', 0, \(output),
+                        \(ts), \(ts + 1000), 500, \(input), \(input / 2), 0);
+                    """
+                try expect(sqlite3_exec(multiPeriodDB, sql, nil, nil, nil) == SQLITE_OK, "cannot insert multi-period row \(id)")
+            }
+            let sevenStartDay = calendar.startOfDay(for: GLMLocalModelStats.Period.sevenDays.windowStart(now: now, calendar: calendar))
+            let thirtyStartDay = calendar.startOfDay(for: GLMLocalModelStats.Period.thirtyDays.windowStart(now: now, calendar: calendar))
+            // 30d 边界外（-1ms）与边界整点（首现 lowercase "glm-5"）
+            try insertMulti(1, thirtyStartDay.addingTimeInterval(-0.001), "out-of-window", 50, 100)
+            try insertMulti(2, thirtyStartDay, "glm-5", 100, 200)
+            // 7d 边界外（-1ms，仅进 30d）与边界整点（7d 首现 Title Case "Glm-5"）
+            try insertMulti(3, sevenStartDay.addingTimeInterval(-0.001), "edge-30d-only", 60, 120)
+            try insertMulti(4, sevenStartDay, "Glm-5", 200, 400)
+            // today 边界外（-1ms，进 7d/30d）与边界整点（today 首现 UPPER "GLM-5"）
+            try insertMulti(5, todayStart.addingTimeInterval(-0.001), "edge-7d-only", 70, 140)
+            try insertMulti(6, todayStart, "GLM-5", 300, 600)
+            let multiBatch = try GLMLocalModelStats.loadAll(now: now, databasePath: multiPeriodPath, calendar: calendar)
+            let multiToday = try GLMLocalModelStats.load(from: GLMLocalModelStats.Period.today.windowStart(now: now, calendar: calendar), to: now, databasePath: multiPeriodPath, calendar: calendar)
+            let multiSeven = try GLMLocalModelStats.load(from: GLMLocalModelStats.Period.sevenDays.windowStart(now: now, calendar: calendar), to: now, databasePath: multiPeriodPath, calendar: calendar)
+            let multiThirty = try GLMLocalModelStats.load(from: GLMLocalModelStats.Period.thirtyDays.windowStart(now: now, calendar: calendar), to: now, databasePath: multiPeriodPath, calendar: calendar)
+            try expect(multiBatch[.today] == multiToday
+                       && multiBatch[.sevenDays] == multiSeven
+                       && multiBatch[.thirtyDays] == multiThirty,
+                       "single-scan loadAll diverged from independent load on cross-period case/boundary fixture")
+            try expect(multiBatch[.thirtyDays]?.rows.first(where: { $0.name.lowercased() == "glm-5" })?.name == "glm-5"
+                       && multiBatch[.sevenDays]?.rows.first(where: { $0.name.lowercased() == "glm-5" })?.name == "Glm-5"
+                       && multiBatch[.today]?.rows.first(where: { $0.name.lowercased() == "glm-5" })?.name == "GLM-5",
+                       "each period must preserve its own first-seen model displayName casing")
+            try expect(multiBatch[.thirtyDays]?.rows.contains(where: { $0.name == "out-of-window" }) == false
+                       && multiBatch[.sevenDays]?.rows.contains(where: { $0.name == "edge-30d-only" }) == false
+                       && multiBatch[.today]?.rows.contains(where: { $0.name == "edge-7d-only" }) == false,
+                       "period lower-bound timestamps leaked across windows")
             // 8c. 全部模型无缓存活动 → 整体行命中率也为 nil（独立 fixture 库）
             let overallNilPath = root.appendingPathComponent("local-stats-overall-nil.sqlite").path
             var overallNilDB: OpaquePointer?
@@ -8766,13 +9018,95 @@ enum GLMOfflineRegression {
             try expect(offScript.contains("launchctl bootout") && offScript.contains("open -n \"$app\"")
                        && !offScript.contains("bootstrap") && offScript.contains("gui/$(id -u)/$label"),
                        "OFF 方向 helper 缺 bootout 或拉回")
-            // plist 定义与历史版本/update.sh 恢复分支同款：RunAtLoad + KeepAlive 仅非正常退出复活
-            let fixturePlist = GLMLaunchAgent.plistContent(executablePath: "/tmp/fixture/GlmUsage.app/Contents/MacOS/GlmUsage")
-            try expect(fixturePlist.contains("<key>Label</key><string>com.local.glm-usage</string>")
-                       && fixturePlist.contains("<key>RunAtLoad</key><true/>")
-                       && fixturePlist.contains("<key>SuccessfulExit</key><false/>")
-                       && fixturePlist.contains("/tmp/fixture/GlmUsage.app/Contents/MacOS/GlmUsage"),
+            // plist 定义与历史版本/update.sh 恢复分支同款：RunAtLoad + KeepAlive 仅非正常退出复活；
+            // 使用 PropertyListSerialization 结构化生成，路径含 XML 特殊字符亦必须合法可解析。
+            let standardExec = "/tmp/fixture/GlmUsage.app/Contents/MacOS/GlmUsage"
+            let fixturePlist = GLMLaunchAgent.plistContent(executablePath: standardExec)
+            let parsedFixture = try PropertyListSerialization.propertyList(
+                from: Data(fixturePlist.utf8), options: [], format: nil) as? [String: Any]
+            let fixtureKeepAlive = parsedFixture?["KeepAlive"] as? [String: Any]
+            try expect(parsedFixture?["Label"] as? String == GLMLaunchAgent.label
+                       && (parsedFixture?["ProgramArguments"] as? [String]) == [standardExec]
+                       && (parsedFixture?["RunAtLoad"] as? Bool) == true
+                       && (fixtureKeepAlive?["SuccessfulExit"] as? Bool) == false
+                       && fixturePlist.contains("<true/>") && fixturePlist.contains("<false/>"),
                        "LaunchAgent plist 定义漂移")
+            let specialExec = "/tmp/Apps & <Test>/\"Glm\"'s/GlmUsage.app/Contents/MacOS/GlmUsage"
+            let specialPlist = GLMLaunchAgent.plistContent(executablePath: specialExec)
+            let parsedSpecial = try PropertyListSerialization.propertyList(
+                from: Data(specialPlist.utf8), options: [], format: nil) as? [String: Any]
+            try expect((parsedSpecial?["ProgramArguments"] as? [String]) == [specialExec]
+                       && specialPlist.contains("&amp;") && specialPlist.contains("&lt;") && specialPlist.contains("&gt;"),
+                       "LaunchAgent plist 未正确转义路径中的 XML 特殊字符")
+            let specialPlistURL = root.appendingPathComponent("special-agent.plist")
+            try specialPlist.write(to: specialPlistURL, atomically: true, encoding: .utf8)
+            let lintProc = Process()
+            lintProc.executableURL = URL(fileURLWithPath: "/usr/bin/plutil")
+            lintProc.arguments = ["-lint", specialPlistURL.path]
+            lintProc.standardOutput = FileHandle.nullDevice
+            lintProc.standardError = FileHandle.nullDevice
+            try lintProc.run()
+            lintProc.waitUntilExit()
+            try expect(lintProc.terminationStatus == 0, "含特殊字符路径的 LaunchAgent plist 未通过 plutil -lint")
+            // helper 参数构造：传入 /Applications/GlmUsage.app 时 $6（pgrep -x 进程名）必须为 GlmUsage 而非 GlmUsage.app
+            try expect(GLMLaunchAgent.processName(forAppPath: "/Applications/GlmUsage.app") == "GlmUsage"
+                       && GLMLaunchAgent.processName(forAppPath: "/Applications/GlmUsage.app/Contents/MacOS/GlmUsage") == "GlmUsage",
+                       "processName(forAppPath:) 未正确剥离 .app 后缀")
+            let helperArgsDefault = GLMLaunchAgent.helperArguments(
+                direction: .bootstrap, waitingPID: 12345, appPath: "/Applications/GlmUsage.app",
+                plistPath: "/tmp/p.plist", resultLogPath: "/tmp/r.log", maxPolls: 50)
+            try expect(helperArgsDefault.count == 10
+                       && helperArgsDefault[3] == "12345"
+                       && helperArgsDefault[5] == "/Applications/GlmUsage.app"
+                       && helperArgsDefault[7] == GLMLaunchAgent.label
+                       && helperArgsDefault[8] == "GlmUsage"
+                       && helperArgsDefault[9] == "50",
+                       "helperArguments 传入 .app 路径时 $6 必须为真实进程名 GlmUsage")
+            let helperArgsExplicit = GLMLaunchAgent.helperArguments(
+                direction: .bootoutThenOpen, waitingPID: 54321, appPath: "/Applications/GlmUsage.app",
+                processName: "GlmUsage", plistPath: "/tmp/p.plist", resultLogPath: "/tmp/r.log", maxPolls: 25)
+            try expect(helperArgsExplicit[8] == "GlmUsage" && helperArgsExplicit[9] == "25",
+                       "helperArguments 显式进程名与轮询上限未透传")
+            // 并发锁自测：GLMKeychainLock 互斥无死锁 + CredStore.savedKey 并发读写无竞争（先用假值占位，绝不触碰真实 Keychain）
+            var activeKeychainSections = 0
+            var keychainOverlapDetected = false
+            DispatchQueue.concurrentPerform(iterations: 16) { idx in
+                GLMKeychainLock.withUserInteractionAllowed(interactive: idx % 2 == 0) {
+                    activeKeychainSections += 1
+                    if activeKeychainSections > 1 { keychainOverlapDetected = true }
+                    Thread.sleep(forTimeInterval: 0.001)
+                    activeKeychainSections -= 1
+                }
+            }
+            try expect(!keychainOverlapDetected && activeKeychainSections == 0,
+                       "GLMKeychainLock must serialize concurrent interactive/non-interactive sections")
+            do {
+                defer { CredStore.resetSavedKeyCacheForTesting() }
+                CredStore.useSavedKey("fixture-concurrent-key-0")
+                var concurrentNeedsUnlockSeen = false
+                let unlockFlagLock = NSLock()
+                DispatchQueue.concurrentPerform(iterations: 32) { idx in
+                    if idx % 2 == 0 {
+                        CredStore.useSavedKey("fixture-concurrent-key-\(idx)")
+                    } else {
+                        _ = CredStore.isSavedKeyActive
+                        if CredStore.savedKeyNeedsUnlock {
+                            unlockFlagLock.lock(); concurrentNeedsUnlockSeen = true; unlockFlagLock.unlock()
+                        }
+                    }
+                }
+                try expect(!concurrentNeedsUnlockSeen, "CredStore.savedKey concurrent access corrupted state")
+            }
+            // UpdateProgressController 阶段识别：覆盖无 v 前缀 tag 下载行与 2/5..5/5 全阶段
+            try expect(UpdateProgressController.phase(fromLog: "") == nil
+                       && UpdateProgressController.phase(fromLog: "==> 1/5 查找并下载最新可安装 Release\n") == nil
+                       && UpdateProgressController.phase(fromLog: "==> 1/5 查找\n==> 下载 1.2.3（https://example.invalid/GlmUsage.zip）\n") == .downloading
+                       && UpdateProgressController.phase(fromLog: "==> 下载 v2.0.0（https://example.invalid/GlmUsage.zip）\n") == .downloading
+                       && UpdateProgressController.phase(fromLog: "==> 下载 1.2.3\n==> 2/5 校验发布包\n") == .verifying
+                       && UpdateProgressController.phase(fromLog: "==> 2/5\n==> 3/5 在安装位置旁暂存新版本\n") == .staging
+                       && UpdateProgressController.phase(fromLog: "==> 3/5\n==> 4/5 停止并切换版本\n") == .installing
+                       && UpdateProgressController.phase(fromLog: "==> 5/5 启动并检查新版本\n") == .installing,
+                       "UpdateProgressController phase detection broke for unprefixed tags or stages")
             // helper 失败回执：已知标签映射提示、未知内容静默清除、消费即删除
             let receiptPath = root.appendingPathComponent("launch-helper-receipt").path
             try "bootstrap-failed\t2026-11-21 10:00:00\n".write(toFile: receiptPath, atomically: true, encoding: .utf8)
