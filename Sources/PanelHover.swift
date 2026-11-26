@@ -60,6 +60,34 @@ func panelHoverClickOutcome(isShown: Bool, presentedByHover: Bool) -> PanelHover
     return presentedByHover ? .pin : .close
 }
 
+/// 触发反馈重展的上下文：同步模态交互返回 vs 异步网络回调。
+enum PanelFeedbackTrigger: Equatable {
+    case modalReturn    // NSAlert / 钥匙串授权弹窗同步返回：用户刚与本应用交互，允许激活并重展
+    case asyncCallback  // 异步网络回调完成：仅在本应用仍活跃时重展，用户已切走时不抢焦点打断
+}
+
+/// 连接设置 / 凭据解锁等交互结束后，恢复面板展示以呈现底部反馈的纯判定（--self-test 覆盖）。
+enum PanelFeedbackPresentationAction: Equatable {
+    case none    // preview 模式、或面板已常开、或异步回调时用户已切去其他应用（不抢焦点打断）
+    case pin     // 面板当前由 hover 打开：转常开并取消待执行收起，防止反馈被自动收走
+    case reopen  // 面板已关闭且允许恢复展示：以常开态重新展开
+}
+
+func panelFeedbackPresentationAction(
+    isPreview: Bool,
+    isShown: Bool,
+    presentedByHover: Bool,
+    trigger: PanelFeedbackTrigger,
+    appIsActive: Bool
+) -> PanelFeedbackPresentationAction {
+    guard !isPreview else { return .none }
+    if isShown { return presentedByHover ? .pin : .none }
+    switch trigger {
+    case .modalReturn: return .reopen
+    case .asyncCallback: return appIsActive ? .reopen : .none
+    }
+}
+
 /// 延迟转换簿记：新转换顶替旧转换；定时器凭 token 生效，陈旧/被顶替/已取消的触发被丢弃。
 struct PanelHoverIntent: Equatable {
     enum Transition: Equatable { case show, hide }
@@ -157,6 +185,8 @@ final class PanelHoverController {
 
     private(set) var isEnabled = false
     private var intent = PanelHoverIntent()
+    /// 仅离线自测观察当前挂起的延迟转换，避免依赖真实时钟产生假阳性。
+    var pendingTransitionForTesting: PanelHoverIntent.Transition? { intent.pending }
     private var pendingWork: DispatchWorkItem?
     private var iconTracking: PanelHoverTracking?
     private var panelTracking: PanelHoverTracking?

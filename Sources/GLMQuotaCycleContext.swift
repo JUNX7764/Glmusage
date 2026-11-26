@@ -20,6 +20,14 @@ struct GLMQuotaHistoryContext: Equatable {
         let digest = SHA256.hash(data: material).map { String(format: "%02x", $0) }.joined()
         return Self(mode: .oauth, partition: digest)
     }
+    /// ZCode 4.0 `oauth:linked_bigmodel` 关联账号的独立持久化分区：
+    /// 身份材料为 `customerId`，与直连 `oauth:bigmodel:user_info.id` 及 `apiKey` 域彻底隔离，
+    /// 避免不同 ID 空间偶发重合导致跨源历史混用；缺失时退回 `.oauth` 会话历史。
+    static func oauthLinked(customerId: String) -> Self {
+        let material = Data(("glm-quota-cycle-v1|open.bigmodel.cn|oauth-linked|" + customerId).utf8)
+        let digest = SHA256.hash(data: material).map { String(format: "%02x", $0) }.joined()
+        return Self(mode: .oauth, partition: digest)
+    }
     func mayAttributeReset(planCredential: String, resetCredential: String) -> Bool {
         mode == .oauth && !planCredential.isEmpty && planCredential == resetCredential
     }
