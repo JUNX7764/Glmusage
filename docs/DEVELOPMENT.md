@@ -28,7 +28,7 @@
 
 ## 原理与数据边界
 
-- **凭据**：优先使用 `GLM_API_KEY`，其次使用用户在 GlmUsage 面板中连接的套餐 API Key，最后回退到 ZCode `~/.zcode/v2/credentials.json` 中支持的凭据。`enc:v1` 可使用 `ZCODE_CREDENTIAL_SECRET` 参与密钥派生；`enc:v2:os` 依赖系统钥匙串授权，`enc:v2:env` 不支持。用户主动连接时先查询额度验证，成功后存入 GlmUsage 的 macOS 钥匙串条目。重置卡使用 ZCode 双 token；可读取已授权的 `enc:v2:os` 登录态。API Key 与 OAuth token 不写入仓库、日志或诊断状态。
+- **凭据**：优先使用 `GLM_API_KEY`，其次使用用户在 GlmUsage 面板中连接的套餐 API Key，最后回退到 ZCode `~/.zcode/v2/credentials.json` 中支持的凭据（按 `coding-plan` API Key > `oauth:bigmodel:access_token` > `oauth:linked_bigmodel` 顺序，高优先级存在但不可用时绝不静默降级）。`enc:v1` 可使用 `ZCODE_CREDENTIAL_SECRET` 参与密钥派生；`enc:v2:os` 依赖系统钥匙串授权，`enc:v2:env` 不支持。`oauth:linked_bigmodel`（ZCode 4.0 `zai_cn` 关联 BigModel）解密后解析 `accessToken` 与可选 `customerId`（用于周额度历史账号域隔离，不写日志或 `status.json`，也不从 `oauth:zai_cn:user_info` 误读邮箱）。用户主动连接时先查询额度验证，成功后存入 GlmUsage 的 macOS 钥匙串条目；模态连接/解锁弹窗结束后若面板已关闭会自动重展并保持常开，确保底部结果提示可见。重置卡使用 ZCode 双 token（`zcodejwttoken` 与 BigModel `access_token` / 回退 `oauth:linked_bigmodel` 的 `accessToken`）；可读取已授权的 `enc:v2:os` 登录态。API Key 与 OAuth token 不写入仓库、日志或诊断状态。
 - **连接入口**：底部不再显示「套餐设置」，顶部「GLM 用量」是无边框、可键盘访问的连接设置入口，悬停提供提示。已知凭据缺失/格式不支持、HTTP 401/403 或钥匙串未授权时显示「修复连接」；锁定优先解锁对应来源，其他凭据问题进入备用设置，HTTP 5xx/超时继续自动重试而不引导填 Key。启动不再在1.5秒后主动调用交互式解锁；启动与定时刷新仅non-interactive读取，系统授权仅由用户显式点击触发，既有已保存来源不自动删除或切换。
 - **额度与用量**：通过智谱监控接口查询 5 小时、7 天额度、模型 Token / 调用数和 MCP 工具次数。
 - **额度周期回顾**：只采集独立额度刷新通道中无警告、带有效 reset 的新鲜周额度；周期、证据、连接分区和存储边界见 `docs/project/17-quota-cycle-history.md`。
@@ -118,6 +118,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `PanelCustomization.swift` | 面板卡片布局模型（`GLMPanelLayout`）与卡片设置视图（`GLMCardSettingsView`） |
 | `Sources/GLMQuotaCycle*.swift` | 周额度历史的模型、上下文、存储、协调器与原生视图 |
 | `Sources/GLMLaunchAgent.swift` | 开机自启开关的决策矩阵、只读探测、受控重启 helper 与失败回执 |
+| `Sources/GLMLinkedBigModel.swift` | ZCode 4.0 `oauth:linked_bigmodel` JSON 负载的纯函数解析 |
 | `Sources/GLMPanelVisuals.swift`、`Sources/GLMAnimatedTokenValue.swift`、`Sources/GLMDeltaChip.swift` | 绘图几何、每日 Token 数值过渡和比较值胶囊 |
 | `tests/ui_refinements_test.py` | 独立 Swift 视觉几何、数值过渡、胶囊和图标离线夹具 |
 | `tests/quota_cycle_history_test.py` | 假数据与临时目录中的周额度历史测试 |

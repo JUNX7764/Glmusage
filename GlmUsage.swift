@@ -221,12 +221,15 @@ enum CredStore {
         let key: String?
         let error: String
         let mode: GLMQuotaHistoryContext.Mode?
-        // OAuth 回退模式下可证明的同源账号 id（user_info 顶层服务端 id）；nil = 退回会话历史
+        // OAuth 回退模式下可证明的同源账号 id（直连取 user_info.id，关联取 linked_bigmodel.customerId）；nil = 退回会话历史
         var oauthHistoryIdentity: String? = nil
+        // 区分直连 BigModel OAuth 与 ZCode 4.0 oauth:linked_bigmodel，保证两者历史分区域隔离
+        var isLinkedOAuth: Bool = false
         var context: GLMQuotaHistoryContext? {
             guard let key, let mode else { return nil }
             if mode == .apiKey { return .apiKey(key) }
-            return oauthHistoryIdentity.map { .oauth(userInfoId: $0) } ?? .oauth
+            guard let id = oauthHistoryIdentity else { return .oauth }
+            return isLinkedOAuth ? .oauthLinked(customerId: id) : .oauth(userInfoId: id)
         }
     }
     static func loadPlanCredential() -> (key: String?, error: String) {
@@ -245,11 +248,48 @@ enum CredStore {
         }
     }
     static func resolvePlanCredentialTyped(envValue: String? = nil, record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> TypedPlanCredential {
-        let result = resolvePlanCredential(envValue: envValue, record: record, secret: secret, systemKey: systemKey)
-        guard result.key != nil else { return .init(key: nil, error: result.error, mode: nil) }
-        let mode: GLMQuotaHistoryContext.Mode = (envValue?.trimmingCharacters(in: .whitespaces).isEmpty == false || preferredApiKey(record: record) != nil) ? .apiKey : .oauth
-        let identity = mode == .oauth ? oauthHistoryIdentity(record: record, secret: secret, systemKey: systemKey) : nil
-        return .init(key: result.key, error: result.error, mode: mode, oauthHistoryIdentity: identity)
+        if let value = envValue, !value.trimmingCharacters(in: .whitespaces).isEmpty {
+            return .init(key: value, error: "", mode: .apiKey)
+        }
+        // 优先级：preferredApiKey > oauth:bigmodel:access_token > oauth:linked_bigmodel。
+        // 严禁静默降级：高优先级候选存在（非空）且加密不可用/解密失败时必须直接报错，
+        // 绝不跳过它去读取低优先级或关联账号的凭据。
+        if let apiCandidate = preferredApiKey(record: record) {
+            if apiCandidate.hasPrefix("enc:v2:env:") { return .init(key: nil, error: newCredentialMessage, mode: nil) }
+            if let key = decrypt(apiCandidate, secret: secret, systemKey: systemKey), !key.isEmpty {
+                return .init(key: key, error: "", mode: .apiKey)
+            }
+            if apiCandidate.hasPrefix("enc:v2:") {
+                return .init(key: nil, error: v2FailureMessage(systemKey: systemKey), mode: nil)
+            }
+            return .init(key: nil, error: missingPlanMessage, mode: nil)
+        }
+        if let directOAuth = record["oauth:bigmodel:access_token"], !directOAuth.isEmpty {
+            if directOAuth.hasPrefix("enc:v2:env:") { return .init(key: nil, error: newCredentialMessage, mode: nil) }
+            if let key = decrypt(directOAuth, secret: secret, systemKey: systemKey), !key.isEmpty {
+                let identity = directOAuthHistoryIdentity(record: record, secret: secret, systemKey: systemKey)
+                return .init(key: key, error: "", mode: .oauth, oauthHistoryIdentity: identity)
+            }
+            if directOAuth.hasPrefix("enc:v2:") {
+                return .init(key: nil, error: v2FailureMessage(systemKey: systemKey), mode: nil)
+            }
+            return .init(key: nil, error: missingPlanMessage, mode: nil)
+        }
+        if let linkedOAuth = record[GLMLinkedBigModel.credentialKey], !linkedOAuth.isEmpty {
+            if linkedOAuth.hasPrefix("enc:v2:env:") { return .init(key: nil, error: newCredentialMessage, mode: nil) }
+            guard let plain = decrypt(linkedOAuth, secret: secret, systemKey: systemKey) else {
+                if linkedOAuth.hasPrefix("enc:v2:") {
+                    return .init(key: nil, error: v2FailureMessage(systemKey: systemKey), mode: nil)
+                }
+                return .init(key: nil, error: missingPlanMessage, mode: nil)
+            }
+            guard let payload = GLMLinkedBigModel.parse(plain) else {
+                return .init(key: nil, error: missingPlanMessage, mode: nil)
+            }
+            return .init(key: payload.accessToken, error: "", mode: .oauth,
+                         oauthHistoryIdentity: payload.customerId, isLinkedOAuth: true)
+        }
+        return .init(key: nil, error: missingPlanMessage, mode: nil)
     }
 
     private static func credentialRecord() -> [String: String]? {
@@ -258,16 +298,8 @@ enum CredStore {
     }
 
     static func resolvePlanCredential(envValue: String? = nil, record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> (key: String?, error: String) {
-        if let value = envValue, !value.trimmingCharacters(in: .whitespaces).isEmpty { return (value, "") }
-        // 纯 OAuth 登录时使用 access_token 作为监控接口的 Bearer 凭证。
-        let selected = preferredApiKey(record: record) ?? record["oauth:bigmodel:access_token"] ?? ""
-        if selected.hasPrefix("enc:v2:env:") { return (nil, newCredentialMessage) }
-        if let key = decrypt(selected, secret: secret, systemKey: systemKey), !key.isEmpty { return (key, "") }
-        if selected.hasPrefix("enc:v2:") {
-            // 首选候选不可静默降级到其他账号的凭据：区分「待授权」（可恢复）与「格式再升级」（不可恢复）
-            return (nil, v2FailureMessage(systemKey: systemKey))
-        }
-        return (nil, missingPlanMessage)
+        let result = resolvePlanCredentialTyped(envValue: envValue, record: record, secret: secret, systemKey: systemKey)
+        return (result.key, result.error)
     }
 
     static func preferredApiKey(record obj: [String: String]) -> String? {
@@ -294,13 +326,24 @@ enum CredStore {
 
     static func resolveResetCredential(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> (tokens: (jwt: String, maas: String)?, error: String) {
         let jwtValue = record["zcodejwttoken"] ?? ""
-        let maasValue = record["oauth:bigmodel:access_token"] ?? ""
-        if jwtValue.hasPrefix("enc:v2:env:") || maasValue.hasPrefix("enc:v2:env:") { return (nil, newCredentialMessage) }
-        guard let jwt = decrypt(jwtValue, secret: secret, systemKey: systemKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !jwt.isEmpty,
-              let maas = decrypt(maasValue, secret: secret, systemKey: systemKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !maas.isEmpty else {
-            if jwtValue.hasPrefix("enc:v2:") || maasValue.hasPrefix("enc:v2:") {
+        let directMaasValue = record["oauth:bigmodel:access_token"] ?? ""
+        // 仅当 oauth:bigmodel:access_token 缺失/为空时才回退 oauth:linked_bigmodel，禁止静默降级。
+        let useLinkedMaas = directMaasValue.isEmpty
+        let maasSourceValue = useLinkedMaas ? (record[GLMLinkedBigModel.credentialKey] ?? "") : directMaasValue
+        if jwtValue.hasPrefix("enc:v2:env:") || maasSourceValue.hasPrefix("enc:v2:env:") { return (nil, newCredentialMessage) }
+        let jwtDecrypted = decrypt(jwtValue, secret: secret, systemKey: systemKey)
+        let maasDecrypted = decrypt(maasSourceValue, secret: secret, systemKey: systemKey)
+        let jwt = jwtDecrypted?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let maas: String?
+        if useLinkedMaas {
+            maas = maasDecrypted.flatMap { GLMLinkedBigModel.parse($0)?.accessToken }
+        } else {
+            maas = maasDecrypted?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let jwt, !jwt.isEmpty, let maas, !maas.isEmpty else {
+            let jwtV2Failed = jwtDecrypted == nil && jwtValue.hasPrefix("enc:v2:")
+            let maasV2Failed = maasDecrypted == nil && maasSourceValue.hasPrefix("enc:v2:")
+            if jwtV2Failed || maasV2Failed {
                 return (nil, v2FailureMessage(systemKey: systemKey))
             }
             return (nil, "未找到或无法读取 ZCode 登录凭证")
@@ -363,11 +406,25 @@ enum CredStore {
     }
 
     /// OAuth 回退历史的同源身份证明：与邮箱展示同一套守卫哲学——
-    /// 存在任何 api-key 候选（key 无法证明与 user_info 同账号）、token 缺失/解密失败、
-    /// 或 user_info 无非空顶层服务端 id 时一律 nil（历史退回会话模式，不落盘）。
+    /// 存在任何 api-key 候选（key 无法证明与 user_info/linked_bigmodel 同账号）、token 缺失/解密失败、
+    /// 或缺少可证服务端账号 id 时一律 nil（历史退回会话模式，不落盘）。
+    /// - 直接 `oauth:bigmodel:access_token`：取 `oauth:bigmodel:user_info` 顶层 `id`；
+    /// - 仅当 `oauth:bigmodel:access_token` 缺失/为空时，才回退取 `oauth:linked_bigmodel` 内的 `customerId`。
     /// 返回值仅用于分区哈希：不写 status.json、不打日志、不进 JSON 内容。
     static func oauthHistoryIdentity(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> String? {
         guard preferredApiKey(record: record) == nil else { return nil }
+        if let directOAuth = record["oauth:bigmodel:access_token"], !directOAuth.isEmpty {
+            return directOAuthHistoryIdentity(record: record, secret: secret, systemKey: systemKey)
+        }
+        if let linkedOAuth = record[GLMLinkedBigModel.credentialKey], !linkedOAuth.isEmpty,
+           let plain = decrypt(linkedOAuth, secret: secret, systemKey: systemKey),
+           let payload = GLMLinkedBigModel.parse(plain) {
+            return payload.customerId
+        }
+        return nil
+    }
+
+    private static func directOAuthHistoryIdentity(record: [String: String], secret: String? = nil, systemKey: Data? = nil) -> String? {
         let parts = decryptZCodeOAuthRecord(record, secret: secret, systemKey: systemKey)
         guard let token = parts.token?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return nil }
         guard let jsonString = parts.userInfoJSON, !jsonString.isEmpty,
@@ -3347,6 +3404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         bindHistoryContext(nil)
         usage.subscription = nil; subscriptionLastOK = nil
         usage.level = nil; planLevelLastOK = nil
+        usage.accountEmail = nil; usage.accountEmailIsZCode = false
     }
     private func planCredentialMatches(_ key: String) -> Bool {
         guard let current = CredStore.loadApiKey() else { bindPlanCredential(nil); return false }
@@ -4453,11 +4511,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// 打开面板。hover 打开与点击打开共用全路径（打开即最新、门控去重的刷新与更新检查），
-    /// 仅来源标记与 panelPresentedByHover 语义不同。
-    private func openPanel(byHover: Bool) {
+    /// 仅来源标记与 panelPresentedByHover 语义不同；`refreshData=false` 用于模态弹窗返回后
+    /// 原位恢复面板展示反馈，避免触发额外网络刷新。
+    private func openPanel(byHover: Bool, refreshData: Bool = true) {
         panelPresentedByHover = byHover
         dailySelectedIndex = nil
-        if !preview { refresh(tokens: false); checkForUpdate() }
+        if !preview && refreshData { refresh(tokens: false); checkForUpdate() }
         // 打开即最新：dailySelectedIndex 重置与关闭期间的数据变化都在此刻落树。
         // 快照一致（含未选中日的干净状态）时沿用现树，秒开；脏（关闭期有变化）则先重建再显示。
         // 横幅语义与首次配置仍走 rebuildPanel 的既有守卫。
@@ -4477,6 +4536,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
         tracePopover(byHover ? "hover-open" : "open")
+    }
+
+    /// 模态连接设置 / 钥匙串授权弹窗会因 transient behavior 自动收起 popover；
+    /// 展示反馈提示后按触发上下文决定恢复策略：
+    /// - 同步模态返回（`.modalReturn`）：下一主队列 tick 激活应用并重展为常开面板，避免与
+    ///   `NSAlert` / `SecurityAgent` 退场竞争焦点导致 `.transient` popover 闪关或无法 Esc 关闭；
+    /// - 异步网络回调（`.asyncCallback`）：仅在应用仍活跃或面板已打开时展示/转常开，用户切走时不抢焦点打断。
+    private func presentPanelForFeedback(trigger: PanelFeedbackTrigger) {
+        switch panelFeedbackPresentationAction(
+            isPreview: preview,
+            isShown: popover.isShown,
+            presentedByHover: panelPresentedByHover,
+            trigger: trigger,
+            appIsActive: NSApp.isActive
+        ) {
+        case .none:
+            break
+        case .pin:
+            panelPresentedByHover = false
+            panelHoverController?.cancelPending()
+        case .reopen:
+            panelHoverController?.cancelPending()
+            if trigger == .modalReturn {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self, !self.preview, !self.popover.isShown else { return }
+                    self.panelHoverController?.cancelPending()
+                    NSApp.activate(ignoringOtherApps: true)
+                    self.openPanel(byHover: false, refreshData: false)
+                }
+            } else {
+                openPanel(byHover: false, refreshData: false)
+            }
+        }
     }
 
     /// 状态栏图标的屏幕矩形（悬停几何与点击判定的共用基准）。
@@ -7171,16 +7263,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let systemOK = systemLocked && CredStore.unlockZCodeKey()
         if savedOK || systemOK {
             setUpdateMessage("凭据已解锁，正在恢复自动读取", dismissAfter: 4)
+            presentPanelForFeedback(trigger: .modalReturn)
             refresh(tokens: true, manual: true)
         } else {
             setUpdateMessage("钥匙串解锁被拒绝，可重试或点击顶部「GLM 用量」打开连接设置", dismissAfter: 8)
+            presentPanelForFeedback(trigger: .modalReturn)
         }
     }
 
     @objc private func onConnectPlan() {
         guard !connectingPlan else { return }
         if !preview && ProcessInfo.processInfo.environment[CredStore.envKey]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
-            setUpdateMessage("当前由 GLM_API_KEY 指定套餐，请先移除该环境变量再连接", dismissAfter: 6); return
+            setUpdateMessage("当前由 GLM_API_KEY 指定套餐，请先移除该环境变量再连接", dismissAfter: 6)
+            presentPanelForFeedback(trigger: .modalReturn)
+            return
         }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -7211,6 +7307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             CredStore.forgetSavedKey()
             bindHistoryContext(nil)
             setUpdateMessage("已断开连接，改用 ZCode 凭据自动读取", dismissAfter: 5)
+            presentPanelForFeedback(trigger: .modalReturn)
             refresh(tokens: true, manual: true)
             return
         }
@@ -7222,21 +7319,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard response == .alertFirstButtonReturn else { return }
         let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         field.stringValue = ""
-        guard !key.isEmpty else { setUpdateMessage("请输入套餐 API Key", dismissAfter: 4); return }
+        guard !key.isEmpty else {
+            setUpdateMessage("请输入套餐 API Key", dismissAfter: 4)
+            presentPanelForFeedback(trigger: .modalReturn)
+            return
+        }
         guard !key.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0) }) else {
-            setUpdateMessage("请只粘贴套餐 API Key", dismissAfter: 4); return
+            setUpdateMessage("请只粘贴套餐 API Key", dismissAfter: 4)
+            presentPanelForFeedback(trigger: .modalReturn)
+            return
         }
         connectingPlan = true
         setUpdateMessage("正在验证套餐…")
+        presentPanelForFeedback(trigger: .modalReturn)
         Fetcher.fetchQuota(apiKey: key, rawKey: true) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.connectingPlan = false
                 switch GLMPlanConnection.commit(result, key: key, save: GLMPlanKeychain.save) {
                 case .invalid:
-                    self.setUpdateMessage("验证失败，请检查套餐 API Key 和网络后重试", dismissAfter: 8); return
+                    self.setUpdateMessage("验证失败，请检查套餐 API Key 和网络后重试", dismissAfter: 8)
+                    self.presentPanelForFeedback(trigger: .asyncCallback)
+                    return
                 case .saveFailed:
-                    self.setUpdateMessage("无法保存到钥匙串，请解锁或允许访问后重试", dismissAfter: 8); return
+                    self.setUpdateMessage("无法保存到钥匙串，请解锁或允许访问后重试", dismissAfter: 8)
+                    self.presentPanelForFeedback(trigger: .asyncCallback)
+                    return
                 case .connected: break
                 }
                 let changed = self.planCredential != SHA256.hash(data: Data(key.utf8)) || !CredStore.isSavedKeyActive
@@ -7255,6 +7363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.lastAttemptAt = Date()
                 self.applyQuota(result)
                 self.setUpdateMessage("套餐已连接，正在刷新", dismissAfter: 5)
+                self.presentPanelForFeedback(trigger: .asyncCallback)
                 self.refresh(tokens: true, manual: true)
             }
         }
@@ -8996,6 +9105,152 @@ enum GLMOfflineRegression {
             let preferredLegacy = ["coding-plan:api-key:bigmodel": fixtureV1, "coding-plan:api-key:zai": "enc:v2:os:fixture:opaque"]
             try expect(CredStore.resolvePlanCredential(record: preferredLegacy, secret: fixtureSecret).key == "fixture-token", "lower-priority v2 hid usable legacy API key")
 
+            // ZCode 4.0 zai_cn 关联 BigModel（oauth:linked_bigmodel）全路径离线自测：
+            // 覆盖纯函数解析、enc:v1/enc:v2:os 凭据与重置卡解析、customerId 隔离、错误分类、
+            // 禁止高优先级静默降级、以及不从 oauth:zai_cn:user_info 误读邮箱。
+            func sealV1(_ plain: String) throws -> String {
+                let box = try AES.GCM.seal(Data(plain.utf8), using: fixtureKey)
+                return "enc:v1:" + b64url(Data(box.nonce)) + "." + b64url(box.tag) + "." + b64url(box.ciphertext)
+            }
+            func sealV2OS(_ plain: String) throws -> String {
+                let box = try AES.GCM.seal(Data(plain.utf8), using: SymmetricKey(data: v2Key))
+                return "enc:v2:os:" + CredStore.sha256HexPrefix(v2Key, 24) + ":"
+                    + b64url(Data(box.nonce)) + "." + b64url(box.tag) + "." + b64url(box.ciphertext)
+            }
+            // 纯函数解析边界
+            try expect(GLMLinkedBigModel.parse(#"{"userId":"u1","customerId":" cust-42 ","accessToken":" bm-tok-1 "}"#)
+                       == GLMLinkedBigModelPayload(accessToken: "bm-tok-1", customerId: "cust-42"), "linked_bigmodel parse normal failed")
+            try expect(GLMLinkedBigModel.parse(#"{"userId":"u1","accessToken":"bm-tok-2"}"#)
+                       == GLMLinkedBigModelPayload(accessToken: "bm-tok-2", customerId: nil), "linked_bigmodel missing customerId failed")
+            try expect(GLMLinkedBigModel.parse(#"{"customerId":"   ","accessToken":"bm-tok-3"}"#)
+                       == GLMLinkedBigModelPayload(accessToken: "bm-tok-3", customerId: nil), "linked_bigmodel blank customerId must be nil")
+            try expect(GLMLinkedBigModel.parse(#"{"customerId":"cust-42","accessToken":"   "}"#) == nil, "linked_bigmodel blank accessToken must fail")
+            try expect(GLMLinkedBigModel.parse(#"{"customerId":"cust-42"}"#) == nil, "linked_bigmodel missing accessToken must fail")
+            try expect(GLMLinkedBigModel.parse(#"{"customerId":"cust-42","accessToken":"tok with space"}"#) == nil, "linked_bigmodel inner space accessToken must fail")
+            try expect(GLMLinkedBigModel.parse("{\"customerId\":\"cust-42\",\"accessToken\":\"tok\\nline\"}") == nil, "linked_bigmodel inner newline accessToken must fail")
+            try expect(GLMLinkedBigModel.parse(#"{"customerId":"cust-42","accessToken":12345}"#) == nil, "linked_bigmodel numeric accessToken must fail")
+            try expect(GLMLinkedBigModel.parse(#"{"customerId":12345,"accessToken":"bm-tok-numcust"}"#)
+                       == GLMLinkedBigModelPayload(accessToken: "bm-tok-numcust", customerId: nil), "linked_bigmodel numeric customerId must be ignored")
+            try expect(GLMLinkedBigModel.parse(#"["not-an-object"]"#) == nil, "linked_bigmodel non-object JSON must fail")
+            try expect(GLMLinkedBigModel.parse("not-json") == nil, "linked_bigmodel invalid JSON must fail")
+
+            let linkedJSONWithCust = #"{"userId":"zai-u1","customerId":"cust-linked-1","accessToken":"linked-bm-token"}"#
+            let linkedJSONNoCust = #"{"userId":"zai-u1","accessToken":"linked-bm-token-nocust"}"#
+            let linkedV1 = try sealV1(linkedJSONWithCust)
+            let linkedV1NoCust = try sealV1(linkedJSONNoCust)
+            let linkedV2OS = try sealV2OS(linkedJSONWithCust)
+            let linkedV2InvalidJSON = try sealV2OS("{broken-json")
+            let linkedV2EmptyToken = try sealV2OS(#"{"customerId":"cust-1","accessToken":"  "}"#)
+            let zaiUserInfoV1 = try sealV1(userEmailJSON)
+            let jwtV1 = try sealV1("linked-jwt-token")
+            let jwtV2OS = try sealV2OS("linked-jwt-v2")
+
+            // enc:v1 正常解析 + customerId 同源身份 + 重置卡 + 不误读 zai_cn 邮箱
+            let linkedRecordV1: [String: String] = [
+                GLMLinkedBigModel.credentialKey: linkedV1,
+                "zcodejwttoken": jwtV1,
+                "oauth:zai_cn:access_token": fixtureV1,
+                "oauth:zai_cn:user_info": zaiUserInfoV1
+            ]
+            let linkedTypedV1 = CredStore.resolvePlanCredentialTyped(record: linkedRecordV1, secret: fixtureSecret)
+            try expect(linkedTypedV1.key == "linked-bm-token" && linkedTypedV1.error.isEmpty && linkedTypedV1.mode == .oauth
+                       && linkedTypedV1.isLinkedOAuth && linkedTypedV1.oauthHistoryIdentity == "cust-linked-1", "linked_bigmodel v1 typed resolve failed")
+            try expect(linkedTypedV1.context == GLMQuotaHistoryContext.oauthLinked(customerId: "cust-linked-1"),
+                       "linked_bigmodel customerId partition must use isolated oauthLinked domain")
+            try expect(GLMQuotaHistoryContext.oauthLinked(customerId: "cust-linked-1").partition != GLMQuotaHistoryContext.oauth(userInfoId: "cust-linked-1").partition,
+                       "oauthLinked customerId partition must be isolated from direct oauth userInfoId")
+            try expect(GLMQuotaHistoryContext.oauthLinked(customerId: "cust-linked-1").partition != GLMQuotaHistoryContext.apiKey("cust-linked-1").partition,
+                       "oauthLinked customerId partition must be isolated from apiKey")
+            try expect(CredStore.oauthHistoryIdentity(record: linkedRecordV1, secret: fixtureSecret) == "cust-linked-1",
+                       "oauthHistoryIdentity linked_bigmodel customerId mismatch")
+            let linkedResetV1 = CredStore.resolveResetCredential(record: linkedRecordV1, secret: fixtureSecret)
+            try expect(linkedResetV1.tokens?.jwt == "linked-jwt-token" && linkedResetV1.tokens?.maas == "linked-bm-token" && linkedResetV1.error.isEmpty,
+                       "linked_bigmodel v1 reset credential failed")
+            try expect(linkedTypedV1.context?.mayAttributeReset(planCredential: "linked-bm-token", resetCredential: "linked-bm-token") == true,
+                       "linked_bigmodel same-token reset must be attributable")
+            try expect(linkedTypedV1.context?.mayAttributeReset(planCredential: "linked-bm-token-rotated", resetCredential: "linked-bm-token") == false,
+                       "linked_bigmodel rotated token reset must not be attributable")
+            try expect(GLMQuotaHistoryContext.apiKey("sk-key").mayAttributeReset(planCredential: "sk-key", resetCredential: "linked-bm-token") == false,
+                       "apiKey plan must never attribute linked_bigmodel reset card")
+            try expect(GLMQuotaHistoryContext.apiKey("linked-bm-token").mayAttributeReset(planCredential: "linked-bm-token", resetCredential: "linked-bm-token") == false,
+                       "apiKey mode must never attribute reset even with identical token")
+            try expect(CredStore.zcodeAccountEmail(record: linkedRecordV1, secret: fixtureSecret) == nil,
+                       "zai_cn user_info must never be misread as BigModel email")
+
+            // customerId 缺失时退回本进程会话历史（partition == nil）
+            let linkedTypedNoCust = CredStore.resolvePlanCredentialTyped(record: [GLMLinkedBigModel.credentialKey: linkedV1NoCust], secret: fixtureSecret)
+            try expect(linkedTypedNoCust.key == "linked-bm-token-nocust" && linkedTypedNoCust.mode == .oauth
+                       && linkedTypedNoCust.oauthHistoryIdentity == nil && linkedTypedNoCust.context == .oauth
+                       && linkedTypedNoCust.context?.partition == nil, "linked_bigmodel missing customerId must fall back to session history")
+
+            // enc:v2:os 注入 systemKey 正常解析与重置卡解析
+            let linkedRecordV2: [String: String] = [GLMLinkedBigModel.credentialKey: linkedV2OS, "zcodejwttoken": jwtV2OS]
+            let linkedTypedV2 = CredStore.resolvePlanCredentialTyped(record: linkedRecordV2, systemKey: v2Key)
+            try expect(linkedTypedV2.key == "linked-bm-token" && linkedTypedV2.mode == .oauth && linkedTypedV2.oauthHistoryIdentity == "cust-linked-1",
+                       "linked_bigmodel v2 os typed resolve failed")
+            let linkedResetV2 = CredStore.resolveResetCredential(record: linkedRecordV2, systemKey: v2Key)
+            try expect(linkedResetV2.tokens?.jwt == "linked-jwt-v2" && linkedResetV2.tokens?.maas == "linked-bm-token",
+                       "linked_bigmodel v2 os reset credential failed")
+
+            // 错误分类：enc:v2:env:、enc:v2:os: 未授权、已解锁仍失败、非法 JSON、空 accessToken
+            try expect(CredStore.resolvePlanCredential(record: [GLMLinkedBigModel.credentialKey: "enc:v2:env:fixture:opaque"]).error == CredStore.newCredentialMessage,
+                       "linked_bigmodel v2 env not classified")
+            try expect(CredStore.resolveResetCredential(record: ["zcodejwttoken": jwtV1, GLMLinkedBigModel.credentialKey: "enc:v2:env:fixture:opaque"], secret: fixtureSecret).error == CredStore.newCredentialMessage,
+                       "linked_bigmodel reset v2 env not classified")
+            try expect(CredStore.resolvePlanCredential(record: [GLMLinkedBigModel.credentialKey: "enc:v2:os:fixture:opaque"], systemKey: nil).error == CredStore.v2LockedMessage,
+                       "linked_bigmodel v2 locked not classified")
+            try expect(CredStore.resolvePlanCredential(record: [GLMLinkedBigModel.credentialKey: "enc:v2:os:fixture:opaque"], systemKey: Data()).error == CredStore.newCredentialMessage,
+                       "linked_bigmodel v2 unlocked-but-failed not classified")
+            try expect(CredStore.resolveResetCredential(record: ["zcodejwttoken": jwtV2OS, GLMLinkedBigModel.credentialKey: "enc:v2:os:fixture:opaque"], systemKey: nil).error == CredStore.v2LockedMessage,
+                       "linked_bigmodel reset v2 locked not classified")
+            try expect(CredStore.resolveResetCredential(record: ["zcodejwttoken": jwtV2OS, GLMLinkedBigModel.credentialKey: "enc:v2:os:fixture:opaque"], systemKey: Data()).error == CredStore.newCredentialMessage,
+                       "linked_bigmodel reset v2 unlocked-but-failed not classified")
+            // enc:v2:os 解密成功但 JSON 非法或 accessToken 为空 → missingPlanMessage / 登录凭证不可读（不得误报 v2 锁定/格式升级）
+            try expect(CredStore.resolvePlanCredential(record: [GLMLinkedBigModel.credentialKey: linkedV2InvalidJSON], systemKey: v2Key).error == CredStore.missingPlanMessage,
+                       "linked_bigmodel invalid JSON misclassified")
+            try expect(CredStore.resolvePlanCredential(record: [GLMLinkedBigModel.credentialKey: linkedV2EmptyToken], systemKey: v2Key).error == CredStore.missingPlanMessage,
+                       "linked_bigmodel empty accessToken misclassified")
+            let resetBadJSON = CredStore.resolveResetCredential(record: ["zcodejwttoken": jwtV2OS, GLMLinkedBigModel.credentialKey: linkedV2InvalidJSON], systemKey: v2Key)
+            try expect(resetBadJSON.tokens == nil && resetBadJSON.error != CredStore.v2LockedMessage && resetBadJSON.error != CredStore.newCredentialMessage,
+                       "linked_bigmodel reset invalid JSON misclassified as v2 failure")
+            let resetEmptyTok = CredStore.resolveResetCredential(record: ["zcodejwttoken": jwtV2OS, GLMLinkedBigModel.credentialKey: linkedV2EmptyToken], systemKey: v2Key)
+            try expect(resetEmptyTok.tokens == nil && resetEmptyTok.error != CredStore.v2LockedMessage && resetEmptyTok.error != CredStore.newCredentialMessage,
+                       "linked_bigmodel reset empty accessToken misclassified as v2 failure")
+
+            // 优先级与禁止静默降级：高优先级存在且为 enc:v2: 未授权或 env 时，绝不降级读 oauth:linked_bigmodel
+            let directOverLinked = ["oauth:bigmodel:access_token": fixtureV1, GLMLinkedBigModel.credentialKey: linkedV1]
+            try expect(CredStore.resolvePlanCredential(record: directOverLinked, secret: fixtureSecret).key == "fixture-token",
+                       "oauth:bigmodel:access_token must take priority over linked_bigmodel")
+            let lockedDirectOverLinked = ["oauth:bigmodel:access_token": "enc:v2:os:fixture:opaque", GLMLinkedBigModel.credentialKey: linkedV1]
+            try expect(CredStore.resolvePlanCredential(record: lockedDirectOverLinked, secret: fixtureSecret, systemKey: nil).error == CredStore.v2LockedMessage,
+                       "locked oauth:bigmodel:access_token silently fell back to linked_bigmodel")
+            try expect(CredStore.resolveResetCredential(record: ["zcodejwttoken": jwtV1, "oauth:bigmodel:access_token": "enc:v2:os:fixture:opaque", GLMLinkedBigModel.credentialKey: linkedV1], secret: fixtureSecret, systemKey: nil).error == CredStore.v2LockedMessage,
+                       "locked reset oauth:bigmodel:access_token silently fell back to linked_bigmodel")
+            try expect(CredStore.oauthHistoryIdentity(record: lockedDirectOverLinked, secret: fixtureSecret, systemKey: nil) == nil,
+                       "locked oauth:bigmodel:access_token leaked linked_bigmodel identity")
+            let lockedApiOverLinked = ["coding-plan:api-key:bigmodel": "enc:v2:os:fixture:opaque", GLMLinkedBigModel.credentialKey: linkedV1]
+            try expect(CredStore.resolvePlanCredential(record: lockedApiOverLinked, secret: fixtureSecret, systemKey: nil).error == CredStore.v2LockedMessage,
+                       "locked preferredApiKey silently fell back to linked_bigmodel")
+            let envDirectOverLinked = ["oauth:bigmodel:access_token": "enc:v2:env:fixture:opaque", GLMLinkedBigModel.credentialKey: linkedV1]
+            try expect(CredStore.resolvePlanCredential(record: envDirectOverLinked, secret: fixtureSecret).error == CredStore.newCredentialMessage,
+                       "v2 env oauth:bigmodel:access_token silently fell back to linked_bigmodel")
+            // 高优先级存在损坏 enc:v1: 或纯空白字符串时绝不降级到 oauth:linked_bigmodel
+            try expect(CredStore.resolvePlanCredential(record: ["coding-plan:api-key:bigmodel": "enc:v1:broken", GLMLinkedBigModel.credentialKey: linkedV1], secret: fixtureSecret).error == CredStore.missingPlanMessage,
+                       "corrupted v1 preferredApiKey silently fell back to linked_bigmodel")
+            try expect(CredStore.resolvePlanCredential(record: ["oauth:bigmodel:access_token": "enc:v1:broken", GLMLinkedBigModel.credentialKey: linkedV1], secret: fixtureSecret).error == CredStore.missingPlanMessage,
+                       "corrupted v1 oauth:bigmodel:access_token silently fell back to linked_bigmodel")
+            try expect(CredStore.resolvePlanCredential(record: ["oauth:bigmodel:access_token": "   ", GLMLinkedBigModel.credentialKey: linkedV1], secret: fixtureSecret).error == CredStore.missingPlanMessage,
+                       "whitespace oauth:bigmodel:access_token silently fell back to linked_bigmodel")
+            try expect(CredStore.resolveResetCredential(record: ["zcodejwttoken": jwtV1, "oauth:bigmodel:access_token": "enc:v1:broken", GLMLinkedBigModel.credentialKey: linkedV1], secret: fixtureSecret).tokens == nil,
+                       "corrupted v1 reset oauth:bigmodel:access_token silently fell back to linked_bigmodel")
+            try expect(CredStore.resolveResetCredential(record: ["zcodejwttoken": jwtV1, "oauth:bigmodel:access_token": "   ", GLMLinkedBigModel.credentialKey: linkedV1], secret: fixtureSecret).tokens == nil,
+                       "whitespace reset oauth:bigmodel:access_token silently fell back to linked_bigmodel")
+            // resolveResetCredential 单边 enc:v2:os: 未授权 + 另一边 enc:v1: 正常
+            try expect(CredStore.resolveResetCredential(record: ["zcodejwttoken": "enc:v2:os:fixture:opaque", GLMLinkedBigModel.credentialKey: linkedV1], secret: fixtureSecret, systemKey: nil).error == CredStore.v2LockedMessage,
+                       "reset jwt v2 locked + linked v1 ok must report v2LockedMessage")
+            try expect(CredStore.resolveResetCredential(record: ["zcodejwttoken": jwtV1, GLMLinkedBigModel.credentialKey: "enc:v2:os:fixture:opaque"], secret: fixtureSecret, systemKey: nil).error == CredStore.v2LockedMessage,
+                       "reset jwt v1 ok + linked v2 locked must report v2LockedMessage")
+
             try expect(CredStore.resolveAccountEmail(envValue: "sk-key", credentialKeyCandidates: 0,
                        oauthAccessToken: "token", userInfoJSON: userEmailJSON) == nil,
                        "env key override still allowed email")
@@ -9328,6 +9583,39 @@ enum GLMOfflineRegression {
             try expect(panelHoverClickOutcome(isShown: false, presentedByHover: false) == .present, "未打开点击=打开")
             try expect(panelHoverClickOutcome(isShown: true, presentedByHover: false) == .close, "普通常开点击=关闭")
             try expect(panelHoverClickOutcome(isShown: true, presentedByHover: true) == .pin, "hover 打开首次点击=固定常开")
+
+            // 连接设置 / 解锁凭据交互反馈后的面板重展/常开判定矩阵：
+            // - preview 下绝不弹真实 popover；
+            // - 同步模态返回（.modalReturn）：关闭态一律重展，hover 态转 pin，常开态不变；
+            // - 异步网络回调（.asyncCallback）：面板已关且用户已切走（appIsActive == false）不抢焦点打断，
+            //   应用活跃时重展，面板已开且 hover 态转 pin。
+            try expect(panelFeedbackPresentationAction(isPreview: true, isShown: false, presentedByHover: false, trigger: .modalReturn, appIsActive: true) == .none, "preview 关闭态不重展")
+            try expect(panelFeedbackPresentationAction(isPreview: true, isShown: true, presentedByHover: true, trigger: .asyncCallback, appIsActive: true) == .none, "preview hover 态不动")
+            try expect(panelFeedbackPresentationAction(isPreview: false, isShown: false, presentedByHover: false, trigger: .modalReturn, appIsActive: false) == .reopen, "模态弹窗返回后关闭态必须重展")
+            try expect(panelFeedbackPresentationAction(isPreview: false, isShown: false, presentedByHover: true, trigger: .modalReturn, appIsActive: true) == .reopen, "关闭态无论旧标记如何都重展")
+            try expect(panelFeedbackPresentationAction(isPreview: false, isShown: false, presentedByHover: false, trigger: .asyncCallback, appIsActive: false) == .none, "异步回调时用户已切走不得弹窗打断")
+            try expect(panelFeedbackPresentationAction(isPreview: false, isShown: false, presentedByHover: false, trigger: .asyncCallback, appIsActive: true) == .reopen, "异步回调时应用仍活跃且面板关闭应重展")
+            try expect(panelFeedbackPresentationAction(isPreview: false, isShown: true, presentedByHover: true, trigger: .asyncCallback, appIsActive: false) == .pin, "hover 态展示异步反馈须转常开防收起")
+            try expect(panelFeedbackPresentationAction(isPreview: false, isShown: true, presentedByHover: true, trigger: .modalReturn, appIsActive: true) == .pin, "hover 态展示同步反馈须转常开防收起")
+            try expect(panelFeedbackPresentationAction(isPreview: false, isShown: true, presentedByHover: false, trigger: .asyncCallback, appIsActive: true) == .none, "已常开面板保持现状")
+            // 同步断言 PanelHoverController 状态机（直接观察 pendingTransitionForTesting，杜绝异步假阳性）
+            do {
+                var feedbackShown = false
+                var feedbackByHover = false
+                let feedbackHover = PanelHoverController(iconView: nil)
+                feedbackHover.isPanelShown = { feedbackShown }
+                feedbackHover.presentedByHover = { feedbackByHover }
+                feedbackHover.setEnabled(true)
+                feedbackShown = true; feedbackByHover = true
+                feedbackHover.panelExited()
+                try expect(feedbackHover.pendingTransitionForTesting == .hide, "hover 态离开面板必须排起延迟收起")
+                feedbackByHover = false
+                feedbackHover.cancelPending()
+                try expect(feedbackHover.pendingTransitionForTesting == nil, "反馈转常开并取消后待执行收起必须清空")
+                feedbackHover.iconExited()
+                feedbackHover.panelExited()
+                try expect(feedbackHover.pendingTransitionForTesting == nil, "常开态离开图标或面板不得再次排起收起")
+            }
 
             let hoverSuite = "GLMHoverTest.\(UUID().uuidString)"
             let hoverDefaults = UserDefaults(suiteName: hoverSuite)!
