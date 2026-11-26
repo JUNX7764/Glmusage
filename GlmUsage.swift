@@ -3439,7 +3439,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func toggleSpeed() { speedExpanded.toggle(); rebuildPanel(force: true) }
     @objc private func toggleCache() { cacheExpanded.toggle(); rebuildPanel(force: true) }
 
+    /// 纯代码启动的 .accessory 应用没有 MainMenu.nib，系统不会自动装配 Edit 菜单；
+    /// 缺少 Edit 菜单会导致「连接设置」等原生弹窗中的输入框无法响应 ⌘V / ⌘C / ⌘X / ⌘A / ⌘Z / ⇧⌘Z。
+    /// 此处只注册标准编辑快捷键，不放 ⌘Q，保留 GLMPanelRootView 对面板内 ⌘Q 的精确控制。
+    static func makeMainMenu() -> NSMenu {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        appItem.submenu = NSMenu(title: "GlmUsage")
+        main.addItem(appItem)
+
+        let editItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
+        let edit = NSMenu(title: "编辑")
+        edit.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        main.addItem(editItem)
+        return main
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = Self.makeMainMenu()
         // 恢复上次「结果未知」遗留的幂等 key：跨重启防重复扣卡
         if !preview {
             pendingResetKeys = GLMPendingResetStore.load(dir: Self.supportDir)
@@ -6249,19 +6274,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                   title.toolTip?.contains("连接设置") == true, title.canBecomeKeyView else { fail("hidden title entry missing or inaccessible") }
             return title
         }
-        func expectSettingsDialog(_ trigger: () -> Void) {
+        func expectSettingsDialog(_ trigger: () -> Void, verifyEditShortcuts: Bool = false) {
             var inspected = false
             // A run-loop timer, not a main-queue block: NSAlert's nested modal loop
             // cannot re-enter the GCD block that started this fixture.
             let inspection = Timer(timeInterval: 0.1, repeats: true) { timer in
                 guard let modal = NSApp.modalWindow else { return }
+                let secureFields = fields(modal.contentView ?? NSView())
                 guard let content = modal.contentView,
                       buttons(content).contains(where: { $0.title == "取消" }),
-                      fields(content).count == 1 else { fail("settings dialog or secure field missing") }
+                      secureFields.count == 1,
+                      let secureField = secureFields.first else { fail("settings dialog or secure field missing") }
                 func containsTitle(_ view: NSView) -> Bool {
                     ((view as? NSTextField)?.stringValue == "连接设置") || view.subviews.contains(where: containsTitle)
                 }
                 guard containsTitle(content) else { fail("settings dialog title is misleading") }
+                if verifyEditShortcuts {
+                    // 校验标准 Edit 主菜单与模态弹窗内真实快捷键派发（⌘V 目标路由 + ⌘A 真实 sendEvent，不触碰系统剪贴板）
+                    guard let editMenu = NSApp.mainMenu?.items.dropFirst().first?.submenu else {
+                        fail("mainMenu Edit submenu missing")
+                    }
+                    let expected: [(Selector, String, NSEvent.ModifierFlags)] = [
+                        (Selector(("undo:")), "z", .command),
+                        (Selector(("redo:")), "z", [.command, .shift]),
+                        (#selector(NSText.cut(_:)), "x", .command),
+                        (#selector(NSText.copy(_:)), "c", .command),
+                        (#selector(NSText.paste(_:)), "v", .command),
+                        (#selector(NSText.selectAll(_:)), "a", .command),
+                    ]
+                    for (action, key, mask) in expected {
+                        guard let item = editMenu.items.first(where: { $0.action == action }),
+                              item.keyEquivalent == key,
+                              item.keyEquivalentModifierMask == mask else {
+                            fail("mainMenu Edit item missing or misconfigured: \(action)")
+                        }
+                    }
+                    guard modal.isKeyWindow else { fail("settings dialog did not become key window for keyboard shortcut check") }
+                    guard let editor = secureField.currentEditor(),
+                          modal.firstResponder === editor else {
+                        fail("secure field is not initial first responder with active editor")
+                    }
+                    secureField.stringValue = "glm-test-key"
+                    editor.selectedRange = NSRange(location: 0, length: 0)
+                    guard let pasteItem = editMenu.items.first(where: { $0.action == #selector(NSText.paste(_:)) }),
+                          let pasteTarget = NSApp.target(forAction: #selector(NSText.paste(_:)), to: nil, from: pasteItem) as AnyObject?,
+                          pasteTarget === editor else {
+                        fail("paste action does not resolve to secure field editor in modal dialog")
+                    }
+                    guard let cmdA = NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: .command,
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: modal.windowNumber,
+                        context: nil, characters: "a", charactersIgnoringModifiers: "a",
+                        isARepeat: false, keyCode: 0
+                    ) else { fail("failed to synthesize Cmd+A event") }
+                    NSApp.sendEvent(cmdA)
+                    guard editor.selectedRange == NSRange(location: 0, length: "glm-test-key".count) else {
+                        fail("Cmd+A via NSApp.sendEvent did not select secure field text (range=\(editor.selectedRange))")
+                    }
+                    secureField.stringValue = ""
+                }
                 inspected = true; timer.invalidate()
                 NSApp.stopModal(withCode: .alertSecondButtonReturn)
                 modal.orderOut(nil)
@@ -6278,7 +6349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         guard buttons(panelFooterSlot).allSatisfy({ $0.action != #selector(onConnectPlan) }),
               !buttons(panelRoot).contains(where: { $0.title == "修复连接" }) else { fail("normal state exposes connection controls") }
-        expectSettingsDialog { click(titleButton()) }
+        expectSettingsDialog({ click(titleButton()) }, verifyEditShortcuts: true)
         for error in [CredStore.keychainUnavailableMessage, CredStore.v2LockedMessage] {
             usage.quotaError = error; usage.resetCardsError = nil; rebuildPanel()
             guard let repair = buttons(panelRoot).first(where: { $0.title == "修复连接" }) else { fail("locked state has no repair entry") }
@@ -6299,7 +6370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         usage.quotaError = nil; rebuildPanel()
         guard buttons(panelFooterSlot).allSatisfy({ $0.action != #selector(onConnectPlan) }) else { fail("footer setting button returned") }
         _ = titleButton()
-        print("GLM connection test: PASS (native control activation, title entry, dialog/cancel, footer removal, unlock/manual repair, automatic retry state)")
+        print("GLM connection test: PASS (native control activation, title entry, dialog/cancel, edit shortcuts, footer removal, unlock/manual repair, automatic retry state)")
         exit(0)
     }
 
@@ -9265,7 +9336,31 @@ enum GLMOfflineRegression {
             hoverDefaults.set(false, forKey: GLMPanelHoverPreference.defaultsKey)
             try expect(!GLMPanelHoverPreference.load(from: hoverDefaults), "悬停偏好写入后须如实读取")
 
-            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, panel snapshot equality/quantization/structural classification, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence, launch agent toggle decision matrix/helper script/receipt, panel hover geometry/intent/click-outcome/preference)")
+            // 标准主菜单：确保 .accessory 应用注册 Edit 快捷键且不注册 ⌘Q（避免绕过 GLMPanelRootView）
+            let mainMenu = AppDelegate.makeMainMenu()
+            try expect(mainMenu.items.count == 2, "mainMenu 应包含 App 占位与 Edit 两个顶层项")
+            guard let editSubmenu = mainMenu.items[1].submenu else {
+                try expect(false, "mainMenu 缺少 Edit 子菜单")
+                return 1
+            }
+            let expectedEditItems: [(Selector, String, NSEvent.ModifierFlags)] = [
+                (Selector(("undo:")), "z", .command),
+                (Selector(("redo:")), "z", [.command, .shift]),
+                (#selector(NSText.cut(_:)), "x", .command),
+                (#selector(NSText.copy(_:)), "c", .command),
+                (#selector(NSText.paste(_:)), "v", .command),
+                (#selector(NSText.selectAll(_:)), "a", .command),
+            ]
+            for (action, key, mask) in expectedEditItems {
+                let matched = editSubmenu.items.first { $0.action == action }
+                try expect(matched?.keyEquivalent == key && matched?.keyEquivalentModifierMask == mask,
+                           "mainMenu Edit 项缺失或快捷键不符：\(action)")
+            }
+            let allMenuItems = mainMenu.items.flatMap { [$0] + ($0.submenu?.items ?? []) }
+            try expect(!allMenuItems.contains { $0.keyEquivalent.lowercased() == "q" },
+                       "mainMenu 不得注册 ⌘Q，保留 GLMPanelRootView 面板内精确退出逻辑")
+
+            print("GlmUsage --self-test: PASS (strict quota/remote parsing, Start Plan SQLite/window/model/daily merge, partial windows, independent freshness, card expiry/retention, refresh gate/schedule, serialized callback merge, menubar alignment, update check release version compare/assets, daily timeline/frame/comparison fixtures, reset-card idempotency outcome/persistence, panel card layout normalization/migration, panel snapshot equality/quantization/structural classification, status writer atomic/dedup/heartbeat/coalesce, local stats single-connection batch equivalence, launch agent toggle decision matrix/helper script/receipt, panel hover geometry/intent/click-outcome/preference, edit main menu shortcuts)")
             return 0
         } catch {
             fputs("GlmUsage --self-test: FAIL: \(error)\n", stderr)

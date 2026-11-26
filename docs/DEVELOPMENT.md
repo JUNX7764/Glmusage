@@ -1,7 +1,7 @@
 # GlmUsage 开发与维护
 
 > **当前工程事实源**。构建、测试、发布、接口或权限行为变化时，应在同一个提交中更新本文。
-> 最后核对：2026-11-25。
+> 最后核对：2026-11-26。
 
 ## 文档入口与效力
 
@@ -60,7 +60,7 @@ python3 -m unittest discover -s tests -p '*_test.py'
 # Shell 语法检查
 bash -n build.sh scripts/update.sh scripts/release.sh
 
-# 连接入口：标题/底部隐藏/异常路由/原生弹窗与取消结果（控件激活，非硬件鼠标；所有数据为假）
+# 连接入口：标题/底部隐藏/异常路由/原生弹窗编辑快捷键与取消结果（控件激活，非硬件鼠标；所有数据为假）
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-connection-test
 ./GlmUsage.app/Contents/MacOS/GlmUsage --preview-connection-test --preview-narrow
 
